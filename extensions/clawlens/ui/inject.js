@@ -1,5 +1,5 @@
 /**
- * ClawLens UI inject — Overview panel + Audit drawer
+ * ClawLens UI inject — Overview panel + Audit drawer + Chat sidebar
  */
 
 const API = "/plugins/clawlens/api";
@@ -13,13 +13,11 @@ const S = {
   drawerOpen: false,
   auditDays: 7,
   auditChannel: "",
-  sessions: [],       // AuditSession[]
+  sessions: [],       // AuditSession summary[]
   selSession: null,   // string | null
-  runs: [],           // RunWithDetail[]
+  runs: [],           // RunAuditDetail[] — new format from getAuditSession
   loadingSessions: false,
   loadingRuns: false,
-  expandedRuns: new Set(),
-  expandedLlm: new Set(),
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -80,15 +78,16 @@ function fmtRelTime(ts) {
 function esc(s) {
   return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
-function statusBadge(status) {
-  const map = { completed: ["✓", "cl-badge-ok"], error: ["✕", "cl-badge-err"], running: ["⟳", "cl-badge-run"] };
-  const [icon, cls] = map[status] ?? ["?", ""];
-  return `<span class="cl-badge ${cls}">${icon} ${esc(status)}</span>`;
-}
 function shortKey(key) {
   if (!key || key === "unknown") return "—";
   if (key.length > 28) return key.slice(0, 12) + "…" + key.slice(-8);
   return key;
+}
+function formatDuration(ms) {
+  if (!ms && ms !== 0) return "—";
+  if (ms < 1000) return ms + "ms";
+  if (ms < 60000) return (ms / 1000).toFixed(1) + "s";
+  return Math.floor(ms / 60000) + "m " + Math.floor((ms % 60000) / 1000) + "s";
 }
 
 // ── Data fetch ────────────────────────────────────────────────────────────
@@ -111,12 +110,11 @@ async function fetchAuditSessions() {
 async function selectSession(key) {
   S.selSession = key;
   S.runs = [];
-  S.expandedRuns.clear();
-  S.expandedLlm.clear();
   S.loadingRuns = true;
   renderDetail();
+  // API returns { sessionKey, runs: RunAuditDetail[] }
   const d = await apiFetch("/audit/session/" + encodeURIComponent(key));
-  S.runs = d ?? [];
+  S.runs = d?.runs ?? [];
   S.loadingRuns = false;
   renderDetail();
 }
@@ -137,10 +135,12 @@ function connectSSE() {
         fetchOverview();
         if (S.drawerOpen) fetchAuditSessions();
         if (S.selSession && (ev.sessionKey === S.selSession || ev.runId)) selectSession(S.selSession);
+        if (CHAT_STATE.visible) refreshChatAudit();
       }
     } catch {}
   };
 }
+
 function setSSEDot(ok) {
   const el = document.getElementById("cl-sse-dot");
   if (el) el.style.color = ok ? "#22c55e" : "#f59e0b";
@@ -184,21 +184,12 @@ function _createPanelEl() {
 }
 
 function mountOverviewPanel() {
-  // Only inject on overview page
   if (!location.pathname.includes("/overview") && location.pathname !== "/") return;
-
-  // Best target: section.grid inside main content (overview page native layout)
   const grid = document.querySelector("main section.grid, section.grid");
-  if (!grid) return; // Overview page not rendered yet — observer will retry
-
+  if (!grid) return;
   const existing = document.getElementById("clawlens-panel");
-
-  // Already mounted in the right place → nothing to do
   if (existing && existing.parentElement === grid) return;
-
-  // Remove from wrong location if needed
   if (existing) existing.remove();
-
   grid.insertBefore(_createPanelEl(), grid.firstChild);
   renderOverview();
 }
@@ -334,127 +325,72 @@ function renderDetail() {
     </div>
   ` : "";
 
-  const runsHtml = S.runs.map((item, idx) => renderRunCard(item, idx)).join("");
-  el.innerHTML = headerHtml + `<div class="cl-run-list">${runsHtml}</div>`;
-
-  // bind expand toggles
-  el.querySelectorAll("[data-toggle-run]").forEach(btn => {
-    btn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      const id = btn.dataset.toggleRun;
-      S.expandedRuns.has(id) ? S.expandedRuns.delete(id) : S.expandedRuns.add(id);
-      renderDetail();
-    });
-  });
-  el.querySelectorAll("[data-toggle-llm]").forEach(btn => {
-    btn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      const id = btn.dataset.toggleLlm;
-      S.expandedLlm.has(id) ? S.expandedLlm.delete(id) : S.expandedLlm.add(id);
-      renderDetail();
-    });
-  });
+  // Use the shared audit panel renderer — same as chat sidebar
+  el.innerHTML = headerHtml + `<div class="clawlens-audit-body">${renderAuditPanel({ runs: S.runs })}</div>`;
 }
 
-function renderRunCard({ run, llmCalls, toolSummary }, idx) {
-  const expanded = S.expandedRuns.has(run.run_id);
-  const llmExpanded = S.expandedLlm.has(run.run_id);
+// ── Shared audit panel renderer ───────────────────────────────────────────
+// Returns run card HTML without outer wrapper — caller provides the container.
 
-  // header row
-  const status = statusBadge(run.status);
-  const toks = run.total_input_tokens + run.total_output_tokens;
-  const cacheInfo = (run.total_cache_read > 0 || run.total_cache_write > 0)
-    ? ` <span class="cl-cache-info">cache ↓${fmtTokens(run.total_cache_read)} ↑${fmtTokens(run.total_cache_write)}</span>` : "";
-  const model = run.model ? `<span class="cl-run-model">${esc(run.model.split("/").pop())}</span>` : "";
-
-  const chevron = expanded ? "▾" : "▸";
-
-  let bodyHtml = "";
-  if (expanded) {
-    // Token breakdown row
-    const tokenRow = `
-      <div class="cl-run-tokens">
-        <span class="cl-tok-in">↑ ${fmtTokens(run.total_input_tokens)} in</span>
-        <span class="cl-tok-out">↓ ${fmtTokens(run.total_output_tokens)} out</span>
-        ${run.total_cache_read > 0 ? `<span class="cl-tok-cache">⚡ ${fmtTokens(run.total_cache_read)} cached</span>` : ""}
-        <span class="cl-run-cost">${fmtCost(run.total_cost_usd)}</span>
-      </div>
-    `;
-
-    // Tool summary
-    const toolsHtml = toolSummary.length ? `
-      <div class="cl-section-label">🔧 Tool Calls (${run.total_tool_calls})</div>
-      <div class="cl-tool-grid">
-        ${toolSummary.map(t => `
-          <div class="cl-tool-row ${t.error_count > 0 ? "cl-tool-err" : ""}">
-            <span class="cl-tool-name">${esc(t.tool_name)}</span>
-            <span class="cl-tool-count">×${t.count}</span>
-            <span class="cl-tool-dur">${fmtDur(t.avg_duration_ms)}/call</span>
-            ${t.error_count > 0 ? `<span class="cl-tool-errcnt">${t.error_count} err</span>` : ""}
-          </div>
-        `).join("")}
-      </div>
-    ` : "";
-
-    // LLM calls expandable
-    const llmChevron = llmExpanded ? "▾" : "▸";
-    const llmHeader = llmCalls.length ? `
-      <div class="cl-section-label">
-        <button class="cl-expand-btn" data-toggle-llm="${esc(run.run_id)}">
-          ${llmChevron} 💬 LLM Calls (${llmCalls.length})
-        </button>
-      </div>
-    ` : "";
-    const llmBody = llmExpanded && llmCalls.length ? `
-      <div class="cl-llm-list">
-        ${llmCalls.map((c, i) => `
-          <div class="cl-llm-row">
-            <span class="cl-llm-idx">#${c.call_index ?? i}</span>
-            <span class="cl-llm-model">${esc((c.model ?? "").split("/").pop())}</span>
-            <span class="cl-llm-dur">${fmtDur(c.duration_ms)}</span>
-            <span class="cl-llm-toks">↑${fmtTokens(c.input_tokens)} ↓${fmtTokens(c.output_tokens)}</span>
-            ${c.cache_read > 0 ? `<span class="cl-llm-cache">⚡${fmtTokens(c.cache_read)}</span>` : ""}
-            <span class="cl-llm-cost">${fmtCost(c.cost_usd)}</span>
-            ${c.tool_calls_in_response > 0 ? `<span class="cl-llm-tc">🔧${c.tool_calls_in_response}</span>` : ""}
-          </div>
-        `).join("")}
-      </div>
-    ` : "";
-
-    bodyHtml = `
-      <div class="cl-run-body">
-        ${tokenRow}
-        ${llmHeader}${llmBody}
-        ${toolsHtml}
-        ${run.error_message ? `<div class="cl-run-error">⚠ ${esc(run.error_message)}</div>` : ""}
-      </div>
-    `;
+function renderAuditPanel(data) {
+  if (!data || !data.runs?.length) {
+    return '<div style="color:var(--muted,#838387);padding:20px;text-align:center">No audit data for this session</div>';
   }
-
-  return `
-    <div class="cl-run-card ${run.status === 'error' ? 'cl-run-card-err' : ''}">
-      <div class="cl-run-head" data-toggle-run="${esc(run.run_id)}">
-        <span class="cl-run-chevron">${chevron}</span>
-        <span class="cl-run-time">${fmtTime(run.started_at)}</span>
-        ${status}
-        ${model}
-        <span class="cl-run-dur">${fmtDur(run.duration_ms)}</span>
-        <span class="cl-run-toks-sm">${fmtTokens(toks)} tok${cacheInfo}</span>
-        <span class="cl-run-cost-sm">${fmtCost(run.total_cost_usd)}</span>
-        <span class="cl-run-pills">
-          ${run.total_llm_calls > 0 ? `<span class="cl-pill-llm">💬${run.total_llm_calls}</span>` : ""}
-          ${run.total_tool_calls > 0 ? `<span class="cl-pill-tool">🔧${run.total_tool_calls}</span>` : ""}
-        </span>
+  return data.runs.map((run, i) => `
+    <div class="clawlens-audit-run${i === 0 ? " expanded" : ""}">
+      <div class="clawlens-audit-run-hdr" onclick="this.parentElement.classList.toggle('expanded')">
+        <div class="clawlens-audit-run-top">
+          <span class="clawlens-audit-run-num">#${i + 1} Run</span>
+          <span class="clawlens-audit-run-time">${formatDuration(run.duration)}</span>
+        </div>
+        <div class="clawlens-audit-run-prompt">${esc(run.userPrompt || "(no prompt)")}</div>
+        <div class="clawlens-audit-run-stats">
+          <span>${run.summary?.llmCalls ?? 0} LLM</span>
+          <span>${run.summary?.toolCalls ?? 0} tool</span>
+          <span>${fmtTokens((run.summary?.totalInputTokens ?? 0) + (run.summary?.totalOutputTokens ?? 0))} tok</span>
+          <span class="cost">${fmtCost(run.summary?.officialCost ?? run.summary?.calculatedCost ?? run.summary?.totalCost)}</span>
+        </div>
       </div>
-      ${bodyHtml}
+      <div class="clawlens-audit-run-detail">
+        <div class="clawlens-section-label">Timeline</div>
+        <div class="clawlens-tl-legend">
+          <span><span class="clawlens-tl-legend-dot" style="background:var(--info,#3b82f6)"></span>LLM</span>
+          <span><span class="clawlens-tl-legend-dot" style="background:var(--ok,#22c55e)"></span>Tool</span>
+        </div>
+        ${renderTimeline(run.timeline, run.duration)}
+        <div class="clawlens-section-label" style="margin-top:8px">Turns</div>
+        <div class="clawlens-turns">${renderTurns(run.turns)}</div>
+      </div>
     </div>
-  `;
+  `).join("");
+}
+
+function renderTimeline(timeline, totalDuration) {
+  if (!timeline?.length || !totalDuration) return "";
+  return '<div class="clawlens-timeline-bar">' + timeline.map(entry => {
+    const left = Math.max(0, (entry.startedAt / totalDuration * 100)).toFixed(1);
+    const width = Math.max(entry.duration / totalDuration * 100, 2).toFixed(1);
+    const cls = entry.type === "llm_call" ? "clawlens-tl-llm" : "clawlens-tl-tool";
+    const label = entry.type === "llm_call"
+      ? `LLM ${formatDuration(entry.duration)}`
+      : `${entry.toolName || "tool"} ${formatDuration(entry.duration)}`;
+    return `<div class="${cls}" style="left:${left}%;width:${width}%" title="${esc(label)}">${formatDuration(entry.duration)}</div>`;
+  }).join("") + "</div>";
+}
+
+function renderTurns(turns) {
+  if (!turns?.length) return "";
+  return turns.map(t => `
+    <div class="clawlens-turn">
+      <span class="clawlens-turn-role ${esc(t.role)}">${esc(t.role)}</span>
+      <span class="clawlens-turn-preview">${esc((t.preview ?? "").slice(0, 120))}</span>
+    </div>
+  `).join("");
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────
 
 async function main() {
-  // Wait for app shell
   await new Promise(resolve => {
     const check = () => document.querySelector("openclaw-app, main, body") && resolve();
     const obs = new MutationObserver(check);
@@ -483,18 +419,6 @@ const CHAT_STATE = {
   pollTimer: null,
 };
 
-function escapeHtml(s) {
-  return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-}
-function formatDuration(ms) {
-  if (!ms && ms !== 0) return "—";
-  if (ms < 1000) return ms + "ms";
-  if (ms < 60000) return (ms / 1000).toFixed(1) + "s";
-  return Math.floor(ms / 60000) + "m " + Math.floor((ms % 60000) / 1000) + "s";
-}
-function formatTokens(n) { return fmtTokens(n); }
-function formatCost(n) { return fmtCost(n); }
-
 function getCurrentSessionKey() {
   const url = new URL(location.href);
   const s = url.searchParams.get("session");
@@ -507,67 +431,6 @@ function isInChatView() {
   return location.pathname.includes("/chat") || !!document.querySelector(".chat-split-container");
 }
 
-function renderTimeline(timeline, totalDuration) {
-  if (!timeline?.length || !totalDuration) return "";
-  return '<div class="clawlens-timeline-bar">' + timeline.map(entry => {
-    const left = Math.max(0, (entry.startedAt / totalDuration * 100)).toFixed(1);
-    const width = Math.max(entry.duration / totalDuration * 100, 2).toFixed(1);
-    const cls = entry.type === "llm_call" ? "clawlens-tl-llm" : "clawlens-tl-tool";
-    const label = entry.type === "llm_call"
-      ? `LLM ${formatDuration(entry.duration)}`
-      : `${entry.toolName || "tool"} ${formatDuration(entry.duration)}`;
-    return `<div class="${cls}" style="left:${left}%;width:${width}%" title="${escapeHtml(label)}">${formatDuration(entry.duration)}</div>`;
-  }).join("") + "</div>";
-}
-
-function renderTurns(turns) {
-  if (!turns?.length) return "";
-  return turns.map(t => `
-    <div class="clawlens-turn">
-      <span class="clawlens-turn-role ${escapeHtml(t.role)}">${escapeHtml(t.role)}</span>
-      <span class="clawlens-turn-preview">${escapeHtml((t.preview ?? "").slice(0, 120))}</span>
-    </div>
-  `).join("");
-}
-
-function renderAuditPanel(data) {
-  if (!data || !data.runs?.length) {
-    return '<div class="clawlens-audit-body"><div style="color:var(--muted,#838387);padding:20px;text-align:center">No audit data for this session</div></div>';
-  }
-  return '<div class="clawlens-audit-body">' + data.runs.map((run, i) => `
-    <div class="clawlens-audit-run${i === 0 ? " expanded" : ""}">
-      <div class="clawlens-audit-run-hdr" onclick="this.parentElement.classList.toggle('expanded')">
-        <div class="clawlens-audit-run-top">
-          <span class="clawlens-audit-run-num">#${i + 1} Run</span>
-          <span class="clawlens-audit-run-time">${formatDuration(run.duration)}</span>
-        </div>
-        <div class="clawlens-audit-run-prompt">${escapeHtml(run.userPrompt || "(no prompt)")}</div>
-        <div class="clawlens-audit-run-stats">
-          <span>${run.summary?.llmCalls ?? 0} LLM</span>
-          <span>${run.summary?.toolCalls ?? 0} tool</span>
-          <span>${formatTokens((run.summary?.totalInputTokens ?? 0) + (run.summary?.totalOutputTokens ?? 0))} tok</span>
-          <span class="cost">${formatCost(run.summary?.totalCost)}</span>
-        </div>
-      </div>
-      <div class="clawlens-audit-run-detail">
-        <div class="clawlens-section-label">Timeline</div>
-        <div class="clawlens-tl-legend">
-          <span><span class="clawlens-tl-legend-dot" style="background:var(--info,#3b82f6)"></span>LLM</span>
-          <span><span class="clawlens-tl-legend-dot" style="background:var(--ok,#22c55e)"></span>Tool</span>
-        </div>
-        ${renderTimeline(run.timeline, run.duration)}
-        <div class="clawlens-section-label" style="margin-top:8px">Turns</div>
-        <div class="clawlens-turns">${renderTurns(run.turns)}</div>
-      </div>
-    </div>
-  `).join("") + "</div>";
-}
-
-async function fetchChatAudit(sessionKey) {
-  const data = await apiFetch("/audit/session/" + encodeURIComponent(sessionKey));
-  return data;
-}
-
 function updateAuditSidebarContent() {
   const body = document.getElementById("clawlens-audit-sidebar-body");
   if (!body) return;
@@ -575,12 +438,12 @@ function updateAuditSidebarContent() {
     body.innerHTML = '<div style="color:var(--muted,#838387);padding:20px;text-align:center">Loading…</div>';
     return;
   }
+  // body already has clawlens-audit-body class; renderAuditPanel returns inner content only
   body.innerHTML = renderAuditPanel(CHAT_STATE.data);
 }
 
 function mountChatAuditSidebar() {
   if (document.getElementById("clawlens-audit-sidebar")) return;
-
   const container = document.querySelector(".chat-split-container");
   if (!container) return;
 
@@ -609,11 +472,7 @@ function hideChatAuditSidebar() {
 }
 
 function toggleChatAuditSidebar() {
-  if (CHAT_STATE.visible) {
-    hideChatAuditSidebar();
-  } else {
-    mountChatAuditSidebar();
-  }
+  if (CHAT_STATE.visible) { hideChatAuditSidebar(); } else { mountChatAuditSidebar(); }
 }
 
 function injectAuditToggleBtn() {
@@ -636,9 +495,10 @@ async function refreshChatAudit() {
     CHAT_STATE.data = null;
     updateAuditSidebarContent();
   }
-  const data = await fetchChatAudit(key);
-  if (data) {
-    CHAT_STATE.data = data;
+  // API returns { sessionKey, runs: RunAuditDetail[] }
+  const d = await apiFetch("/audit/session/" + encodeURIComponent(key));
+  if (d) {
+    CHAT_STATE.data = d;
     if (CHAT_STATE.visible) updateAuditSidebarContent();
   }
 }
@@ -674,6 +534,5 @@ const _chatObs = new MutationObserver(() => {
 });
 _chatObs.observe(document.body, { childList: true, subtree: true });
 
-// Initial check — deferred so SPA can finish rendering
 setTimeout(handleRouteChange, 1000);
 setTimeout(handleRouteChange, 3000);
