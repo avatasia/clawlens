@@ -220,7 +220,9 @@ export class Store {
         COALESCE(SUM(cache_write), 0) as cache_write,
         COALESCE(SUM(cost_usd), 0) as cost_usd,
         SUM(official_cost) as official_cost,
-        SUM(calculated_cost) as calculated_cost
+        SUM(calculated_cost) as calculated_cost,
+        MIN(model) as model,
+        MIN(provider) as provider
       FROM llm_calls WHERE run_id = ?
     `);
 
@@ -295,7 +297,16 @@ export class Store {
       cost_usd: number;
       official_cost: number | null;
       calculated_cost: number | null;
+      model: string | null;
+      provider: string | null;
     };
+
+    // Backfill model/provider from llm_calls if not set on the run row
+    if (agg.model || agg.provider) {
+      this.db.prepare(
+        "UPDATE runs SET model = COALESCE(model, ?), provider = COALESCE(provider, ?) WHERE run_id = ?",
+      ).run(agg.model ?? null, agg.provider ?? null, runId);
+    }
 
     this.stmtCompleteRun.run(
       endedAt,
@@ -551,8 +562,8 @@ export class Store {
       startedAt: run.started_at,
       duration: (run.ended_at ?? run.started_at) - run.started_at,
       status: run.status,
-      model: run.model ?? null,
-      provider: run.provider ?? null,
+      model: run.model ?? (llmCalls[0] as any)?.model ?? null,
+      provider: run.provider ?? (llmCalls[0] as any)?.provider ?? null,
       errorMessage: run.error_message ?? null,
       userPrompt: (llmCalls[0] as any)?.user_prompt_preview ?? "",
       summary: {
