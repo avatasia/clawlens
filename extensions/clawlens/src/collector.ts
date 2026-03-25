@@ -169,7 +169,7 @@ export class Collector {
     const now = Date.now();
 
     const costKey = `${event.provider}:${event.model}`;
-    const costUsd = calculateCost(
+    const calculatedCost = calculateCost(
       {
         input: event.usage?.input,
         output: event.usage?.output,
@@ -189,7 +189,8 @@ export class Collector {
         outputTokens: event.usage?.output,
         cacheRead: event.usage?.cacheRead,
         cacheWrite: event.usage?.cacheWrite,
-        costUsd: costUsd ?? undefined,
+        calculatedCost: calculatedCost ?? undefined,
+        officialCost: undefined,   // not yet provided by hook events
         stopReason: event.stopReason,
         provider: event.provider,
         model: event.model,
@@ -204,7 +205,7 @@ export class Collector {
         model: event.model,
         inputTokens: event.usage?.input,
         outputTokens: event.usage?.output,
-        costUsd,
+        calculatedCost,
       });
     });
   }
