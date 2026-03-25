@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+*.js.map
+
+# SQLite database (runtime data, contains user session info)
+*.db
+*.db-wal
+*.db-shm
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment / credentials
+.env
+.env.*
+!.env.example
+
+# SSH / deployment
+*.pem
+*.key
+id_*
+known_hosts
+
+# Headless browser screenshots (may contain UI with session data)
+clawlens-*.png
+
+# OpenClaw runtime state (if accidentally copied into repo)
+.openclaw/
+openclaw.yaml
+
+# Logs
+*.log
+
+# Compare workspace (Module B runtime output, may contain user data)
+compare/
