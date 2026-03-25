@@ -1,0 +1,9 @@
+{
+  "name": "clawlens",
+  "version": "0.1.0",
+  "description": "OpenClaw session monitor + multi-model comparator",
+  "type": "module",
+  "openclaw": {
+    "extensions": ["./index.ts"]
+  }
+}
