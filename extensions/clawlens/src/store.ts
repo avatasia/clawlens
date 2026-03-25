@@ -29,7 +29,9 @@ type LlmCallOpts = {
   outputTokens?: number;
   cacheRead?: number;
   cacheWrite?: number;
-  costUsd?: number;
+  costUsd?: number;           // kept for back-compat; maps to calculated_cost
+  officialCost?: number;      // cost reported by provider (may be null)
+  calculatedCost?: number;    // cost from our pricing config
   stopReason?: string;
   provider?: string;
   model?: string;
@@ -77,6 +79,19 @@ export class Store {
   private stmtCleanup: ReturnType<DatabaseSync["prepare"]>;
   private stmtAggregateRun: ReturnType<DatabaseSync["prepare"]>;
   private stmtInsertConvTurn: ReturnType<DatabaseSync["prepare"]>;
+
+  private static computeCostMatch(
+    official: number | null,
+    calculated: number | null,
+  ): { costMatch: boolean; costDiffReason?: string } {
+    if (official == null && calculated == null) return { costMatch: true };
+    if (official == null) return { costMatch: false, costDiffReason: "provider did not return cost, using fallback" };
+    if (calculated == null) return { costMatch: false, costDiffReason: "no pricing config available" };
+    const diff = Math.abs(official - calculated);
+    const threshold = Math.max(official, calculated) * 0.001;
+    if (diff <= threshold) return { costMatch: true };
+    return { costMatch: false, costDiffReason: "pricing differs from config" };
+  }
 
   constructor(stateDir: string) {
     const dbDir = path.join(stateDir, "clawlens");
@@ -180,11 +195,15 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_conv_turns_session ON conversation_turns(session_key);
     `);
 
-    // Add user_prompt_preview to llm_calls if not present (idempotent migration)
-    try {
-      this.db.exec("ALTER TABLE llm_calls ADD COLUMN user_prompt_preview TEXT");
-    } catch {
-      // column already exists — ignore
+    // Idempotent migrations
+    for (const sql of [
+      "ALTER TABLE llm_calls ADD COLUMN user_prompt_preview TEXT",
+      "ALTER TABLE llm_calls ADD COLUMN official_cost REAL",
+      "ALTER TABLE llm_calls ADD COLUMN calculated_cost REAL",
+      "ALTER TABLE runs ADD COLUMN total_official_cost REAL",
+      "ALTER TABLE runs ADD COLUMN total_calculated_cost REAL",
+    ]) {
+      try { this.db.exec(sql); } catch { /* column already exists */ }
     }
 
     this.stmtInsertRun = this.db.prepare(`
@@ -199,7 +218,9 @@ export class Store {
         COALESCE(SUM(output_tokens), 0) as output_tokens,
         COALESCE(SUM(cache_read), 0) as cache_read,
         COALESCE(SUM(cache_write), 0) as cache_write,
-        COALESCE(SUM(cost_usd), 0) as cost_usd
+        COALESCE(SUM(cost_usd), 0) as cost_usd,
+        SUM(official_cost) as official_cost,
+        SUM(calculated_cost) as calculated_cost
       FROM llm_calls WHERE run_id = ?
     `);
 
@@ -215,13 +236,15 @@ export class Store {
         total_cache_read = ?,
         total_cache_write = ?,
         total_cost_usd = ?,
+        total_official_cost = ?,
+        total_calculated_cost = ?,
         total_tool_calls = (SELECT COUNT(*) FROM tool_executions WHERE run_id = ?)
       WHERE run_id = ?
     `);
 
     this.stmtInsertLlmCall = this.db.prepare(`
-      INSERT INTO llm_calls (run_id, call_index, started_at, ended_at, duration_ms, input_tokens, output_tokens, cache_read, cache_write, cost_usd, stop_reason, provider, model, system_prompt_hash, tool_calls_in_response, user_prompt_preview)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO llm_calls (run_id, call_index, started_at, ended_at, duration_ms, input_tokens, output_tokens, cache_read, cache_write, cost_usd, stop_reason, provider, model, system_prompt_hash, tool_calls_in_response, user_prompt_preview, official_cost, calculated_cost)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     this.stmtInsertToolExec = this.db.prepare(`
@@ -270,6 +293,8 @@ export class Store {
       cache_read: number;
       cache_write: number;
       cost_usd: number;
+      official_cost: number | null;
+      calculated_cost: number | null;
     };
 
     this.stmtCompleteRun.run(
@@ -283,12 +308,15 @@ export class Store {
       agg.cache_read,
       agg.cache_write,
       agg.cost_usd,
+      agg.official_cost ?? null,
+      agg.calculated_cost ?? null,
       runId,
       runId,
     );
   }
 
   insertLlmCall(runId: string, callIndex: number, startedAt: number, opts: LlmCallOpts): void {
+    const calculatedCost = opts.calculatedCost ?? opts.costUsd ?? null;
     this.stmtInsertLlmCall.run(
       runId,
       callIndex,
@@ -299,13 +327,15 @@ export class Store {
       opts.outputTokens ?? null,
       opts.cacheRead ?? null,
       opts.cacheWrite ?? null,
-      opts.costUsd ?? null,
+      calculatedCost,               // cost_usd (legacy, = calculated)
       opts.stopReason ?? null,
       opts.provider ?? null,
       opts.model ?? null,
       opts.systemPromptHash ?? null,
       opts.toolCallsInResponse ?? 0,
       opts.userPromptPreview ?? null,
+      opts.officialCost ?? null,
+      calculatedCost,               // calculated_cost
     );
   }
 
@@ -512,18 +542,31 @@ export class Store {
     }
     (timeline as any[]).sort((a: any, b: any) => a.startedAt - b.startedAt);
 
+    const officialCost: number | null = run.total_official_cost ?? null;
+    const calculatedCost: number | null = run.total_calculated_cost ?? run.total_cost_usd ?? null;
+    const { costMatch, costDiffReason } = Store.computeCostMatch(officialCost, calculatedCost);
+
     return {
       runId: run.run_id,
       startedAt: run.started_at,
-      duration: run.duration_ms ?? 0,
+      duration: (run.ended_at ?? run.started_at) - run.started_at,
       status: run.status,
+      model: run.model ?? null,
+      provider: run.provider ?? null,
+      errorMessage: run.error_message ?? null,
       userPrompt: (llmCalls[0] as any)?.user_prompt_preview ?? "",
       summary: {
-        llmCalls: run.total_llm_calls,
-        toolCalls: run.total_tool_calls,
-        totalInputTokens: run.total_input_tokens,
-        totalOutputTokens: run.total_output_tokens,
-        totalCost: run.total_cost_usd,
+        llmCalls: run.total_llm_calls ?? llmCalls.length,
+        toolCalls: run.total_tool_calls ?? toolExecs.length,
+        totalInputTokens: run.total_input_tokens ?? 0,
+        totalOutputTokens: run.total_output_tokens ?? 0,
+        totalCacheRead: run.total_cache_read ?? 0,
+        totalCacheWrite: run.total_cache_write ?? 0,
+        totalCost: run.total_cost_usd ?? null,
+        officialCost,
+        calculatedCost,
+        costMatch,
+        costDiffReason,
       },
       timeline,
       turns: turns.map((t: any) => ({
