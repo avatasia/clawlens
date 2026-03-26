@@ -444,8 +444,6 @@ function updateAuditSidebarContent() {
 
 function mountChatAuditSidebar() {
   if (document.getElementById("clawlens-audit-sidebar")) return;
-  const container = document.querySelector(".chat-split-container");
-  if (!container) return;
 
   const sidebar = document.createElement("div");
   sidebar.id = "clawlens-audit-sidebar";
@@ -456,13 +454,14 @@ function mountChatAuditSidebar() {
       <button class="clawlens-audit-close" id="clawlens-audit-close-btn" title="Close">✕</button>
     </div>
     <div id="clawlens-audit-sidebar-body" class="clawlens-audit-body">
-      <div style="color:var(--muted,#838387);padding:20px;text-align:center">Select a session to view audit data</div>
+      <div style="color:var(--muted,#838387);padding:20px;text-align:center">Loading…</div>
     </div>
   `;
-  container.appendChild(sidebar);
+  document.body.appendChild(sidebar);
   document.getElementById("clawlens-audit-close-btn")?.addEventListener("click", hideChatAuditSidebar);
   CHAT_STATE.visible = true;
-  updateAuditSidebarContent();
+  // Fetch immediately — don't wait for MutationObserver debounce
+  refreshChatAudit();
 }
 
 function hideChatAuditSidebar() {
@@ -493,10 +492,19 @@ async function refreshChatAudit() {
   if (key !== CHAT_STATE.sessionKey) {
     CHAT_STATE.sessionKey = key;
     CHAT_STATE.data = null;
-    updateAuditSidebarContent();
+    if (CHAT_STATE.visible) updateAuditSidebarContent();
   }
   // API returns { sessionKey, runs: RunAuditDetail[] }
-  const d = await apiFetch("/audit/session/" + encodeURIComponent(key));
+  let d = await apiFetch("/audit/session/" + encodeURIComponent(key));
+  // If no runs found for this exact key, also try the "unknown" bucket —
+  // some agents (e.g. heartbeat) may not emit sessionKey in lifecycle events
+  // and get stored under "unknown".
+  if (d && d.runs?.length === 0) {
+    const fallback = await apiFetch("/audit/session/unknown");
+    if (fallback?.runs?.length) {
+      d = { ...fallback, sessionKey: key, _fallback: true };
+    }
+  }
   if (d) {
     CHAT_STATE.data = d;
     if (CHAT_STATE.visible) updateAuditSidebarContent();
