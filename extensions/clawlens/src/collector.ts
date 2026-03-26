@@ -97,7 +97,13 @@ export class Collector {
 
     if (phase === "start") {
       const runId = evt.runId ?? randomUUID();
-      const sessionKey = evt.sessionKey ?? "unknown";
+      // Build session key: prefer evt.sessionKey; fall back to "agent:{agentId}:{channelId}" or "unknown"
+      const agentId = data.agentId as string | undefined;
+      const channelId = data.channelId as string | undefined;
+      const sessionKey = evt.sessionKey
+        ?? (agentId && channelId ? `agent:${agentId}:${channelId}` : undefined)
+        ?? (agentId ? `agent:${agentId}` : undefined)
+        ?? "unknown";
       const startedAt = (data.startedAt as number | undefined) ?? evt.ts ?? Date.now();
 
       const active: ActiveRun = { runId, sessionKey, startedAt, llmCallIndex: 0 };
@@ -217,7 +223,7 @@ export class Collector {
       prompt?: string;
       systemPrompt?: string;
     },
-    _ctx: { sessionKey?: string; agentId?: string; channelId?: string },
+    ctx: { sessionKey?: string; agentId?: string; channelId?: string },
   ): void {
     const runId = event.runId;
     if (!runId) return;
@@ -231,6 +237,14 @@ export class Collector {
     if (active) {
       if (event.prompt) active.lastUserPrompt = event.prompt.slice(0, 200);
       if (event.systemPrompt) active.systemPromptHash = simpleHash(event.systemPrompt);
+
+      // Backfill session key: lifecycle events may not carry sessionKey for some agents
+      // (e.g. heartbeat), but llm_input ctx always has it. Fix "unknown" → real key.
+      if (active.sessionKey === "unknown" && ctx.sessionKey && ctx.sessionKey !== "unknown") {
+        active.sessionKey = ctx.sessionKey;
+        const newKey = ctx.sessionKey;
+        this.enqueue(() => this.store.updateRunSessionKey(runId, newKey));
+      }
     }
   }
 

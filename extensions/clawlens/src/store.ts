@@ -596,6 +596,12 @@ export class Store {
     return { sessionKey, runs: runs.map((r) => this.buildRunAuditDetail(r)) };
   }
 
+  updateRunSessionKey(runId: string, sessionKey: string): void {
+    this.db.prepare(
+      "UPDATE runs SET session_key = ? WHERE run_id = ? AND session_key = 'unknown'",
+    ).run(sessionKey, runId);
+  }
+
   getAuditRun(runId: string): unknown {
     const run = this.db.prepare("SELECT * FROM runs WHERE run_id = ?").get(runId) as any;
     if (!run) return null;
