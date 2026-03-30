@@ -1,7 +1,7 @@
 # ClawLens Plugin — 架构设计文档
 
 > 基于 analysis-raw.md 源码分析结论
-> OpenClaw v2026.3.22 / pi-agent-core 0.61.1
+> OpenClaw v2026.3.23 / pi-agent-core 0.61.1
 
 ---
 
