@@ -44,3 +44,5 @@ openclaw.yaml
 
 # Compare workspace (Module B runtime output, may contain user data)
 compare/
+
+projects-ref/
