@@ -496,9 +496,18 @@ async function refreshChatAudit() {
   }
   // API returns { sessionKey, runs: RunAuditDetail[] }
   let d = await apiFetch("/audit/session/" + encodeURIComponent(key));
-  // If no runs found for this exact key, also try the "unknown" bucket —
-  // some agents (e.g. heartbeat) may not emit sessionKey in lifecycle events
-  // and get stored under "unknown".
+  // If no runs found for the exact key, try progressively coarser fallbacks.
+  // Lifecycle events may omit channelId so "agent:main:main" is stored as
+  // "agent:main". Try each shorter prefix before giving up.
+  if (d && d.runs?.length === 0) {
+    const parts = key.split(":");
+    for (let i = parts.length - 1; i >= 1 && d.runs?.length === 0; i--) {
+      const shorter = parts.slice(0, i).join(":");
+      const fb = await apiFetch("/audit/session/" + encodeURIComponent(shorter));
+      if (fb?.runs?.length) { d = { ...fb, sessionKey: key, _fallback: true }; }
+    }
+  }
+  // Last resort: try the "unknown" bucket.
   if (d && d.runs?.length === 0) {
     const fallback = await apiFetch("/audit/session/unknown");
     if (fallback?.runs?.length) {

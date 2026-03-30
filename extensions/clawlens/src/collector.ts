@@ -238,12 +238,18 @@ export class Collector {
       if (event.prompt) active.lastUserPrompt = event.prompt.slice(0, 200);
       if (event.systemPrompt) active.systemPromptHash = simpleHash(event.systemPrompt);
 
-      // Backfill session key: lifecycle events may not carry sessionKey for some agents
-      // (e.g. heartbeat), but llm_input ctx always has it. Fix "unknown" → real key.
-      if (active.sessionKey === "unknown" && ctx.sessionKey && ctx.sessionKey !== "unknown") {
-        active.sessionKey = ctx.sessionKey;
-        const newKey = ctx.sessionKey;
-        this.enqueue(() => this.store.updateRunSessionKey(runId, newKey));
+      // Backfill session key: lifecycle events may lack channelId so keys like
+      // "agent:main" get stored instead of the full "agent:main:main". The ctx
+      // from llm_input always carries the complete key, so we upgrade whenever
+      // ctx provides a more specific key (is a proper extension of the stored one).
+      if (ctx.sessionKey && ctx.sessionKey !== "unknown" && ctx.sessionKey !== active.sessionKey) {
+        const isMoreSpecific = active.sessionKey === "unknown" ||
+          ctx.sessionKey.startsWith(active.sessionKey + ":");
+        if (isMoreSpecific) {
+          active.sessionKey = ctx.sessionKey;
+          const newKey = ctx.sessionKey;
+          this.enqueue(() => this.store.updateRunSessionKey(runId, newKey));
+        }
       }
     }
   }

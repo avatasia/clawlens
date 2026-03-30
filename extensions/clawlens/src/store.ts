@@ -598,7 +598,7 @@ export class Store {
 
   updateRunSessionKey(runId: string, sessionKey: string): void {
     this.db.prepare(
-      "UPDATE runs SET session_key = ? WHERE run_id = ? AND session_key = 'unknown'",
+      "UPDATE runs SET session_key = ? WHERE run_id = ?",
     ).run(sessionKey, runId);
   }
 

@@ -27,40 +27,24 @@
 
 ClawLens 的数据分为三个层次，在 UI 中用不同标签区分。
 
-### 层次 1：官方口径（Official）
+### 层次 1：官方口径（Official）— 暂未实现
 
-从 `onSessionTranscriptUpdate` 监听到的 `message.usage` 中直接提取，**不做任何重算**。
+> **当前状态**：`officialCost` 字段在 DB 中存在但始终为 `NULL`。
+> `llm_output` hook 的 `PluginHookLlmOutputEvent` 不携带 cost 字段；
+> 如需实现该层次，需要另找能提供 `message.usage.cost` 的数据源。
 
-| 字段 | 来源 | 说明 |
-|------|------|------|
-| input tokens | `message.usage.input` | 经 `normalizeUsage()` 标准化 |
-| output tokens | `message.usage.output` | 同上 |
-| cache read/write | `message.usage.cacheRead/cacheWrite` | 同上 |
-| total tokens | `message.usage.total` 或 in+out+cache 求和 | 同上 |
-| cost total | `message.usage.cost.total` | pi-ai 从内置定价表计算并写入 |
-| cost breakdown | `message.usage.cost.{input,output,cacheRead,cacheWrite}` | 同上 |
-
-**这和官方 Usage 视图读取的是同一个 message 对象、同一个 usage 字段。**
-
-Token 数据保证一致（同一份数据）。Cost 数据在大多数情况下一致（pi-ai 内置定价计算），
-但在以下场景可能和 Usage 视图显示的不同：
-- pi-ai 返回的 `usage.cost` 为空 → 官方 fallback 到 `resolveModelCostConfig` 三层 fallback
-- 用户在 `config.models.providers` 中配了自定义 cost → 官方用自定义 cost，pi-ai 用内置定价
+设计目标：直接提取 pi-ai 内置定价计算的 cost（来自 `message.usage.cost.total`），
+不做任何重算，与官方 Usage 视图一致。
 
 ### 层次 2：ClawLens 计算（Calculated）
 
-用官方的 `resolveModelCostConfig` + `estimateUsageCost` 对同一份 token 数据**独立重算 cost**。
+用自定义 `cost-calculator.ts` 按定价配置重算 cost。
 
 | 字段 | 来源 | 说明 |
 |------|------|------|
-| clawlens cost | `estimateUsageCost({usage, cost: resolveModelCostConfig(...)})` | 三层 fallback |
+| calculatedCost | `calculateCost(usage, costMap.get("provider:model"))` | 仅一层 fallback（`config.models.providers` 中的定价） |
 
-**和层次 1 的 cost 对比**：
-- 一致 → UI 显示绿色勾 ✓
-- 不一致 → UI 显示黄色差异提示，附带可能原因：
-  - "pi-ai 内置定价 vs config 自定义定价不同"
-  - "provider 未返回 cost，使用 fallback 计算"
-  - "models.json 定价已更新，旧数据使用了旧定价"
+若用户未配置对应模型定价，`calculatedCost` 为 `null`。
 
 ### 层次 3：ClawLens 独有（Exclusive）
 
@@ -172,46 +156,17 @@ onAgentEvent(evt => {
 
 **补充数据源**：
 
-- **Per-run 累计 usage**：通过 `api.on("llm_output", ...)` 获取整个 run 的累计 token usage
-- **Per-call usage（瀑布图必需）**：通过 `runtime.events.onSessionTranscriptUpdate` 监听每条 assistant message 写入，提取 per-message usage
+- **Per-call usage（瀑布图核心）**：通过 `api.on("llm_output", ...)` 获取每次 LLM 调用的 token usage。`llm_output` hook 在每次 LLM 调用结束时触发（per-call 粒度），不是 per-run。
 - **System prompt 差异**：通过 `api.on("llm_input", ...)` 捕获每次发送给模型的完整 system prompt
 - **Tool 执行详情**：通过 `api.on("after_tool_call", ...)` 获取每次 tool 执行的结果和耗时
 
-> **数据源一致性论证**
+> **Cost 计算**
 >
-> ClawLens 的 token 数据和官方 Usage 视图来自**同一个源头**：pi-agent-core 的
-> `message_end` 事件中的 `event.message.usage`。验证路径：
+> 当前实现使用内置的 `cost-calculator.ts`，从 `config.models.providers` 读取定价配置，
+> 对 token 用量做线性计算。若用户未配置对应模型定价，`calculatedCost` 为 `null`。
 >
-> 1. pi-agent-core agent-loop 每次 LLM 调用完成时 emit `message_end`
-> 2. OpenClaw 的 `handleMessageEnd()`（pi-embedded-subscribe.handlers.messages.ts:325）从
->    `event.message.usage` 提取 usage，调用 `recordAssistantUsage()` 累加到 `usageTotals`
-> 3. 同一个 `event.message` 对象通过 `appendMessage()` 写入 session state → persist 到 `.jsonl` transcript
-> 4. 官方 Usage 视图从 `.jsonl` 逐行解析 `message.usage`（session-cost-usage.ts:130）
-> 5. ClawLens 通过两个路径获取同一份数据：
->    - `llm_output` hook 的 `getUsageTotals()`：整个 run 结束后的累计值（per-run 粒度）
->    - `onSessionTranscriptUpdate` 的 `update.message.usage`：每条 message 写入时的独立值（per-call 粒度）
-> 6. 两者都经过相同的 `normalizeUsage()` 标准化（处理各 provider 字段名差异）
->
-> **结论**：token 数据**完全一致**，因为读的是同一个 message 对象的同一个 usage 字段。
->
-> **⚠️ `llm_output` hook 是 per-run 触发，不是 per-LLM-call**
->
-> `runLlmOutput` 在 attempt.ts 中只调用一次（run 结束后的 finally 块），`getUsageTotals()`
-> 返回的是整个 run 的累计 usage。如果一个 run 中有 3 次 LLM 调用（tool call 循环），hook
-> 只返回总和。瀑布图需要 per-call 数据，必须用 `onSessionTranscriptUpdate` 获取。
->
-> **Cost 一致性**
->
-> 官方用 `resolveModelCostConfig()` 有三层 fallback：
-> 1. `models.json`（bundled model pricing）
-> 2. `config.models.providers.*.cost`（用户配置）
-> 3. gateway model pricing cache（运行时缓存）
->
-> ClawLens 应直接 import 并调用官方的 `resolveModelCostConfig` + `estimateUsageCost`
-> （从 `src/utils/usage-format.ts`），而不是自己重新实现。这样三层 fallback 完全一致，
-> 不会出现官方显示 $0.015 而 ClawLens 显示 $0 的情况。
-> Plugin 可以通过 `import { resolveModelCostConfig, estimateUsageCost } from "../../utils/usage-format.js"`
-> 访问这些函数（extensions 在同一个 monorepo 中，共享 tsconfig）。
+> `officialCost`（pi-ai 内置定价计算的 cost）当前**未实现**——`llm_output` hook 的
+> `PluginHookLlmOutputEvent` 不包含 cost 字段，该字段始终为 `undefined`。
 >
 > - `onAgentEvent`（全局事件总线）适合追踪 **run 级别生命周期**（start/end/error）
 > - `onAgentEvent` 的 `stream: "assistant"` 事件**不带 usage**，只有 text/delta
@@ -252,7 +207,7 @@ CREATE TABLE runs (
 -- 每次 LLM API 调用（一次运行中可能有多次调用，因为 tool call 循环）
 CREATE TABLE llm_calls (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
-  run_id          TEXT NOT NULL REFERENCES runs(run_id),
+  run_id          TEXT NOT NULL,     -- 关联 runs.run_id（无外键约束）
   call_index      INTEGER NOT NULL,  -- 第几次调用 (0, 1, 2...)
   started_at      INTEGER NOT NULL,
   ended_at        INTEGER,
@@ -261,12 +216,11 @@ CREATE TABLE llm_calls (
   output_tokens   INTEGER,
   cache_read      INTEGER,
   cache_write     INTEGER,
-  official_cost   REAL,              -- 层次 1：pi-ai 内置定价计算的 cost (message.usage.cost.total)
-  calculated_cost REAL,              -- 层次 2：ClawLens 用 resolveModelCostConfig 三层 fallback 重算的 cost
+  official_cost   REAL,              -- 暂未实现：llm_output hook 不提供 cost 字段，始终为 NULL
+  calculated_cost REAL,              -- ClawLens 用 cost-calculator.ts 按定价配置计算（未配置则 NULL）
   provider        TEXT,
   model           TEXT,
   stop_reason     TEXT,
-  message_count   INTEGER,
   system_prompt_hash TEXT,           -- system prompt 的 hash（用于检测 channel 差异）
   user_prompt_preview TEXT,          -- 用户 prompt 前 200 字符
   tool_calls_in_response INTEGER DEFAULT 0
@@ -275,8 +229,7 @@ CREATE TABLE llm_calls (
 -- 每次工具执行
 CREATE TABLE tool_executions (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
-  run_id          TEXT NOT NULL REFERENCES runs(run_id),
-  llm_call_index  INTEGER NOT NULL,  -- 属于哪次 LLM 调用
+  run_id          TEXT NOT NULL,     -- 关联 runs.run_id（无外键约束）
   tool_call_id    TEXT NOT NULL,
   tool_name       TEXT NOT NULL,
   started_at      INTEGER NOT NULL,
@@ -303,186 +256,95 @@ CREATE INDEX idx_tool_exec_run ON tool_executions(run_id);
 | 数据源 | 粒度 | 采集内容 |
 |--------|------|---------|
 | `runtime.events.onAgentEvent` | per-run | run 生命周期（start/end/error） |
-| `runtime.events.onSessionTranscriptUpdate` | per-LLM-call | 每次 LLM 调用的独立 usage + provider/model（瀑布图核心数据源） |
+| `api.on("llm_output")` | per-LLM-call | 每次 LLM 调用的 usage + provider/model（瀑布图核心数据源） |
 | `api.on("llm_input")` | per-LLM-call | system prompt hash + user prompt preview |
 | `api.on("after_tool_call")` | per-tool-call | tool 名称、参数、结果、耗时 |
 
-> **为什么不用 `api.on("llm_output")` 做瀑布图？**
->
-> `llm_output` hook 在整个 run 结束后只触发一次（attempt.ts 的 finally 块），
-> `getUsageTotals()` 返回的是所有 LLM 调用的累计值。如果一个 run 有 3 次 LLM 调用，
-> hook 返回的是总和，无法拆分。瀑布图需要 per-call 粒度，必须用 `onSessionTranscriptUpdate`。
->
-> `llm_output` hook 仍然保留注册，用于 Overview 面板的 per-run 汇总更新。
-
 ```typescript
-// collector.ts 核心逻辑（伪代码）
-
-// ★ 直接使用官方的 cost 函数，保证三层 fallback 一致
-import { resolveModelCostConfig, estimateUsageCost } from "../../utils/usage-format.js";
+// collector.ts 核心逻辑（伪代码，与实际实现一致）
 
 class Collector {
   private store: Store;
   private sseManager: SSEManager;
-  private activeRuns: Map<string, RunState>;
-  private sessionIdToRunId: Map<string, string>;
-  private eventQueue: Array<() => void> = [];
-  private flushTimer: NodeJS.Timer | null = null;
-  private unsubTranscript: (() => void) | null = null;
+  private activeRuns: Map<string, RunState>;     // runId → RunState
+  private sessionIdToRunId: Map<string, string>; // sessionId → runId (agent_end 关联)
+  private queue: Array<() => void> = [];
+  private flushInterval: ReturnType<typeof setInterval> | null = null;
+  private costMap: Map<string, CostConfig>;      // "provider:model" → pricing
 
-  start(runtime: PluginRuntime, config: OpenClawConfig) {
-    this.flushTimer = setInterval(() => this.flushEventQueue(), 100);
-
-    // ★ per-call usage 的数据源：每条 assistant message 写入 transcript 时触发
-    this.unsubTranscript = runtime.events.onSessionTranscriptUpdate((update) => {
-      this.handleTranscriptUpdate(update, config);
-    });
+  start(runtime, globalConfig, pluginConfig) {
+    this.costMap = loadCostConfig(globalConfig);  // 从 config.models.providers 读取定价
+    this.flushInterval = setInterval(() => this.flush(), 100);
   }
 
   // ── onAgentEvent：run 级别生命周期 ──
-  handleAgentEvent(evt: AgentEventPayload) {
-    this.eventQueue.push(() => {
-      if (evt.stream !== 'lifecycle') return;
-      if (evt.data.phase === 'start') {
-        this.activeRuns.set(evt.runId, {
-          runId: evt.runId,
-          sessionKey: evt.sessionKey,
-          startedAt: evt.ts,
-          llmCallIndex: 0,
-        });
-        this.store.insertRun(evt);
-        this.sseManager.broadcast({ type: 'run_started', runId: evt.runId });
-      }
-      if (evt.data.phase === 'end' || evt.data.phase === 'error') {
-        this.store.completeRun(evt);
-        this.activeRuns.delete(evt.runId);
-        this.sseManager.broadcast({ type: 'run_ended', runId: evt.runId });
-      }
-    });
+  handleAgentEvent(evt) {
+    if (evt.stream !== 'lifecycle') return;
+    if (evt.data.phase === 'start') {
+      // sessionKey 优先级：evt.sessionKey > agent:{agentId}:{channelId} > agent:{agentId} > "unknown"
+      const sessionKey = evt.sessionKey
+        ?? (agentId && channelId ? `agent:${agentId}:${channelId}` : undefined)
+        ?? (agentId ? `agent:${agentId}` : undefined)
+        ?? "unknown";
+      this.activeRuns.set(runId, { runId, sessionKey, startedAt, llmCallIndex: 0 });
+      this.enqueue(() => {
+        this.store.insertRun(runId, sessionKey, startedAt, opts);
+        this.sseManager.broadcast({ type: 'run_started', runId, sessionKey });
+      });
+    } else if (phase === 'end' || phase === 'error') {
+      this.activeRuns.delete(runId);
+      this.scheduleComplete(runId, endedAt, status);  // 延迟 800ms 等待 trailing events
+    }
   }
 
-  // ── onSessionTranscriptUpdate：per-call usage（瀑布图核心）──
-  // 和官方 Usage 视图从 .jsonl 解析的是同一个 message.usage 对象
-  handleTranscriptUpdate(update: SessionTranscriptUpdate, config: OpenClawConfig) {
-    const msg = update.message as Record<string, unknown> | undefined;
-    if (!msg || msg.role !== 'assistant') return;
-
-    const usageRaw = msg.usage as Record<string, unknown> | undefined;
-    if (!usageRaw) return;
-
-    const usage = normalizeUsage(usageRaw);  // 同官方 normalizeUsage
-    if (!usage) return;
-
-    const provider = String(msg.provider ?? '');
-    const model = String(msg.model ?? '');
-    const sessionKey = update.sessionKey;
-    const run = sessionKey
-      ? [...this.activeRuns.values()].find(r => r.sessionKey === sessionKey)
-      : undefined;
-    if (!run) return;
-
-    // ★ 层次 1：官方口径 cost — 从 message.usage.cost 直接提取（pi-ai 内置定价计算）
-    const officialCost = extractCostFromUsage(usageRaw);  // usage.cost.total
-
-    // ★ 层次 2：ClawLens 计算 cost — 用 resolveModelCostConfig 三层 fallback 独立重算
-    const costConfig = resolveModelCostConfig({ provider, model, config });
-    const calculatedCost = estimateUsageCost({ usage, cost: costConfig });
-
-    this.eventQueue.push(() => {
-      this.store.insertLlmCall({
-        runId: run.runId,
-        callIndex: run.llmCallIndex++,
-        startedAt: Date.now(),
-        inputTokens: usage.input,
-        outputTokens: usage.output,
-        cacheRead: usage.cacheRead,
-        cacheWrite: usage.cacheWrite,
-        officialCost: officialCost ?? null,      // 层次 1
-        calculatedCost: calculatedCost ?? null,  // 层次 2
-        provider,
-        model,
-        systemPromptHash: run.systemPromptHash,
-        userPromptPreview: run.lastUserPrompt,
+  // ── llm_output hook：per-call usage（瀑布图核心）──
+  // llm_output 在每次 LLM 调用结束时触发，不是 per-run
+  recordLlmCall(event, ctx) {
+    const active = this.activeRuns.get(event.runId);
+    const callIndex = active ? active.llmCallIndex++ : 0;
+    const costKey = `${event.provider}:${event.model}`;
+    const calculatedCost = calculateCost(event.usage, this.costMap.get(costKey));
+    this.enqueue(() => {
+      this.store.insertLlmCall(runId, callIndex, now, {
+        inputTokens, outputTokens, cacheRead, cacheWrite,
+        calculatedCost,
+        officialCost: undefined,  // llm_output hook 不提供 cost，暂未实现
+        provider, model, stopReason, systemPromptHash, userPromptPreview,
       });
     });
   }
 
-  // 从 usage.cost 中直接提取 pi-ai 返回的 cost
-  private extractCostFromUsage(usageRaw: Record<string, unknown>): number | undefined {
-    const cost = usageRaw.cost as Record<string, unknown> | undefined;
-    if (!cost) return undefined;
-    const total = cost.total;
-    return typeof total === 'number' && Number.isFinite(total) && total >= 0 ? total : undefined;
-  }
-
-  // ── llm_input hook：system prompt hash + user prompt ──
-  recordLlmInput(event: LlmInputEvent, ctx: AgentContext) {
-    this.eventQueue.push(() => {
-      this.sessionIdToRunId.set(event.sessionId, event.runId);
-      const run = this.activeRuns.get(event.runId);
-      if (!run) return;
-      run.lastUserPrompt = event.prompt?.slice(0, 200);
-      run.systemPromptHash = simpleHash(event.systemPrompt ?? '');
-    });
+  // ── llm_input hook：system prompt hash + user prompt + session key 回填 ──
+  recordLlmInput(event, ctx) {
+    if (event.sessionId) this.sessionIdToRunId.set(event.sessionId, event.runId);
+    const active = this.activeRuns.get(event.runId);
+    if (active) {
+      if (event.prompt) active.lastUserPrompt = event.prompt.slice(0, 200);
+      if (event.systemPrompt) active.systemPromptHash = simpleHash(event.systemPrompt);
+      // 回填更完整的 session key（lifecycle start 事件可能只提供了部分键）
+      if (ctx.sessionKey !== active.sessionKey
+          && (active.sessionKey === "unknown"
+              || ctx.sessionKey.startsWith(active.sessionKey + ":"))) {
+        active.sessionKey = ctx.sessionKey;
+        this.enqueue(() => this.store.updateRunSessionKey(runId, ctx.sessionKey));
+      }
+    }
   }
 
   // ── after_tool_call hook：tool 执行详情 ──
-  recordToolCall(event: AfterToolCallEvent, ctx: ToolContext) {
-    this.eventQueue.push(() => {
-      this.store.insertToolExecution({
-        runId: ctx.runId ?? event.runId,
-        toolName: event.toolName,
-        toolCallId: event.toolCallId,
-        startedAt: Date.now() - (event.durationMs ?? 0),
-        durationMs: event.durationMs,
-        isError: !!event.error,
-        argsSummary: truncate(JSON.stringify(event.params), 200),
-        resultSummary: truncate(String(event.result ?? event.error ?? ''), 200),
-      });
-    });
+  recordToolCall(event, ctx) {
+    this.enqueue(() => this.store.insertToolExecution(runId, toolCallId, toolName, startedAt, opts));
   }
 
   // ── agent_end hook：对话轮次（conversation_turns）──
-  recordAgentEnd(event: AgentEndEvent, ctx: AgentContext) {
-    this.eventQueue.push(() => {
-      const runId = ctx.sessionId
-        ? this.sessionIdToRunId.get(ctx.sessionId)
-        : undefined;
-      if (!runId || !ctx.sessionKey) return;
-
-      const messages = event.messages as Array<{ role?: string; content?: string | unknown[] }>;
-      let turnIndex = 0;
-      for (const msg of messages) {
-        const role = msg.role ?? 'unknown';
-        const content = typeof msg.content === 'string'
-          ? msg.content : JSON.stringify(msg.content ?? '');
-        this.store.insertConversationTurn(
-          runId, ctx.sessionKey, turnIndex++, role,
-          content.slice(0, 500), content.length, Date.now(),
-        );
+  recordAgentEnd(event, ctx) {
+    const runId = ctx.sessionId ? this.sessionIdToRunId.get(ctx.sessionId) : undefined;
+    if (!runId || !ctx.sessionKey) return;
+    this.enqueue(() => {
+      for (const msg of event.messages) {
+        this.store.insertConversationTurn(runId, ctx.sessionKey, turnIndex++, role, content, ...);
       }
     });
-  }
-
-  // ── llm_output hook：per-run 汇总（Overview 面板用）──
-  recordLlmOutput(event: LlmOutputEvent, ctx: AgentContext) {
-    // 用 per-run 累计 usage 更新 runs 表的汇总字段
-    // 瀑布图的 per-call 数据来自 handleTranscriptUpdate
-    this.eventQueue.push(() => {
-      if (!event.usage) return;
-      this.store.updateRunUsageTotals(event.runId, event.usage);
-    });
-  }
-
-  private flushEventQueue() {
-    const batch = this.eventQueue.splice(0);
-    for (const fn of batch) fn();
-  }
-
-  stop() {
-    if (this.flushTimer) clearInterval(this.flushTimer);
-    this.flushEventQueue();
-    this.unsubTranscript?.();
   }
 }
 ```
@@ -630,7 +492,6 @@ clawlens:
       - provider: google
         model: gemini-2.5-flash
     channels: ["telegram"]   # 只在指定 channel 生效
-    workspaceMode: "copy"    # copy | sandbox | shared
     maxConcurrent: 3         # 最多同时几个对比运行
 ```
 
@@ -663,42 +524,42 @@ clawlens:
 ```
 Plugin HTTP 路由（前缀: /plugins/clawlens）
 
+# ── 已实现 ──────────────────────────────────────────────────────────
+
 GET  /plugins/clawlens/api/overview
-  → 全局汇总：活跃 session 数、总 token、总 cost、平均效率
+  → 全局汇总：活跃 run 数、24h token 总量、24h cost 总量
 
-GET  /plugins/clawlens/api/sessions?channel=&model=&since=&limit=
-  → session 列表 + 汇总指标
-
-GET  /plugins/clawlens/api/session/:sessionKey
-  → 单个 session 的所有 run 详情
+GET  /plugins/clawlens/api/sessions?channel=&model=&provider=&limit=&offset=
+  → session 列表 + per-session 汇总指标
 
 GET  /plugins/clawlens/api/run/:runId
-  → 单个 run 的 LLM 调用 + tool 执行时间线
+  → 单个 run 的详情（LLM 调用 + tool 执行列表 + 对话轮次）
 
-GET  /plugins/clawlens/api/run/:runId/waterfall
-  → 瀑布图数据（时间线格式）
+GET  /plugins/clawlens/api/audit?days=&channel=&limit=
+  → 审计视图：session 列表，含每个 session 的聚合统计
 
-GET  /plugins/clawlens/api/compare/:groupId
-  → 对比组的全部模型结果
+GET  /plugins/clawlens/api/audit/session/:sessionKey
+  → 单个 session 的所有 run 完整审计数据（含瀑布图 timeline）
 
-GET  /plugins/clawlens/api/compare/list?since=&limit=
-  → 对比组列表
+GET  /plugins/clawlens/api/audit/run/:runId
+  → 单个 run 的完整审计数据
 
-GET  /plugins/clawlens/api/stats/channels
-  → 按 channel 分组的效率统计
-
-GET  /plugins/clawlens/api/stats/models
-  → 按 model 分组的效率统计
-
-POST /plugins/clawlens/api/compare/trigger
-  → 手动触发一次对比运行
-
-POST /plugins/clawlens/api/config
-  → 更新 clawlens 配置（开关对比、修改模型列表）
+GET  /plugins/clawlens/api/events  (SSE)
+  → 实时事件推送（run_started / run_ended / llm_call / tool_executed）
 
 # 静态资源
 GET  /plugins/clawlens/ui/*
-  → 注入脚本、CSS、图标等
+  → 注入脚本（inject.js）、样式表（styles.css）
+
+# ── 未实现（待开发）──────────────────────────────────────────────────
+
+GET  /plugins/clawlens/api/session/:sessionKey   # 注：当前只有 audit/session/:key
+GET  /plugins/clawlens/api/compare/:groupId
+GET  /plugins/clawlens/api/compare/list
+GET  /plugins/clawlens/api/stats/channels
+GET  /plugins/clawlens/api/stats/models
+POST /plugins/clawlens/api/compare/trigger
+POST /plugins/clawlens/api/config
 ```
 
 ### 6.2 实时推送（SSE）
