@@ -31,6 +31,7 @@ cat extensions/clawlens/index.ts
 cat extensions/clawlens/src/types.ts
 cat extensions/clawlens/src/store.ts
 cat extensions/clawlens/src/collector.ts
+cat extensions/clawlens/src/comparator.ts
 cat extensions/clawlens/src/cost-calculator.ts
 cat extensions/clawlens/src/api-routes.ts
 cat extensions/clawlens/src/sse-manager.ts
