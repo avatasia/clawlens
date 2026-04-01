@@ -313,6 +313,32 @@
 - `conversation_turns` 表中，同一 run 的所有行 `timestamp` 字段完全相同。
 - 无法通过时间戳排序区分轮次顺序，只能依赖 `turn_index`。
 
+### P2-7 `refreshChatAudit()` "unknown" 回退桶会显示无关 run 数据
+
+证据：
+
+- `extensions/clawlens/ui/inject.js:511-516`
+
+现状：
+
+- 当当前 session key 查不到任何 run，且所有前缀截断后仍为 0 时，代码回退到 `/audit/session/unknown`。
+- `unknown` 桶聚合了所有未能解析到 sessionKey 的 run，与当前会话无关。
+- 若该桶有数据，sidebar 会展示完全不属于本次会话的 run，且外观上看不出是回退数据（`_fallback: true` 只存在于内存，UI 不显示）。
+- 用户可能误以为看到的是自己当前会话的审计记录。
+
+### P2-8 `CHAT_STATE.pollTimer` 从不清理
+
+证据：
+
+- `extensions/clawlens/ui/inject.js:523-529,467-471`
+
+现状：
+
+- `startChatPolling()` 设置了一个 10 秒 `setInterval`，存入 `CHAT_STATE.pollTimer`。
+- `hideChatAuditSidebar()` 移除了 DOM 元素并将 `CHAT_STATE.visible` 置为 `false`，但没有 `clearInterval(CHAT_STATE.pollTimer)` 也没有将 `CHAT_STATE.pollTimer` 清空。
+- 一旦 polling 启动，它将在整个页面生命周期内持续以 10 秒为间隔调用 `refreshChatAudit()`，包括用户已离开 chat 视图后。
+- `startChatPolling()` 的幂等守卫（`if (CHAT_STATE.pollTimer) return`）虽防止了重复启动，但也使 timer 永远不可被替换或停止。
+
 ### P2-2 测试文件与实现脱节
 
 证据：

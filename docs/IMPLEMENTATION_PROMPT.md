@@ -364,6 +364,41 @@ const config: ClawLensConfig = {
 }
 ```
 
+#### P2-6 修复 `refreshChatAudit()` "unknown" 回退桶显示无关数据
+
+`inject.js:511-516` 在所有 sessionKey 前缀查询都返回 0 runs 后，会回退到 `/audit/session/unknown`。该桶聚合了所有无法解析 sessionKey 的 run，与当前会话无任何关联。
+
+删除该 fallback 块，或改为向用户展示"未找到数据"而不是展示可能无关的 run：
+
+```javascript
+// 删除以下段落（inject.js:511-516）：
+if (d && d.runs?.length === 0) {
+  const fallback = await apiFetch("/audit/session/unknown");
+  if (fallback?.runs?.length) {
+    d = { ...fallback, sessionKey: key, _fallback: true };
+  }
+}
+```
+
+#### P2-7 修复 `CHAT_STATE.pollTimer` 从不被清理
+
+`inject.js:523-529` 的 `startChatPolling()` 设置了持续 10 秒轮询的 `setInterval`，但没有对应的清理逻辑。即使 sidebar 已关闭或用户离开 chat 视图，轮询依然持续。
+
+在 `hideChatAuditSidebar()` 中加入清理：
+
+```javascript
+function hideChatAuditSidebar() {
+  const sidebar = document.getElementById("clawlens-audit-sidebar");
+  if (sidebar) sidebar.remove();
+  CHAT_STATE.visible = false;
+  // 新增：
+  if (CHAT_STATE.pollTimer) {
+    clearInterval(CHAT_STATE.pollTimer);
+    CHAT_STATE.pollTimer = null;
+  }
+}
+```
+
 ---
 
 ## 4. 测试文件修复
@@ -542,6 +577,6 @@ echo "截图: /tmp/clawlens-overview.png  /tmp/clawlens-chat.png"
 4. `src/collector.ts` — recordLlmOutput 改名、officialCost、flush 加日志、sessionIdToRunId 清理、recordAgentEnd 回退（snapshotIntervalMs 保守处理，不改 flush 间隔）
 5. `index.ts` — 更新 hook 名称、深合并 config、移除 patchControlUiIndexHtml 默认调用
 6. `src/api-routes.ts` — try/catch、NaN 防护（SSE token 修复见下条）
-7. `ui/inject.js` — SSE 刷新条件修窄；SSE token 认证重构（若本轮决定处理，需同步改 inject.js 和 api-routes.ts）
+7. `ui/inject.js` — SSE 刷新条件修窄；移除 unknown 回退桶；修复 pollTimer 泄漏；SSE token 认证重构（若本轮决定处理，需同步改 inject.js 和 api-routes.ts）
 8. `tests/` — 先修字段名，再确认运行方案后修 import 路径
 9. Comparator（最后，依赖 configSchema 修复）
