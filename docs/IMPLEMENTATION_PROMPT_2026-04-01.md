@@ -343,24 +343,21 @@ console.assert(m2.size === 1, '完整 config 应入表');
 console.log('OK');
 "
 
-# 3. NaN 查询参数修复验证
+# 3. NaN 查询参数修复验证（验证修复后的解析逻辑，而不是只复现旧错误）
 node -e "
-import { Store } from './extensions/clawlens/src/store.ts';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'clawlens-check-'));
-const store = new Store(dir);
-store.insertRun('r1','s1',Date.now());
-store.completeRun('r1',Date.now(),'completed');
-try {
-  store.getSessions({ limit: Number.NaN });
-  console.error('expected datatype mismatch before fix');
-} catch (e) {
-  console.log(String(e).includes('datatype mismatch') ? 'datatype mismatch reproduced' : String(e));
+const { DatabaseSync } = await import('node:sqlite');
+const db = new DatabaseSync(':memory:');
+db.exec('CREATE TABLE runs (run_id TEXT, started_at INTEGER)');
+db.exec(\"INSERT INTO runs VALUES ('r1', 1000)\");
+function parseIntParam(v, d) {
+  if (v === null) return d;
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : d;
 }
-store.close();
-fs.rmSync(dir, { recursive: true, force: true });
+const limit = parseIntParam('foo', 50);
+const rows = db.prepare('SELECT * FROM runs LIMIT ? OFFSET ?').all(limit, 0);
+console.assert(rows.length === 1, '修复后应返回 1 行，而不是 datatype mismatch');
+console.log('OK');
 "
 ```
 

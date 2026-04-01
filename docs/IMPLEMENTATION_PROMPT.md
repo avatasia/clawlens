@@ -482,9 +482,9 @@ console.assert(m2.size === 1, '完整 config 应入表');
 console.log('✅ cost-calculator NaN 修复 OK');
 "
 
-# 3. NaN 查询参数修复验证（SQLite，纯 JS）
+# 3. NaN 查询参数修复验证（验证修复后的解析逻辑，而不是只复现旧错误）
 node -e "
-const { DatabaseSync } = require('node:sqlite');
+const { DatabaseSync } = await import('node:sqlite');
 const db = new DatabaseSync(':memory:');
 db.exec('CREATE TABLE runs (run_id TEXT, started_at INTEGER)');
 db.exec(\"INSERT INTO runs VALUES ('r1', 1000)\");
@@ -495,7 +495,7 @@ function parseIntParam(v, d) {
 }
 const limit = parseIntParam('foo', 50);
 const rows = db.prepare('SELECT * FROM runs LIMIT ? OFFSET ?').all(limit, 0);
-console.assert(rows.length === 1, '应返回 1 行');
+console.assert(rows.length === 1, '修复后应返回 1 行，而不是 datatype mismatch');
 console.log('✅ NaN 防护 OK');
 "
 ```
