@@ -138,18 +138,20 @@
 - `intervalMs` 被读取但没有被用到。
 - 实际 flush 定时器始终固定为 100ms。
 
-### P1-2 Comparator 缺少 `sessionId`
+### P1-2 Comparator 缺少多个 `runEmbeddedPiAgent()` 必填参数
 
 证据：
 
 - `extensions/clawlens/src/comparator.ts:72-96`
-- `projects-ref/openclaw/src/agents/pi-embedded-runner/run/params.ts:27-28`
+- `projects-ref/openclaw/src/agents/pi-embedded-runner/run/params.ts:27-28`（`sessionId: string`）
+- `projects-ref/openclaw/src/agents/pi-embedded-runner/run/params.ts:77`（`prompt: string`）
+- `projects-ref/openclaw/src/agents/pi-embedded-runner/run/params.ts:105`（`runId: string`）
 
 现状：
 
-- `runEmbeddedPiAgent()` 的 `sessionId` 是必填。
-- Comparator 调用时未传该字段。
-- `runtime: any` 抹掉了本应在编译期暴露出来的错误。
+- `RunEmbeddedPiAgentParams` 中共有六个无 `?` 的必填字段：`sessionId`、`sessionFile`、`workspaceDir`、`prompt`、`timeoutMs`、`runId`。
+- Comparator 传了 `sessionFile`、`workspaceDir`、`timeoutMs`；但缺少 `sessionId`、`prompt`、`runId`。
+- `runtime: any`（comparator.ts:24）抹掉了编译期报错；三个缺失字段在运行时会为 `undefined`。
 
 ### P1-3 Comparator 异常被完全吞掉
 
