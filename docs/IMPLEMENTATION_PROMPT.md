@@ -1,4 +1,4 @@
-# ClawLens — 代码实现提示词（完整版）
+# ClawLens — 代码实现提示词
 
 > 基于四份复核文档（2026-04-01）生成。
 > 涵盖 Bug 修复、功能补全、本地验证与远程部署，合并自 `claude-code-prompt.md` 和 `claude-code-prompt-update.md`。
@@ -55,7 +55,7 @@ cat extensions/clawlens/ui/styles.css
 
 ---
 
-## 3. Bug 修复清单（按优先级）
+## 3. 必须修（本轮）
 
 ### P0 — 数据根本性错误
 
@@ -68,12 +68,13 @@ cat extensions/clawlens/ui/styles.css
    > 此方法由 `llm_output` hook 触发，一个 run 只调用一次，写入的是全 run 累计 usage。
 
 2. 同步更新 `index.ts` 中的 hook 注册：
-   ```typescript
-   // 改前：
-   api.on("llm_output", (event: any, ctx: any) => collector.recordLlmCall(event, ctx));
-   // 改后：
-   api.on("llm_output", (event: any, ctx: any) => collector.recordLlmOutput(event, ctx));
-   ```
+
+```typescript
+// 改前：
+api.on("llm_output", (event: any, ctx: any) => collector.recordLlmCall(event, ctx));
+// 改后：
+api.on("llm_output", (event: any, ctx: any) => collector.recordLlmOutput(event, ctx));
+```
 
 #### P0-2 尝试读取 `officialCost`
 
@@ -159,9 +160,9 @@ if (official == null && calculated == null) return { costMatch: true };
 if (official == null && calculated == null) return { costMatch: false, costDiffReason: "no cost data available" };
 ```
 
-#### P1-4 修复 `cleanup()` — 加事务
+#### P1-4 修复 `cleanup()` — 加事务并覆盖 `conversation_turns`
 
-把现有多个 DELETE 操作包进一个事务，防止中途崩溃产生部分清理状态：
+把现有多个 DELETE 操作包进一个事务，防止中途崩溃产生部分清理状态，同时把 `conversation_turns` 纳入清理路径（原实现遗漏）：
 
 ```typescript
 cleanup(retentionDays: number): void {
@@ -185,13 +186,7 @@ cleanup(retentionDays: number): void {
 }
 ```
 
-注意：`conversation_turns` 也在这里删除了（下一条 P1-5 的修复已合并进来）。
-
-#### P1-5 修复 `conversation_turns` 不受保留策略覆盖
-
-已合并到 P1-4 的 `cleanup()` 修复中（在事务内对每个 `run_id` 先删 `conversation_turns`）。
-
-#### P1-6 修复 `sessionIdToRunId` 永不清理
+#### P1-5 修复 `sessionIdToRunId` 永不清理
 
 在 `stop()` 方法末尾加：
 
@@ -199,7 +194,7 @@ cleanup(retentionDays: number): void {
 this.sessionIdToRunId.clear();
 ```
 
-#### P1-7 修复 `recordAgentEnd()` 无 `sessionKey` 回退
+#### P1-6 修复 `recordAgentEnd()` 无 `sessionKey` 回退
 
 当 `ctx.sessionKey` 缺失时，回退到 `activeRuns` 中存储的 sessionKey：
 
@@ -225,7 +220,7 @@ recordAgentEnd(event: { messages?: unknown[]; success?: boolean; durationMs?: nu
 }
 ```
 
-#### P1-8 修复 `flush()` 静默吞错
+#### P1-7 修复 `flush()` 静默吞错
 
 catch 体不能为空，至少输出一条日志（Collector 持有 logger 的话用 logger，否则用 console.error）：
 
@@ -242,7 +237,7 @@ private flush(): void {
 }
 ```
 
-#### P1-9 `snapshotIntervalMs` 配置项当前无效（不要改动 flush() 间隔）
+#### P1-8 `snapshotIntervalMs` 配置项当前无效（不要改动 flush() 间隔）
 
 `collector.ts` 的 `start()` 读取了 `intervalMs`（默认 60_000），但 `setInterval` 写死为 `100ms`——这两个数字语义不同：100ms 是写队列排空节奏，60s 是 snapshot 采集节奏，直接替换会让写库从 100ms 变成 60s，造成严重延迟。
 
@@ -257,7 +252,7 @@ private flush(): void {
 
 ### P1 — API / 安全
 
-#### P1-10 修复 API handler 无顶层 try/catch
+#### P1-9 修复 API handler 无顶层 try/catch
 
 在 `api-routes.ts` 的 handler 函数体最外层包一层 try/catch：
 
@@ -271,7 +266,7 @@ handler(req, res) {
 }
 ```
 
-#### P1-11 修复 NaN 注入 — 校验 Number() 转换结果
+#### P1-10 修复 NaN 注入 — 校验 Number() 转换结果
 
 所有从 query string 转换为数字的地方，加有效性检查：
 
@@ -290,14 +285,16 @@ const days     = parseIntParam(url.searchParams.get("days"), 7);
 const limit    = parseIntParam(url.searchParams.get("limit"), 100);
 ```
 
-#### P1-12 SSE token 暴露在 URL 查询参数
+#### P1-11 SSE token 暴露在 URL 查询参数
 
 当前 `/events?token=...` 把认证 token 放在 URL 里，会出现在服务端访问日志、浏览器历史、代理日志中。
 
-**注意**：原生 `EventSource` 不支持自定义请求头，不能简单改成 `Authorization: Bearer`。可接受的修复方向只有两类：
+**注意**：原生 `EventSource` 不支持自定义请求头，不能简单改成 `Authorization: Bearer`。修复方向只有两类：
 
 1. 改成基于 `fetch()` 的 SSE 客户端（`inject.js` 侧），这样可以走 `Authorization: Bearer ...`
 2. 改为由更安全的同源会话/cookie 机制承载认证
+
+**若涉及认证机制重构，需同步修改 `inject.js` 和 `api-routes.ts` 两侧；不要只改一端产生半改状态。**
 
 如果本轮不打算重构 SSE 客户端，就暂不处理此项，不要引入半成品修复。
 
@@ -327,15 +324,7 @@ if (S.selSession && ev.sessionKey === S.selSession) selectSession(S.selSession);
 
 不要继续把改写 OpenClaw dist 产物当成可接受实现。
 
-#### P2-3 `getSessionRuns()` 死代码（可选清理）
-
-`store.ts` 中的 `getSessionRuns()` 方法当前无调用方，且只读取了旧的 `cost_usd` 字段，未包含 `official_cost`/`calculated_cost`。"无调用方"本身只是候选死代码证据，不足以强制删除。
-
-处理方式：
-- 若已全局搜索确认无计划使用，可删除
-- 否则保留，留待后续单独做 dead-code 清理
-
-#### P2-4 修复 `index.ts` 浅合并丢失嵌套配置
+#### P2-3 修复 `index.ts` 浅合并丢失嵌套配置
 
 ```typescript
 // 改前：
@@ -348,7 +337,7 @@ const config: ClawLensConfig = {
 };
 ```
 
-#### P2-5 Comparator 补充必填参数（configSchema 修复后才有意义）
+#### P2-4 Comparator 补充必填参数（configSchema 修复后才有意义）
 
 完成 P1-1 的 configSchema 修复后，再修正 `comparator.ts` 的 `runEmbeddedPiAgent()` 调用。
 当前缺失的必填参数：`sessionId`、`prompt`、`runId`。
@@ -365,11 +354,11 @@ const config: ClawLensConfig = {
 }
 ```
 
-#### P2-6 修复 `refreshChatAudit()` "unknown" 回退桶显示无关数据
+#### P2-5 移除 chat audit 的 `unknown` fallback
 
-`inject.js:511-516` 在所有 sessionKey 前缀查询都返回 0 runs 后，会回退到 `/audit/session/unknown`。该桶聚合了所有无法解析 sessionKey 的 run，与当前会话无任何关联。
+`inject.js:511-516`：`refreshChatAudit()` 在精确 key 和逐级缩短前缀都查不到结果后，还会回退到 `/audit/session/unknown`。该桶聚合的是所有无法解析 sessionKey 的 run，与当前 chat session 不相关，会把无关数据混进侧栏。
 
-删除该 fallback 块，或改为向用户展示"未找到数据"而不是展示可能无关的 run：
+保留"逐级缩短前缀"的 fallback，删除最终的 `unknown` fallback：
 
 ```javascript
 // 删除以下段落（inject.js:511-516）：
@@ -381,11 +370,11 @@ if (d && d.runs?.length === 0) {
 }
 ```
 
-#### P2-7 修复 `CHAT_STATE.pollTimer` 从不被清理
+#### P2-6 修复 `CHAT_STATE.pollTimer` 从不被清理
 
-`inject.js:523-529` 的 `startChatPolling()` 设置了持续 10 秒轮询的 `setInterval`，但没有对应的清理逻辑。即使 sidebar 已关闭或用户离开 chat 视图，轮询依然持续。
+`inject.js:523-529`：`startChatPolling()` 设置了 10 秒 `setInterval`，但 `hideChatAuditSidebar()` 只移除 DOM，不清理 timer。即使侧栏关闭或路由切走，轮询仍持续。
 
-在 `hideChatAuditSidebar()` 中加入清理：
+在 `hideChatAuditSidebar()` 中补上：
 
 ```javascript
 function hideChatAuditSidebar() {
@@ -402,11 +391,21 @@ function hideChatAuditSidebar() {
 
 ---
 
-## 4. 测试文件修复
+## 4. 可选优化
+
+以下问题已确认存在，但不影响核心功能，可在本轮完成必修项后按需处理：
+
+#### `getSessionRuns()` 死代码
+
+`store.ts` 中的 `getSessionRuns()` 当前无调用方，且只读取了旧的 `cost_usd` 字段，未包含 `official_cost`/`calculated_cost`。若已全局搜索确认无未来计划使用，可删除；否则保留，留待后续单独做 dead-code 清理。
+
+---
+
+## 5. 测试文件修复
 
 当前三个测试文件导入不存在的 `.js` 文件：
 
-```
+```text
 tests/collector.test.ts       → ../src/collector.js       (不存在)
 tests/cost-calculator.test.ts → ../src/cost-calculator.js (不存在)
 tests/sse-manager.test.ts     → ../src/sse-manager.js     (不存在)
@@ -445,9 +444,11 @@ tests/sse-manager.test.ts     → ../src/sse-manager.js     (不存在)
 
 ---
 
-## 5. 验证
+## 6. 验证
 
-### 5-A 本地验证（每批改完立即跑）
+> 验证目标是**确认修复生效**，不是复现旧 bug。本地验证命令均为纯 JS 内联脚本，不依赖构建产物。
+
+### 6-A 本地验证（每批改完立即跑）
 
 ```bash
 # 1. inject.js 语法
@@ -500,10 +501,14 @@ console.log('✅ NaN 防护 OK');
 "
 ```
 
-### 5-B 远程部署
+### 6-B 测试命令
 
-> 以下命令依赖本地已配置的 `rscp`/`rssh` alias、`$REMOTE_HOST`/`$REMOTE_PORT` 环境变量。
-> 这些不是仓库内可推导出的通用前提，执行前确认环境已就绪。
+只有在先补齐测试运行方案（见第 5 节）后，才执行测试；不要把"尚未配置完成的命令"当成必过验证。
+
+### 6-C 远程部署
+
+> **前提**：以下命令依赖本地已配置的 `rscp`/`rssh` alias、`$REMOTE_HOST`/`$REMOTE_PORT` 环境变量。
+> 这些不是仓库内可推导出的通用前提，**执行前确认本地环境已就绪**，不要把这段当成默认可执行步骤。
 
 ```bash
 # 同步文件到远程（rscp 为已配置的 alias）
@@ -526,9 +531,10 @@ rssh "curl -s 'http://localhost:18789/plugins/clawlens/api/sessions?limit=foo'"
 rssh "curl -s 'http://localhost:18789/plugins/clawlens/api/audit?days=foo'"
 ```
 
-### 5-C UI 验证（截图）
+### 6-D UI 验证（截图）
 
-> 依赖 `sshpass`、`google-chrome --headless`，以及已配置的 `rssh` alias。确认本地环境具备后再执行。
+> **前提**：依赖 `sshpass`、`google-chrome --headless`，以及已配置的 `rssh` alias。
+> **执行前确认本地环境具备**，不要混入通用步骤中。
 
 ```bash
 # 建立 SSH 隧道（若尚未建立）
@@ -556,28 +562,29 @@ echo "截图: /tmp/clawlens-overview.png  /tmp/clawlens-chat.png"
 
 ---
 
-## 6. 约束
+## 7. 约束
 
 - 只修改 `extensions/clawlens/` 目录下的文件
 - 不修改 OpenClaw 的任何文件（包括 `dist/control-ui/index.html`）
 - 不安装全局包
 - Hook 注册用 `api.on()`，不是 `api.registerHook()`
-- 所有颜色用 CSS 变量 `var(--name, fallback)`
+- 前端颜色优先使用 CSS 变量 `var(--name, fallback)`
 - SQLite 用 `node:sqlite`（`DatabaseSync`）
 - `agent_end` hook 的 context 没有 `runId`，通过 `sessionIdToRunId` Map 关联
 - 不要在 `before_message_write` / `tool_result_persist` handler 里返回 Promise（会被框架忽略）
 - 不要把 `snapshotIntervalMs` 直接改成 `flush()` 的 setInterval 间隔
+- 所有颜色用 CSS 变量 `var(--name, fallback)`
 
 ---
 
-## 7. 改动顺序建议
+## 8. 改动顺序建议
 
 1. `openclaw.plugin.json` — configSchema（改完立即能测试配置注入）
 2. `src/cost-calculator.ts` — NaN 防护（影响所有成本计算）
-3. `src/store.ts` — cleanup 事务、computeCostMatch（getSessionRuns 可选清理）
+3. `src/store.ts` — cleanup 事务 + conversation_turns、computeCostMatch（getSessionRuns 可选清理）
 4. `src/collector.ts` — recordLlmOutput 改名、officialCost、flush 加日志、sessionIdToRunId 清理、recordAgentEnd 回退（snapshotIntervalMs 保守处理，不改 flush 间隔）
 5. `index.ts` — 更新 hook 名称、深合并 config、移除 patchControlUiIndexHtml 默认调用
 6. `src/api-routes.ts` — try/catch、NaN 防护（SSE token 修复见下条）
-7. `ui/inject.js` — SSE 刷新条件修窄；移除 unknown 回退桶；修复 pollTimer 泄漏；SSE token 认证重构（若本轮决定处理，需同步改 inject.js 和 api-routes.ts）
+7. `ui/inject.js` — SSE 刷新条件修窄；移除 unknown fallback；修复 pollTimer 泄漏；SSE token 认证重构（若本轮决定处理，需同步改 inject.js 和 api-routes.ts 两侧）
 8. `tests/` — 先修字段名，再确认运行方案后修 import 路径
 9. Comparator（最后，依赖 configSchema 修复）
