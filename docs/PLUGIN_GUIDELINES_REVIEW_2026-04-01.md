@@ -8,7 +8,7 @@
 
 1. 保留原文关于 plugin shape、`api.on()`、`definePluginEntry()`、空 `configSchema`、`any` 类型逃逸的主判断，原因是对应源码未变。
 2. 将 “Comparator 缺少 `sessionId`” 的合规风险扩大为 “`runtime: any` 让整组必填参数缺失都绕过类型系统”，原因是这比单字段缺失更能解释当前实现为何在编译期未报警。
-3. 保留“测试不可直接运行、字段名陈旧”的判断，并补充本轮直接执行失败结果作为证据。
+3. 保留“测试不可直接运行、字段名陈旧”的判断，并扩大到多个测试文件，原因是当前不仅 `collector.test.ts`，`cost-calculator.test.ts` 和 `sse-manager.test.ts` 也都直接导入不存在的 `../src/*.js`。
 
 ## 结论摘要
 
@@ -142,6 +142,7 @@
 补充验证：
 
 - 本轮执行 `node --test extensions/clawlens/tests/collector.test.ts`，结果为 `ERR_MODULE_NOT_FOUND`，因为测试直接导入不存在的 `../src/collector.js`。
+- 同类问题也出现在 `extensions/clawlens/tests/cost-calculator.test.ts` 与 `extensions/clawlens/tests/sse-manager.test.ts`，它们分别导入 `../src/cost-calculator.js`、`../src/sse-manager.js`。
 
 结论：
 

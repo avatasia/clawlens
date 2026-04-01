@@ -15,9 +15,9 @@
 1. `llm_output` 在 OpenClaw v2026.3.28 中仍然是 per-run、累计 usage，不是 per-call。
 2. ClawLens 当前把 `llm_output` 当作单次 LLM 调用写入 `llm_calls`，瀑布图 token/cost 数据在多轮 tool-use 下会失真。
 3. Comparator 路径不仅缺少 `sessionId`，还缺少 `prompt`、`runId` 等 `runEmbeddedPiAgent()` 必填参数；再叠加空 `configSchema`，该功能在正常配置路径下基本不可达。
-4. 测试现状不能支撑“已有可靠回归覆盖”的表述：`collector.test.ts` 直接运行即因 `../src/*.js` 不存在而失败，且若修正入口后仍有字段名陈旧问题。
-5. Store 层已确认三处数据完整性缺陷：`cleanup()` 无事务、`computeCostMatch(null, null)` 假阳性、`conversation_turns` 不受保留策略覆盖。
-6. Collector 的 `sessionIdToRunId` Map 无清理，`recordAgentEnd()` 又要求 `ctx.sessionKey` 必须存在，导致长时运行会泄漏映射，且部分对话轮次会被静默丢弃。
+4. 测试现状不能支撑“已有可靠回归覆盖”的表述：`collector.test.ts`、`cost-calculator.test.ts`、`sse-manager.test.ts` 都直接导入不存在的 `../src/*.js`，且若修正入口后仍有字段名陈旧问题。
+5. Store/成本层已确认四处数据完整性缺陷：`cleanup()` 无事务、`computeCostMatch(null, null)` 假阳性、`conversation_turns` 不受保留策略覆盖、`loadCostConfig()` 对不完整 cost 配置校验不足会把 `NaN` 带入成本计算。
+6. Collector 的 `sessionIdToRunId` Map 无清理，`recordAgentEnd()` 又要求 `ctx.sessionKey` 必须存在，`flush()` 还会吞掉队列写入异常且不记日志；长时运行会泄漏映射，部分对话轮次和持久化失败都会静默丢失。
 7. API/UI 层仍有四类风险：SSE token 暴露在 URL 查询参数、handler 无顶层 try/catch、`limit`/`offset`/`days` 未校验会把 `NaN` 传给底层查询并报错、Audit 面板的 SSE 刷新条件过宽导致无关 run 也会刷新当前 session 详情。
 
 ## 一、OpenClaw 侧已核实事实
@@ -184,6 +184,23 @@
 
 - 当前语义把“双方都没有数据”显示成“成本匹配”，会误导 audit 结果。
 
+### P1-6b `loadCostConfig()` 会接受不完整 cost 配置并导致 `NaN`
+
+证据：
+
+- `extensions/clawlens/src/cost-calculator.ts:3-10`
+- `extensions/clawlens/src/cost-calculator.ts:17-26`
+
+补充验证：
+
+- 本轮本地执行 `loadCostConfig({models:{providers:{p:{models:{m:{cost:{input:1}}}}}}})` 后，再调用 `calculateCost(...)`，返回值为 `NaN`。
+
+结论：
+
+- `loadCostConfig()` 只检查 `cost.input` 是否为 number，就把对象整体当作 `ModelCostConfig` 写入 Map。
+- 一旦 `output` / `cacheRead` / `cacheWrite` 缺失，`calculateCost()` 中的乘法会产生 `NaN`。
+- 这会污染 `calculatedCost`、SSE 广播和后续 run 聚合。
+
 ### P1-7 `sessionIdToRunId` 永不清理
 
 证据：
@@ -219,6 +236,18 @@
 
 - 只要 `ctx.sessionKey` 缺失，即使已能通过 `ctx.sessionId` 查到 `runId`，函数也会直接返回。
 - 它没有回退读取 `activeRuns.get(runId)?.sessionKey`。
+
+### P1-9b `flush()` 会吞掉队列操作异常且不留日志
+
+证据：
+
+- `extensions/clawlens/src/collector.ts:72-79`
+
+结论：
+
+- `flush()` 对每个队列操作都包了 `try/catch`，但 catch 体为空。
+- 任何 `store.insert*` / `store.completeRun` / `store.updateRunSessionKey` 失败都会被静默吞掉。
+- 这属于真实的数据丢失风险，不应仅轻描淡写为“不中断主流程”。
 
 ### P1-10 API 查询参数未校验，`NaN` 会触发 SQLite `datatype mismatch`
 
@@ -272,6 +301,7 @@
 补充验证：
 
 - 本轮直接执行 `node --test extensions/clawlens/tests/collector.test.ts`，报 `ERR_MODULE_NOT_FOUND`，因为测试导入的是不存在的 `../src/collector.js`。
+- 同类问题也出现在 `extensions/clawlens/tests/cost-calculator.test.ts` 与 `extensions/clawlens/tests/sse-manager.test.ts`，它们分别导入 `../src/cost-calculator.js`、`../src/sse-manager.js`。
 
 ### 2. 测试字段名与实现不一致
 
@@ -293,4 +323,5 @@
 2. Comparator 问题应表述为“配置路径被 schema 封死，且实现本身还缺少多项必填参数并吞错”。
 3. API 路由的 `NaN` 问题应表述为“参数校验缺失导致查询报错”，不要写成 SQL 注入。
 4. UI 层还存在一个独立问题：SSE 事件对 Audit 详情的刷新条件过宽，会造成无关 session 的重复拉取。
-5. 测试状态应写成“存在测试草稿，但执行入口和断言字段均需修正”，不能写成“已有可靠覆盖”。
+5. 成本配置边界也应写清：不完整 `cost` 配置不会自动按 0 处理，而会让 `calculateCost()` 产出 `NaN`。
+6. 测试状态应写成“存在测试草稿，但执行入口和断言字段均需修正”，不能写成“已有可靠覆盖”。
