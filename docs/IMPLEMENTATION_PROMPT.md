@@ -12,6 +12,7 @@
 - **先读后改**：每个文件改之前先完整读取，理解现有实现再动手。
 - 改完一批就运行本地验证，验证通过再继续下一批。
 - 验证失败时读错误信息修复，不要绕过。
+- 不要把 `snapshotIntervalMs` 直接复用为队列 `flush()` 间隔；若要实现 snapshot 功能，必须新增独立 snapshot 调度逻辑。
 
 ---
 
@@ -48,6 +49,8 @@ cat extensions/clawlens/ui/styles.css
 | `loadCostConfig()` 只检查 `cost.input` 是否为 number，`output`/`cacheRead`/`cacheWrite` 缺失时 `calculateCost()` 返回 `NaN` | `cost-calculator.ts:17-26` |
 | `Store.getSessions({ limit: NaN })` 会触发 SQLite `datatype mismatch`（已本地复现） | `api-routes.ts:83`, `store.ts:401` |
 | `collector.test.ts`/`cost-calculator.test.ts`/`sse-manager.test.ts` 导入不存在的 `../src/*.js`，直接报 `ERR_MODULE_NOT_FOUND` | 三个测试文件 import 行 |
+| `patchControlUiIndexHtml()` 会直接改写 OpenClaw 自身 `dist/control-ui/index.html` | `index.ts:34-58,102` |
+| SSE 当前通过 `/events?token=...` 传 token，token 暴露在 URL 查询参数；原生 `EventSource` 不支持自定义请求头，不能简单改成 Bearer header | `api-routes.ts:33-58`, `inject.js:125-127` |
 
 ---
 
@@ -125,16 +128,16 @@ const officialCost =
 }
 ```
 
-#### P1-2 修复 `snapshotIntervalMs` 配置项无效
+#### P1-2 `snapshotIntervalMs` 配置项当前无效（不要改动 flush() 间隔）
 
-`collector.ts` 的 `start()` 读取了 `intervalMs` 但 `setInterval` 写死为 `100`。改为使用配置值：
+`collector.ts` 的 `start()` 读取了 `intervalMs`（默认 60_000），但 `setInterval` 写死为 `100ms`——这两个数字语义不同：100ms 是写队列排空节奏，60s 是 snapshot 采集节奏，直接替换会让写库从 100ms 变成 60s，造成严重延迟。
 
-```typescript
-// 改前：
-this.flushInterval = setInterval(() => { this.flush(); }, 100);
-// 改后：
-this.flushInterval = setInterval(() => { this.flush(); }, intervalMs);
-```
+本轮二选一：
+
+1. **保守修复**：保留 `setInterval(..., 100)` 不变，仅在注释中说明 `snapshotIntervalMs` 目前未生效，等待 snapshot 采集逻辑实现后再接入。
+2. **完整修复**：新增独立 snapshot scheduler，明确 snapshot 数据来源后，再让 `snapshotIntervalMs` 控制该 scheduler 的间隔。
+
+**不要把 `intervalMs` 直接传给 `flush()` 的 `setInterval`。**
 
 #### P1-3 修复 `loadCostConfig()` — 校验全部四个字段
 
@@ -253,7 +256,18 @@ private flush(): void {
 
 ### P1 — API 层
 
-#### P1-10 修复 API handler 无顶层 try/catch
+#### P1-10 SSE token 暴露在 URL 查询参数
+
+当前 `/events?token=...` 把认证 token 放在 URL 里，会出现在服务端访问日志、浏览器历史、代理日志中。
+
+**注意**：原生 `EventSource` 不支持自定义请求头，不能简单改成 `Authorization: Bearer`。可接受的修复方向只有两类：
+
+1. 改成基于 `fetch()` 的 SSE 客户端（`inject.js` 侧），这样可以走 `Authorization: Bearer ...`
+2. 改为由更安全的同源会话/cookie 机制承载认证
+
+如果本轮不打算重构 SSE 客户端，就暂不处理此项，不要引入半成品修复。
+
+#### P1-11 修复 API handler 无顶层 try/catch
 
 在 `api-routes.ts` 的 handler 函数体最外层包一层 try/catch：
 
@@ -267,7 +281,7 @@ handler(req, res) {
 }
 ```
 
-#### P1-11 修复 NaN 注入 — 校验 Number() 转换结果
+#### P1-12 修复 NaN 注入 — 校验 Number() 转换结果
 
 所有从 query string 转换为数字的地方，加有效性检查：
 
@@ -302,11 +316,25 @@ if (S.selSession && (ev.sessionKey === S.selSession || ev.runId)) selectSession(
 if (S.selSession && ev.sessionKey === S.selSession) selectSession(S.selSession);
 ```
 
-#### P2-2 删除死代码 `getSessionRuns()`
+#### P2-2 移除 `patchControlUiIndexHtml()` 的默认调用
 
-`store.ts` 中的 `getSessionRuns()` 方法在整个代码库中没有调用方，且它读取的 `cost_usd` 字段没有包含新增的 `official_cost`/`calculated_cost`。直接删除该方法。
+`index.ts` 的 `start()` 中调用了 `patchControlUiIndexHtml(api)`，会直接改写 OpenClaw 自身 `dist/control-ui/index.html`。这与约束"不修改 OpenClaw 本体"矛盾。
 
-#### P2-3 修复 `index.ts` 浅合并丢失嵌套配置
+本轮至少做到以下之一：
+- 从 `start()` 中移除该调用
+- 改为记录 warning 并跳过
+
+不要继续把改写 OpenClaw dist 产物当成可接受实现。
+
+#### P2-3 `getSessionRuns()` 死代码（可选清理）
+
+`store.ts` 中的 `getSessionRuns()` 方法当前无调用方，且只读取了旧的 `cost_usd` 字段，未包含 `official_cost`/`calculated_cost`。"无调用方"本身只是候选死代码证据，不足以强制删除。
+
+处理方式：
+- 若已全局搜索确认无计划使用，可删除
+- 否则保留，留待后续单独做 dead-code 清理
+
+#### P2-4 修复 `index.ts` 浅合并丢失嵌套配置
 
 ```typescript
 // 改前：
@@ -319,7 +347,7 @@ const config: ClawLensConfig = {
 };
 ```
 
-#### P2-4 Comparator 补充必填参数（configSchema 修复后才有意义）
+#### P2-5 Comparator 补充必填参数（configSchema 修复后才有意义）
 
 完成 P1-1 的 configSchema 修复后，再修正 `comparator.ts` 的 `runEmbeddedPiAgent()` 调用。
 当前缺失的必填参数：`sessionId`、`prompt`、`runId`。
@@ -348,32 +376,36 @@ tests/cost-calculator.test.ts → ../src/cost-calculator.js (不存在)
 tests/sse-manager.test.ts     → ../src/sse-manager.js     (不存在)
 ```
 
-**解决方案**：在 `extensions/clawlens/package.json` 中添加 test 构建步骤：
+**注意**：`extensions/clawlens/` 目录下没有本地 `tsconfig*.json`，不能直接用 `tsc --outDir dist-test` 方案。
+
+**先修测试内容本身**：
+- 把 `collector.test.ts` 里陈旧的 `input`/`content`/`isError` 改为 `params`/`result`/`error`（与当前 `recordToolCall` 实现对齐）
+- 同步更新 `recordLlmCall` 改名带来的调用点
+
+**再选择运行方案（二选一）**：
+
+1. 若工作区现成可用 `tsx`，优先用运行时转译：
 
 ```json
 {
   "scripts": {
-    "test": "tsc --noEmit false --outDir dist-test && node --test tests/*.test.js",
-    "test:build": "tsc --project tsconfig.json --outDir dist-test"
+    "test": "node --import tsx --test tests/*.test.ts"
   }
 }
 ```
 
-或者（更简单）：在 `package.json` 加 `tsx` 依赖，改用：
+2. 若必须走编译产物，则需同时补齐 `tsconfig.test.json` 和正确输出路径：
 
 ```json
 {
   "scripts": {
-    "test": "node --import tsx/esm --test tests/*.test.ts"
-  },
-  "devDependencies": {
-    "tsx": "^4.0.0"
+    "test:build": "tsc -p tsconfig.test.json --outDir dist-test",
+    "test": "npm run test:build && node --test dist-test/tests/*.test.js"
   }
 }
 ```
 
-同时修复 `collector.test.ts` 中的字段名陈旧问题：
-- 把 `input`/`content`/`isError` 改为 `params`/`result`/`error`（与当前 `recordToolCall` 实现对齐）。
+只有在运行方案确认可用后，才把测试命令写进验证步骤。
 
 ---
 
@@ -382,20 +414,10 @@ tests/sse-manager.test.ts     → ../src/sse-manager.js     (不存在)
 ### 5-A 本地验证（每批改完立即跑）
 
 ```bash
-# 1. TypeScript 语法检查（不需要构建）
-cd extensions/clawlens
-npx tsc --noEmit 2>&1 | head -30
-
-# 2. inject.js 语法
+# 1. inject.js 语法
 node --check extensions/clawlens/ui/inject.js && echo "✅ inject.js OK"
 
-# 3. Store 核心功能：cleanup 事务 + computeCostMatch + conversation_turns
-node -e "
-import { Store } from './extensions/clawlens/src/store.ts';
-// 以下需要 tsx 或构建后路径，视工具链调整
-" 2>&1
-
-# 4. cost-calculator NaN 修复验证
+# 2. cost-calculator NaN 修复验证（纯 JS，无需构建）
 node -e "
 function loadCostConfig(config) {
   const map = new Map();
@@ -424,7 +446,7 @@ console.assert(m2.size === 1, '完整 config 应入表');
 console.log('✅ cost-calculator NaN 修复 OK');
 "
 
-# 5. NaN 查询参数修复验证（SQLite）
+# 3. NaN 查询参数修复验证（SQLite，纯 JS）
 node -e "
 const { DatabaseSync } = require('node:sqlite');
 const db = new DatabaseSync(':memory:');
@@ -444,8 +466,11 @@ console.log('✅ NaN 防护 OK');
 
 ### 5-B 远程部署
 
+> 以下命令依赖本地已配置的 `rscp`/`rssh` alias、`$REMOTE_HOST`/`$REMOTE_PORT` 环境变量。
+> 这些不是仓库内可推导出的通用前提，执行前确认环境已就绪。
+
 ```bash
-# 同步文件到远程（rssh/rscp 为已配置的 alias）
+# 同步文件到远程（rscp 为已配置的 alias）
 rscp -r extensions/clawlens/ $REMOTE_HOST:~/.openclaw/extensions/clawlens/
 
 # 重启 gateway
@@ -466,6 +491,8 @@ rssh "curl -s 'http://localhost:18789/plugins/clawlens/api/audit?days=foo'"
 ```
 
 ### 5-C UI 验证（截图）
+
+> 依赖 `sshpass`、`google-chrome --headless`，以及已配置的 `rssh` alias。确认本地环境具备后再执行。
 
 ```bash
 # 建立 SSH 隧道（若尚未建立）
@@ -503,6 +530,7 @@ echo "截图: /tmp/clawlens-overview.png  /tmp/clawlens-chat.png"
 - SQLite 用 `node:sqlite`（`DatabaseSync`）
 - `agent_end` hook 的 context 没有 `runId`，通过 `sessionIdToRunId` Map 关联
 - 不要在 `before_message_write` / `tool_result_persist` handler 里返回 Promise（会被框架忽略）
+- 不要把 `snapshotIntervalMs` 直接改成 `flush()` 的 setInterval 间隔
 
 ---
 
@@ -510,10 +538,10 @@ echo "截图: /tmp/clawlens-overview.png  /tmp/clawlens-chat.png"
 
 1. `openclaw.plugin.json` — configSchema（改完立即能测试配置注入）
 2. `src/cost-calculator.ts` — NaN 防护（影响所有成本计算）
-3. `src/store.ts` — cleanup 事务、computeCostMatch、删 getSessionRuns
-4. `src/collector.ts` — recordLlmOutput 改名、officialCost、snapshotIntervalMs、flush 加日志、sessionIdToRunId 清理、recordAgentEnd 回退
-5. `index.ts` — 更新 hook 名称、深合并 config
-6. `src/api-routes.ts` — try/catch、NaN 防护
-7. `ui/inject.js` — SSE 刷新条件修窄
-8. `tests/` — 修复 import 路径和字段名
+3. `src/store.ts` — cleanup 事务、computeCostMatch（getSessionRuns 可选清理）
+4. `src/collector.ts` — recordLlmOutput 改名、officialCost、flush 加日志、sessionIdToRunId 清理、recordAgentEnd 回退（snapshotIntervalMs 保守处理，不改 flush 间隔）
+5. `index.ts` — 更新 hook 名称、深合并 config、移除 patchControlUiIndexHtml 默认调用
+6. `src/api-routes.ts` — try/catch、NaN 防护（SSE token 修复见下条）
+7. `ui/inject.js` — SSE 刷新条件修窄；SSE token 认证重构（若本轮决定处理，需同步改 inject.js 和 api-routes.ts）
+8. `tests/` — 先修字段名，再确认运行方案后修 import 路径
 9. Comparator（最后，依赖 configSchema 修复）
