@@ -573,7 +573,6 @@ echo "截图: /tmp/clawlens-overview.png  /tmp/clawlens-chat.png"
 - `agent_end` hook 的 context 没有 `runId`，通过 `sessionIdToRunId` Map 关联
 - 不要在 `before_message_write` / `tool_result_persist` handler 里返回 Promise（会被框架忽略）
 - 不要把 `snapshotIntervalMs` 直接改成 `flush()` 的 setInterval 间隔
-- 所有颜色用 CSS 变量 `var(--name, fallback)`
 
 ---
 
