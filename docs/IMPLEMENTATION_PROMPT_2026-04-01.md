@@ -384,6 +384,7 @@ console.log('OK');
 - 不修改 OpenClaw 的任何文件（包括 `dist/control-ui/index.html`）
 - 不安装全局包
 - Hook 注册用 `api.on()`，不是 `api.registerHook()`
+- 前端颜色优先使用 CSS 变量 `var(--name, fallback)`
 - SQLite 用 `node:sqlite`（`DatabaseSync`）
 - `agent_end` hook 的 context 没有 `runId`，通过 `sessionIdToRunId` Map 关联
 - 不要在 `before_message_write` / `tool_result_persist` handler 里返回 Promise（会被框架忽略）
