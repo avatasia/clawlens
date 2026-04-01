@@ -6,7 +6,7 @@
 ## 本轮修改原因
 
 1. 原文把 `snapshotIntervalMs` 直接接到 `flush()` 定时器上，这会把默认写库节奏从 `100ms` 拉长到 `60_000ms`，与“snapshot”语义不符，且会明显恶化数据落盘延迟。
-2. 原文遗漏了两个已确认问题：`patchControlUiIndexHtml()` 直接修改 OpenClaw 产物、SSE token 暴露在 URL 查询参数。
+2. 原文遗漏了四个已确认问题：`patchControlUiIndexHtml()` 直接修改 OpenClaw 产物、SSE token 暴露在 URL 查询参数、chat audit 的 `unknown` fallback 会混入无关数据、`CHAT_STATE.pollTimer` 没有清理。
 3. 原文给出的测试脚本 `tsc --outDir dist-test && node --test tests/*.test.js` 路径不正确，而且 `extensions/clawlens/` 下没有本地 `tsconfig*.json`，不能直接按该方案执行。
 4. 原文对 Comparator / `before_agent_start` / `sessionId` 的表述基本成立，但测试与部署部分存在若干“可选方案被写成现成可执行命令”的问题，因此改为更保守、可落地的说法。
 
@@ -237,6 +237,33 @@ if (S.selSession && ev.sessionKey === S.selSession) selectSession(S.selSession);
 
 同时不要继续空吞 compare 失败，应记录日志。
 
+#### P2-6 移除 chat audit 的 `unknown` fallback
+
+`refreshChatAudit()` 当前在精确 key 和逐级缩短前缀都查不到结果后，还会回退到 `/audit/session/unknown`。
+这个桶聚合的是所有无法解析 sessionKey 的 run，与当前 chat session 不一定相关，会把无关数据混进当前侧栏。
+
+因此本轮应：
+
+- 保留“逐级缩短前缀”的 fallback
+- 删除最终的 `/audit/session/unknown` fallback
+
+不要为了“有数据可看”而牺牲关联准确性。
+
+#### P2-7 清理 `CHAT_STATE.pollTimer`
+
+`startChatPolling()` 会创建持续轮询的 `setInterval`，但 `hideChatAuditSidebar()` 当前只移除 DOM，不清理 `pollTimer`。
+
+本轮应在隐藏侧栏时补上：
+
+```javascript
+if (CHAT_STATE.pollTimer) {
+  clearInterval(CHAT_STATE.pollTimer);
+  CHAT_STATE.pollTimer = null;
+}
+```
+
+否则即使侧栏关闭或路由切走，轮询仍会继续运行。
+
 ---
 
 ## 4. 测试文件修复
@@ -375,6 +402,6 @@ fs.rmSync(dir, { recursive: true, force: true });
 4. `src/collector.ts` — `recordLlmOutput` 改名、`officialCost`、`flush` 加日志、`sessionIdToRunId` 清理、`recordAgentEnd` 回退
 5. `index.ts` — 更新 hook 名称、深合并 config、移除 `patchControlUiIndexHtml(api)` 默认调用
 6. `src/api-routes.ts` — try/catch、NaN 防护
-7. `ui/inject.js` — SSE 刷新条件修窄；若本轮重构 SSE 认证，再一起处理 token in query
+7. `ui/inject.js` — SSE 刷新条件修窄、移除 `unknown` fallback、清理 `pollTimer`；若本轮重构 SSE 认证，再一起处理 token in query
 8. `tests/` — 修复 import 路径和字段名，再补测试运行方案
 9. Comparator（最后，依赖 configSchema 修复）
