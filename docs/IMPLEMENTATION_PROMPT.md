@@ -46,7 +46,7 @@ cat extensions/clawlens/ui/styles.css
 | `before_agent_start` 是 modifying hook，框架逐个 `await`（顺序执行） | `hooks.ts:494-513` |
 | `tool_result_persist`/`before_message_write` 是同步 hook；handler 返回 Promise 会被警告并忽略 | `hooks.ts:745-878` |
 | `openclaw.plugin.json` 的 `configSchema` 为空对象 + `additionalProperties: false`，会拒绝所有用户配置 | `openclaw.plugin.json:1-7` |
-| Comparator 对 `runEmbeddedPiAgent()` 的调用缺少必填参数 `sessionId`、`prompt`、`runId` | `comparator.ts:72-96`, `params.ts:27-105` |
+| Comparator 对 `runEmbeddedPiAgent()` 的调用缺少必填参数 `sessionId`、`prompt`、`runId`；`before_agent_start` 的 `ctx` 类型本身允许带 `sessionId` | `comparator.ts:72-96`, `params.ts:27-105`, `types.ts:1878-1887` |
 | `loadCostConfig()` 只检查 `cost.input` 是否为 number，`output`/`cacheRead`/`cacheWrite` 缺失时 `calculateCost()` 返回 `NaN` | `cost-calculator.ts:17-26` |
 | `Store.getSessions({ limit: NaN })` 会触发 SQLite `datatype mismatch`（已本地复现） | `api-routes.ts:83`, `store.ts:401` |
 | `collector.test.ts`/`cost-calculator.test.ts`/`sse-manager.test.ts` 导入不存在的 `../src/*.js`，直接报 `ERR_MODULE_NOT_FOUND` | 三个测试文件 import 行 |
@@ -129,18 +129,7 @@ const officialCost =
 }
 ```
 
-#### P1-2 `snapshotIntervalMs` 配置项当前无效（不要改动 flush() 间隔）
-
-`collector.ts` 的 `start()` 读取了 `intervalMs`（默认 60_000），但 `setInterval` 写死为 `100ms`——这两个数字语义不同：100ms 是写队列排空节奏，60s 是 snapshot 采集节奏，直接替换会让写库从 100ms 变成 60s，造成严重延迟。
-
-本轮二选一：
-
-1. **保守修复**：保留 `setInterval(..., 100)` 不变，仅在注释中说明 `snapshotIntervalMs` 目前未生效，等待 snapshot 采集逻辑实现后再接入。
-2. **完整修复**：新增独立 snapshot scheduler，明确 snapshot 数据来源后，再让 `snapshotIntervalMs` 控制该 scheduler 的间隔。
-
-**不要把 `intervalMs` 直接传给 `flush()` 的 `setInterval`。**
-
-#### P1-3 修复 `loadCostConfig()` — 校验全部四个字段
+#### P1-2 修复 `loadCostConfig()` — 校验全部四个字段
 
 只有四个数值字段都是有限数字时才入表：
 
@@ -159,7 +148,7 @@ if (
 }
 ```
 
-#### P1-4 修复 `computeCostMatch(null, null)` 假阳性
+#### P1-3 修复 `computeCostMatch(null, null)` 假阳性
 
 双方都没有数据时不应显示为"匹配"：
 
@@ -170,7 +159,7 @@ if (official == null && calculated == null) return { costMatch: true };
 if (official == null && calculated == null) return { costMatch: false, costDiffReason: "no cost data available" };
 ```
 
-#### P1-5 修复 `cleanup()` — 加事务
+#### P1-4 修复 `cleanup()` — 加事务
 
 把现有多个 DELETE 操作包进一个事务，防止中途崩溃产生部分清理状态：
 
@@ -196,13 +185,13 @@ cleanup(retentionDays: number): void {
 }
 ```
 
-注意：`conversation_turns` 也在这里删除了（下一条 P1-6 的修复已合并进来）。
+注意：`conversation_turns` 也在这里删除了（下一条 P1-5 的修复已合并进来）。
 
-#### P1-6 修复 `conversation_turns` 不受保留策略覆盖
+#### P1-5 修复 `conversation_turns` 不受保留策略覆盖
 
-已合并到 P1-5 的 `cleanup()` 修复中（在事务内对每个 `run_id` 先删 `conversation_turns`）。
+已合并到 P1-4 的 `cleanup()` 修复中（在事务内对每个 `run_id` 先删 `conversation_turns`）。
 
-#### P1-7 修复 `sessionIdToRunId` 永不清理
+#### P1-6 修复 `sessionIdToRunId` 永不清理
 
 在 `stop()` 方法末尾加：
 
@@ -210,7 +199,7 @@ cleanup(retentionDays: number): void {
 this.sessionIdToRunId.clear();
 ```
 
-#### P1-8 修复 `recordAgentEnd()` 无 `sessionKey` 回退
+#### P1-7 修复 `recordAgentEnd()` 无 `sessionKey` 回退
 
 当 `ctx.sessionKey` 缺失时，回退到 `activeRuns` 中存储的 sessionKey：
 
@@ -236,7 +225,7 @@ recordAgentEnd(event: { messages?: unknown[]; success?: boolean; durationMs?: nu
 }
 ```
 
-#### P1-9 修复 `flush()` 静默吞错
+#### P1-8 修复 `flush()` 静默吞错
 
 catch 体不能为空，至少输出一条日志（Collector 持有 logger 的话用 logger，否则用 console.error）：
 
@@ -253,22 +242,22 @@ private flush(): void {
 }
 ```
 
+#### P1-9 `snapshotIntervalMs` 配置项当前无效（不要改动 flush() 间隔）
+
+`collector.ts` 的 `start()` 读取了 `intervalMs`（默认 60_000），但 `setInterval` 写死为 `100ms`——这两个数字语义不同：100ms 是写队列排空节奏，60s 是 snapshot 采集节奏，直接替换会让写库从 100ms 变成 60s，造成严重延迟。
+
+本轮二选一：
+
+1. **保守修复**：保留 `setInterval(..., 100)` 不变，仅在注释中说明 `snapshotIntervalMs` 目前未生效，等待 snapshot 采集逻辑实现后再接入。
+2. **完整修复**：新增独立 snapshot scheduler，明确 snapshot 数据来源后，再让 `snapshotIntervalMs` 控制该 scheduler 的间隔。
+
+**不要把 `intervalMs` 直接传给 `flush()` 的 `setInterval`。**
+
 ---
 
-### P1 — API 层
+### P1 — API / 安全
 
-#### P1-10 SSE token 暴露在 URL 查询参数
-
-当前 `/events?token=...` 把认证 token 放在 URL 里，会出现在服务端访问日志、浏览器历史、代理日志中。
-
-**注意**：原生 `EventSource` 不支持自定义请求头，不能简单改成 `Authorization: Bearer`。可接受的修复方向只有两类：
-
-1. 改成基于 `fetch()` 的 SSE 客户端（`inject.js` 侧），这样可以走 `Authorization: Bearer ...`
-2. 改为由更安全的同源会话/cookie 机制承载认证
-
-如果本轮不打算重构 SSE 客户端，就暂不处理此项，不要引入半成品修复。
-
-#### P1-11 修复 API handler 无顶层 try/catch
+#### P1-10 修复 API handler 无顶层 try/catch
 
 在 `api-routes.ts` 的 handler 函数体最外层包一层 try/catch：
 
@@ -282,7 +271,7 @@ handler(req, res) {
 }
 ```
 
-#### P1-12 修复 NaN 注入 — 校验 Number() 转换结果
+#### P1-11 修复 NaN 注入 — 校验 Number() 转换结果
 
 所有从 query string 转换为数字的地方，加有效性检查：
 
@@ -300,6 +289,17 @@ filters.offset = parseIntParam(url.searchParams.get("offset"), 0);
 const days     = parseIntParam(url.searchParams.get("days"), 7);
 const limit    = parseIntParam(url.searchParams.get("limit"), 100);
 ```
+
+#### P1-12 SSE token 暴露在 URL 查询参数
+
+当前 `/events?token=...` 把认证 token 放在 URL 里，会出现在服务端访问日志、浏览器历史、代理日志中。
+
+**注意**：原生 `EventSource` 不支持自定义请求头，不能简单改成 `Authorization: Bearer`。可接受的修复方向只有两类：
+
+1. 改成基于 `fetch()` 的 SSE 客户端（`inject.js` 侧），这样可以走 `Authorization: Bearer ...`
+2. 改为由更安全的同源会话/cookie 机制承载认证
+
+如果本轮不打算重构 SSE 客户端，就暂不处理此项，不要引入半成品修复。
 
 ---
 
