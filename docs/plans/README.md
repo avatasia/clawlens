@@ -1,0 +1,26 @@
+# Plans
+
+`docs/plans/` 用于存放**当前仍在讨论、待决或待实施**的文档。
+
+放在这里的内容通常具有以下特征：
+
+- 不是当前权威主文档
+- 不是已完成后的历史归档
+- 仍然需要后续决策、实施或转正
+
+规则如下：
+
+1. 当前待决分析稿、协作方案、迁移方案可放在此目录。
+2. 若方案最终定稿，应提升为 `docs/` 顶层主文档或合并进现有主文档。
+3. 若方案失活或被吸收，应归档到 `docs/archive/` 并在对应 `history` 中登记。
+
+## 当前方案文档
+
+- [ANALYSIS_CODEX_COLLABORATION_WORKFLOW_2026-04-03.md](ANALYSIS_CODEX_COLLABORATION_WORKFLOW_2026-04-03.md)
+- [ANALYSIS_OPENCLAW_STALE_TOOL_RESULT_REPLAY_MITIGATION_REVISED_2026-04-03.md](ANALYSIS_OPENCLAW_STALE_TOOL_RESULT_REPLAY_MITIGATION_REVISED_2026-04-03.md)
+- [IMPLEMENTATION_OPENCLAW_STALE_TOOL_RESULT_REPLAY_MITIGATION_REVISED_2026-04-03.md](IMPLEMENTATION_OPENCLAW_STALE_TOOL_RESULT_REPLAY_MITIGATION_REVISED_2026-04-03.md)
+
+## 已归档旧草稿
+
+- 旧 `FILTERING` 草稿与未修正的 `MITIGATION` 初稿已移入：
+  - [archive/analysis](../archive/analysis)

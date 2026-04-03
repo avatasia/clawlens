@@ -70,6 +70,7 @@ Important behavior notes:
 - transcript turns and run detail are not derived from a single source; they are merged
 - heartbeat traffic is treated as a separate run kind and excluded from chat-facing audit queries by default
 - logger import is optional and exists to strengthen `message_id -> runId` mapping, not to make the base audit UI work
+- OpenClaw reference code is kept as a local reference checkout under `projects-ref/openclaw/` and is not a runtime dependency or hard repository binding
 
 ## API
 
@@ -177,6 +178,30 @@ Prompt / analysis playbooks:
 - [ANALYSIS_PROMPT_PLAYBOOK_GENERAL.md](docs/prompts/ANALYSIS_PROMPT_PLAYBOOK_GENERAL.md)
 - [ANALYSIS_PROMPT_PLAYBOOK_DOC_REVIEW.md](docs/prompts/ANALYSIS_PROMPT_PLAYBOOK_DOC_REVIEW.md)
 - [ANALYSIS_PROMPT_PLAYBOOK_DEBUG.md](docs/prompts/ANALYSIS_PROMPT_PLAYBOOK_DEBUG.md)
+
+Current discussion / pending-plan area:
+
+- [plans/README.md](docs/plans/README.md)
+- [ANALYSIS_CODEX_COLLABORATION_WORKFLOW_2026-04-03.md](docs/plans/ANALYSIS_CODEX_COLLABORATION_WORKFLOW_2026-04-03.md)
+- [ANALYSIS_OPENCLAW_STALE_TOOL_RESULT_REPLAY_MITIGATION_REVISED_2026-04-03.md](docs/plans/ANALYSIS_OPENCLAW_STALE_TOOL_RESULT_REPLAY_MITIGATION_REVISED_2026-04-03.md)
+- [IMPLEMENTATION_OPENCLAW_STALE_TOOL_RESULT_REPLAY_MITIGATION_REVISED_2026-04-03.md](docs/plans/IMPLEMENTATION_OPENCLAW_STALE_TOOL_RESULT_REPLAY_MITIGATION_REVISED_2026-04-03.md)
+- [IMPLEMENTATION_OPENCLAW_PR_WORKFLOW_2026-04-03.md](docs/plans/IMPLEMENTATION_OPENCLAW_PR_WORKFLOW_2026-04-03.md)
+- [IMPLEMENTATION_OPENCLAW_REMOTE_DEBUG_PATCH_WORKFLOW_2026-04-03.md](docs/plans/IMPLEMENTATION_OPENCLAW_REMOTE_DEBUG_PATCH_WORKFLOW_2026-04-03.md)
+
+Current research references:
+
+- [research/README.md](docs/research/README.md)
+- [RESEARCH_OPENCLAW_TOOL_CALL_FLOW.md](docs/research/RESEARCH_OPENCLAW_TOOL_CALL_FLOW.md)
+- [RESEARCH_OPENCLAW_CLI_PLUGINS_LIST_FLOW.md](docs/research/RESEARCH_OPENCLAW_CLI_PLUGINS_LIST_FLOW.md)
+- [ANALYSIS_OPENCLAW_CLI_PHANTOM_READ.md](docs/research/ANALYSIS_OPENCLAW_CLI_PHANTOM_READ.md)
+- [RESEARCH_OPENCLAW_SESSION_HISTORY_REPLAY_POLLUTION_2026-04-03.md](docs/research/RESEARCH_OPENCLAW_SESSION_HISTORY_REPLAY_POLLUTION_2026-04-03.md)
+- [RESEARCH_OPENCLAW_TOOL_RESULT_TIMESTAMP_AND_REPLAY_2026-04-03.md](docs/research/RESEARCH_OPENCLAW_TOOL_RESULT_TIMESTAMP_AND_REPLAY_2026-04-03.md)
+- [ANALYSIS_OPENCLAW_SESSION_POLLUTION_FIX_PROPOSAL.md](docs/research/ANALYSIS_OPENCLAW_SESSION_POLLUTION_FIX_PROPOSAL.md)
+
+Maintenance helper:
+
+- `bash scripts/update-openclaw-reference-version.sh`
+  updates the OpenClaw reference version line in `docs/architecture.md` from the local `projects-ref/openclaw/` checkout
 
 ## Current Status
 

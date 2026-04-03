@@ -6,6 +6,15 @@
 > 当前权威架构文档。
 > 本文以仓库当前代码为准，吸收了已达成共识的修复结论；旧分析稿与过程稿已转入 `docs/archive/`。
 
+## Reference Source Note
+
+ClawLens 的上游参考代码不再通过 Git submodule 绑定。
+
+- 本地参考位置：`projects-ref/openclaw/`
+- 当前参考版本：`OpenClaw v2026.4.2 (d74a12264a)`
+
+该目录仅作为本地研究、对照和审计输入源，不构成 ClawLens 运行时依赖，也不要求主仓库对其提交指针进行硬绑定。
+
 ## 1. 定位
 
 ClawLens 是一个 OpenClaw 插件，当前主要承担两类能力：
