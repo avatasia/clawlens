@@ -13,6 +13,7 @@ type CompareConfig = {
 
 type AgentEventCtx = {
   sessionKey?: string;
+  sessionId?: string;
   agentId?: string;
   channelId?: string;
 };
@@ -69,7 +70,13 @@ export class Comparator {
           const workspaceDir = path.join(compareDir, `${provider}_${model}`);
 
           try {
+            const compareRunId = randomUUID();
+            const compareSessionId = ctx.sessionId ?? randomUUID();
+            const originalPrompt = (event as any)?.prompt ?? "";
             await this.runtime.agent.runEmbeddedPiAgent({
+              runId: compareRunId,
+              sessionId: compareSessionId,
+              prompt: originalPrompt,
               sessionKey: compareSessionKey,
               sessionFile,
               workspaceDir,
@@ -95,7 +102,7 @@ export class Comparator {
               },
             });
           } catch (err) {
-            // log but don't surface compare failures to the primary run
+            console.error(`[clawlens] compare run failed (${provider}/${model}):`, err);
           }
         }),
       );

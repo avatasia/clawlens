@@ -4,6 +4,7 @@
 
 const API = "/plugins/clawlens/api";
 const OVERVIEW_INTERVAL = 30_000;
+const DEBUG_PREFIX = "[ClawLens Audit]";
 
 // ── State ─────────────────────────────────────────────────────────────────
 
@@ -35,12 +36,41 @@ function authHeaders() {
   return S.token ? { Authorization: `Bearer ${S.token}` } : {};
 }
 
+function debugLog(...args) {
+  console.log(DEBUG_PREFIX, ...args);
+}
+
 async function apiFetch(path) {
+  debugLog("apiFetch:start", path);
   try {
     const r = await fetch(API + path, { headers: authHeaders() });
+    debugLog("apiFetch:response", path, r.status, r.ok);
     if (!r.ok) return null;
-    return await r.json();
-  } catch { return null; }
+    const data = await r.json();
+    debugLog("apiFetch:json", path, {
+      hasRuns: Array.isArray(data?.runs),
+      runCount: data?.runs?.length ?? null,
+      latestStartedAt: data?.latestStartedAt ?? null,
+      oldestStartedAt: data?.oldestStartedAt ?? null,
+      hasMore: data?.hasMore ?? null,
+    });
+    if (path.startsWith("/audit/session/")) {
+      const sampleRuns = Array.isArray(data?.runs)
+        ? data.runs.slice(0, 3).map((run) => ({
+            runId: run?.runId ?? null,
+            hasDetail: run?.hasDetail ?? null,
+            turnCount: Array.isArray(run?.turns) ? run.turns.length : null,
+            timelineCount: Array.isArray(run?.timeline) ? run.timeline.length : null,
+            status: run?.status ?? null,
+          }))
+        : [];
+      debugLog("apiFetch:sessionSample", path, sampleRuns);
+    }
+    return data;
+  } catch (err) {
+    debugLog("apiFetch:error", path, err instanceof Error ? err.message : err);
+    return null;
+  }
 }
 
 function fmtTokens(n) {
@@ -131,11 +161,16 @@ function connectSSE() {
   es.onmessage = (e) => {
     try {
       const ev = JSON.parse(e.data);
-      if (["run_started", "run_ended", "llm_call", "tool_executed"].includes(ev.type)) {
+      if (["run_started", "run_ended", "llm_call", "tool_executed", "transcript_turn"].includes(ev.type)) {
         fetchOverview();
         if (S.drawerOpen) fetchAuditSessions();
-        if (S.selSession && (ev.sessionKey === S.selSession || ev.runId)) selectSession(S.selSession);
-        if (CHAT_STATE.visible) refreshChatAudit();
+        if (S.selSession && ev.sessionKey === S.selSession) selectSession(S.selSession);
+        if (CHAT_STATE.visible) {
+          refreshChatAudit();
+          if (ev.runId && CHAT_STATE.expandedRunIds.has(ev.runId)) {
+            void refreshChatRunDetail(ev.runId, { force: true });
+          }
+        }
       }
     } catch {}
   };
@@ -327,24 +362,29 @@ function renderDetail() {
 
   // Use the shared audit panel renderer — same as chat sidebar
   el.innerHTML = headerHtml + `<div class="clawlens-audit-body">${renderAuditPanel({ runs: S.runs })}</div>`;
+  bindAuditPanelInteractions(el);
 }
 
 // ── Shared audit panel renderer ───────────────────────────────────────────
 // Returns run card HTML without outer wrapper — caller provides the container.
 
 function renderAuditPanel(data) {
+  const expandedRunIds = arguments[1]?.expandedRunIds ?? null;
+  const loadingRunIds = arguments[1]?.loadingRunIds ?? null;
+  const defaultExpandFirst = arguments[1]?.defaultExpandFirst ?? true;
   if (!data || !data.runs?.length) {
     return '<div style="color:var(--muted,#838387);padding:20px;text-align:center">No audit data for this session</div>';
   }
   return data.runs.map((run, i) => `
-    <div class="clawlens-audit-run${i === 0 ? " expanded" : ""}">
-      <div class="clawlens-audit-run-hdr" onclick="this.parentElement.classList.toggle('expanded')">
+    <div class="clawlens-audit-run${isRunExpanded(run.runId, i, expandedRunIds, defaultExpandFirst) ? " expanded" : ""}" data-run-id="${esc(run.runId)}">
+      <div class="clawlens-audit-run-hdr" data-run-id="${esc(run.runId)}">
         <div class="clawlens-audit-run-top">
           <span class="clawlens-audit-run-num">#${i + 1} Run</span>
           <span class="clawlens-audit-run-time">${formatDuration(run.duration)}</span>
         </div>
         <div class="clawlens-audit-run-prompt">${esc(run.userPrompt || "(no prompt)")}</div>
         <div class="clawlens-audit-run-stats">
+          ${run.runKind === "heartbeat" ? '<span class="clawlens-tag exclusive">HEARTBEAT</span>' : ""}
           <span>${run.summary?.llmCalls ?? 0} LLM</span>
           <span>${run.summary?.toolCalls ?? 0} tool</span>
           <span>${fmtTokens((run.summary?.totalInputTokens ?? 0) + (run.summary?.totalOutputTokens ?? 0))} tok</span>
@@ -352,21 +392,65 @@ function renderAuditPanel(data) {
         </div>
       </div>
       <div class="clawlens-audit-run-detail">
+        ${renderRunDetailStatus(run, loadingRunIds)}
         <div class="clawlens-section-label">Timeline</div>
         <div class="clawlens-tl-legend">
           <span><span class="clawlens-tl-legend-dot" style="background:var(--info,#3b82f6)"></span>LLM</span>
           <span><span class="clawlens-tl-legend-dot" style="background:var(--ok,#22c55e)"></span>Tool</span>
         </div>
-        ${renderTimeline(run.timeline, run.duration)}
+        ${needsRunDetailFetch(run) ? renderDeferredTimelineHint() : renderTimeline(run.timeline, run.duration)}
         <div class="clawlens-section-label" style="margin-top:8px">Turns</div>
-        <div class="clawlens-turns">${renderTurns(run.turns)}</div>
+        <div class="clawlens-turns">${needsRunDetailFetch(run) ? renderDeferredTurnsHint(loadingRunIds?.has(run.runId)) : renderTurns(run.turns)}</div>
       </div>
     </div>
   `).join("");
 }
 
+function isRunExpanded(runId, idx, expandedRunIds, defaultExpandFirst) {
+  if (expandedRunIds?.size) return expandedRunIds.has(runId);
+  return defaultExpandFirst && idx === 0;
+}
+
+function renderRunDetailStatus(run, loadingRunIds) {
+  if (needsRunDetailFetch(run) && loadingRunIds?.has(run.runId)) {
+    return '<div style="color:var(--muted,#838387);font-size:11px;padding:8px 0">Loading detail…</div>';
+  }
+  if (needsRunDetailFetch(run)) {
+    return '<div style="color:var(--muted,#838387);font-size:11px;padding:8px 0">Click to load full timeline and turns.</div>';
+  }
+  return "";
+}
+
+function needsRunDetailFetch(run) {
+  if (!run) return true;
+  if (run.hasDetail === false) return true;
+  const turns = Array.isArray(run.turns) ? run.turns : null;
+  const timeline = Array.isArray(run.timeline) ? run.timeline : null;
+  const hasTurns = !!turns?.length;
+  const hasTimeline = !!timeline?.length;
+  const llmCalls = run.summary?.llmCalls ?? 0;
+  const toolCalls = run.summary?.toolCalls ?? 0;
+  const hasRecordedActivity = llmCalls > 0 || toolCalls > 0;
+  if (hasTurns || hasTimeline) return false;
+  if (run.hasDetail === true && !hasRecordedActivity) return false;
+  return true;
+}
+
+function renderDeferredTimelineHint() {
+  return '<div style="color:var(--muted,#838387);font-size:11px;padding:4px 0 8px">Expand this run to load full timeline.</div>';
+}
+
+function renderDeferredTurnsHint(isLoading) {
+  if (isLoading) {
+    return '<div style="color:var(--muted,#838387);font-size:11px;padding:4px 0">Loading turns…</div>';
+  }
+  return '<div style="color:var(--muted,#838387);font-size:11px;padding:4px 0">Expand this run to load turns.</div>';
+}
+
 function renderTimeline(timeline, totalDuration) {
-  if (!timeline?.length || !totalDuration) return "";
+  if (!timeline?.length || !totalDuration) {
+    return '<div style="color:var(--muted,#838387);font-size:11px;padding:4px 0 8px">No timeline captured for this run.</div>';
+  }
   return '<div class="clawlens-timeline-bar">' + timeline.map(entry => {
     const left = Math.max(0, (entry.startedAt / totalDuration * 100)).toFixed(1);
     const width = Math.max(entry.duration / totalDuration * 100, 2).toFixed(1);
@@ -379,13 +463,58 @@ function renderTimeline(timeline, totalDuration) {
 }
 
 function renderTurns(turns) {
-  if (!turns?.length) return "";
-  return turns.map(t => `
-    <div class="clawlens-turn">
+  debugLog("renderTurns", {
+    hasTurns: Array.isArray(turns),
+    turnCount: turns?.length ?? null,
+    sample: Array.isArray(turns) ? turns.slice(0, 2).map((t) => ({ role: t?.role ?? null, previewLen: t?.preview?.length ?? 0 })) : null,
+  });
+  if (!turns?.length) {
+    return '<div style="color:var(--muted,#838387);font-size:11px;padding:4px 0">No turns captured for this run.</div>';
+  }
+  return turns.map(t => {
+    const preview = t.preview ?? "";
+    return `
+    <div class="clawlens-turn" title="${esc(preview)}">
       <span class="clawlens-turn-role ${esc(t.role)}">${esc(t.role)}</span>
-      <span class="clawlens-turn-preview">${esc((t.preview ?? "").slice(0, 120))}</span>
+      <span class="clawlens-turn-preview">${esc(preview)}</span>
     </div>
-  `).join("");
+  `}).join("");
+}
+
+function bindAuditPanelInteractions(root) {
+  if (!root || root.dataset.clawlensAuditBound === "1") return;
+  root.dataset.clawlensAuditBound = "1";
+  root.addEventListener("click", async (e) => {
+    const turn = e.target.closest(".clawlens-turn");
+    if (turn && root.contains(turn)) {
+      turn.classList.toggle("expanded");
+      return;
+    }
+
+    const hdr = e.target.closest(".clawlens-audit-run-hdr");
+    if (hdr && root.contains(hdr)) {
+      if (root.id === "clawlens-audit-sidebar-body") {
+        await toggleChatRunExpanded(hdr.dataset.runId);
+        return;
+      }
+      const runEl = hdr.parentElement;
+      runEl?.classList.toggle("expanded");
+    }
+  });
+}
+
+function renderAuditEmptyState(sessionKey, resolvedFrom) {
+  const keyLabel = esc(sessionKey || "unknown");
+  const resolved = resolvedFrom && resolvedFrom !== sessionKey
+    ? `<div style="margin-top:6px;font-size:11px;color:var(--muted,#838387)">using fallback: ${esc(resolvedFrom)}</div>`
+    : "";
+  return `
+    <div style="color:var(--muted,#838387);padding:20px;text-align:center;line-height:1.6">
+      <div>No audit data for this session</div>
+      <div style="margin-top:6px;font-size:11px">session: ${keyLabel}</div>
+      ${resolved}
+    </div>
+  `;
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────
@@ -415,31 +544,197 @@ main().catch(console.error);
 const CHAT_STATE = {
   visible: false,
   sessionKey: null,
+  sourceSessionKey: null,
   data: null,
   pollTimer: null,
+  loading: false,
+  loadingMore: false,
+  refreshing: false,
+  loadError: null,
+  latestStartedAt: null,
+  oldestStartedAt: null,
+  hasMore: false,
+  expandedRunIds: new Set(),
+  loadingRunIds: new Set(),
+  currentMessageRunId: null,
+  currentMessageStatus: null,
+  lastDomMessageFingerprint: null,
+  domRefreshTimer: null,
+  autoExpandDone: false,
+  pointerInsideSidebar: false,
+  suppressRenderUntil: 0,
+  pendingSidebarRender: false,
+  deferredRenderTimer: null,
 };
 
-function getCurrentSessionKey() {
+const SIDEBAR_RENDER_SUPPRESS_MS = 800;
+
+function getCurrentSessionSelection() {
   const url = new URL(location.href);
-  const s = url.searchParams.get("session");
-  if (s) return s;
-  const sel = document.querySelector(".chat-session select");
-  return sel?.value ?? null;
+  const raw = url.searchParams.get("session")
+    ?? document.querySelector(".chat-session select")?.value
+    ?? null;
+  if (!raw) return null;
+  return {
+    raw,
+    resolved: raw.includes(":") ? raw : "agent:main:main",
+  };
 }
 
 function isInChatView() {
   return location.pathname.includes("/chat") || !!document.querySelector(".chat-split-container");
 }
 
-function updateAuditSidebarContent() {
+function getLatestChatDomMessageCandidate() {
+  const groups = Array.from(document.querySelectorAll(".chat-group"));
+  if (!groups.length) return null;
+  for (let i = groups.length - 1; i >= 0; i--) {
+    const group = groups[i];
+    const role = group.classList.contains("user")
+      ? "user"
+      : group.classList.contains("assistant")
+        ? "assistant"
+        : group.classList.contains("tool")
+          ? "tool"
+          : null;
+    if (!role) continue;
+    const textNodes = Array.from(group.querySelectorAll(".chat-text, .chat-sender-name"))
+      .map((node) => node.textContent?.trim() ?? "")
+      .filter(Boolean);
+    const text = textNodes.join(" | ").trim();
+    if (!text) continue;
+    return {
+      role,
+      text,
+      fingerprint: `${role}:${text.slice(0, 240)}`,
+    };
+  }
+  return null;
+}
+
+function scheduleDomDrivenAuditRefresh(reason) {
+  if (!isInChatView()) return;
+  if (!CHAT_STATE.visible) return;
+  if (CHAT_STATE.domRefreshTimer) clearTimeout(CHAT_STATE.domRefreshTimer);
+  CHAT_STATE.domRefreshTimer = setTimeout(async () => {
+    CHAT_STATE.domRefreshTimer = null;
+    const candidate = getLatestChatDomMessageCandidate();
+    if (!candidate) return;
+    if (candidate.fingerprint === CHAT_STATE.lastDomMessageFingerprint) return;
+    CHAT_STATE.lastDomMessageFingerprint = candidate.fingerprint;
+    if (candidate.role !== "user" && candidate.role !== "assistant") return;
+    debugLog("domRefresh", { reason, role: candidate.role, textPreview: candidate.text.slice(0, 120) });
+    await refreshChatAudit();
+    await refreshExpandedChatRunDetails();
+  }, 250);
+}
+
+function updateAuditSidebarContent(forceImmediate = false) {
   const body = document.getElementById("clawlens-audit-sidebar-body");
   if (!body) return;
+  const now = Date.now();
+  const hasRenderedStableContent = body.dataset.clawlensRenderedStable === "1";
+  if (!forceImmediate && hasRenderedStableContent && (CHAT_STATE.pointerInsideSidebar || CHAT_STATE.suppressRenderUntil > now)) {
+    CHAT_STATE.pendingSidebarRender = true;
+    scheduleDeferredSidebarRender();
+    return;
+  }
+  CHAT_STATE.pendingSidebarRender = false;
+  debugLog("updateSidebar", {
+    visible: CHAT_STATE.visible,
+    hasData: !!CHAT_STATE.data,
+    runCount: CHAT_STATE.data?.runs?.length ?? 0,
+    loadError: CHAT_STATE.loadError,
+    loading: CHAT_STATE.loading,
+    refreshing: CHAT_STATE.refreshing,
+    latestStartedAt: CHAT_STATE.latestStartedAt,
+  });
+  if (CHAT_STATE.loadError) {
+    body.dataset.clawlensRenderedStable = "1";
+    body.innerHTML = `<div style="color:var(--destructive,#ef4444);padding:20px;text-align:center;line-height:1.6">${esc(CHAT_STATE.loadError)}</div>`;
+    return;
+  }
   if (!CHAT_STATE.data) {
+    body.dataset.clawlensRenderedStable = "0";
     body.innerHTML = '<div style="color:var(--muted,#838387);padding:20px;text-align:center">Loading…</div>';
     return;
   }
+  if (!CHAT_STATE.data.runs?.length) {
+    body.dataset.clawlensRenderedStable = "1";
+    body.innerHTML = renderAuditEmptyState(
+      CHAT_STATE.sourceSessionKey ?? CHAT_STATE.sessionKey,
+      CHAT_STATE.data._resolvedFrom ?? CHAT_STATE.sessionKey,
+    );
+    return;
+  }
   // body already has clawlens-audit-body class; renderAuditPanel returns inner content only
-  body.innerHTML = renderAuditPanel(CHAT_STATE.data);
+  const footer = CHAT_STATE.hasMore
+    ? `<button id="clawlens-audit-load-more" class="clawlens-audit-load-more">${CHAT_STATE.loadingMore ? "Loading…" : "Load older runs"}</button>`
+    : "";
+  const hasExpanded = CHAT_STATE.expandedRunIds.size > 0;
+  body.innerHTML = renderAuditPanel(CHAT_STATE.data, {
+    expandedRunIds: CHAT_STATE.expandedRunIds,
+    loadingRunIds: CHAT_STATE.loadingRunIds,
+    defaultExpandFirst: !hasExpanded && !CHAT_STATE.autoExpandDone,
+  }) + footer;
+  body.dataset.clawlensRenderedStable = "1";
+  bindAuditPanelInteractions(body);
+  body.onscroll = () => {
+    if (!CHAT_STATE.hasMore || CHAT_STATE.loadingMore) return;
+    if (body.scrollTop + body.clientHeight >= body.scrollHeight - 120) {
+      loadOlderChatAudit();
+    }
+  };
+  document.getElementById("clawlens-audit-load-more")?.addEventListener("click", loadOlderChatAudit);
+}
+
+function scheduleDeferredSidebarRender() {
+  if (CHAT_STATE.deferredRenderTimer) return;
+  const delay = Math.max(100, CHAT_STATE.suppressRenderUntil - Date.now());
+  CHAT_STATE.deferredRenderTimer = setTimeout(() => {
+    CHAT_STATE.deferredRenderTimer = null;
+    if (!CHAT_STATE.visible) return;
+    if (CHAT_STATE.pointerInsideSidebar || CHAT_STATE.suppressRenderUntil > Date.now()) {
+      scheduleDeferredSidebarRender();
+      return;
+    }
+    if (CHAT_STATE.pendingSidebarRender) {
+      updateAuditSidebarContent();
+    }
+  }, delay);
+}
+
+function bumpSidebarInteractionWindow(ms = SIDEBAR_RENDER_SUPPRESS_MS) {
+  CHAT_STATE.suppressRenderUntil = Math.max(CHAT_STATE.suppressRenderUntil, Date.now() + ms);
+}
+
+
+function setupResizeHandle(sidebar) {
+  const handle = sidebar.querySelector(".clawlens-resize-handle");
+  if (!handle) return;
+  let startX = 0;
+  let startWidth = 0;
+
+  handle.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    startX = e.clientX;
+    startWidth = sidebar.offsetWidth;
+    handle.classList.add("dragging");
+    handle.setPointerCapture(e.pointerId);
+  });
+
+  handle.addEventListener("pointermove", (e) => {
+    if (!handle.classList.contains("dragging")) return;
+    const delta = startX - e.clientX;
+    const minW = 240;
+    const maxW = Math.min(760, Math.floor(window.innerWidth * 0.85));
+    const newWidth = Math.max(minW, Math.min(maxW, startWidth + delta));
+    document.documentElement.style.setProperty("--clawlens-audit-width", newWidth + "px");
+  });
+
+  handle.addEventListener("pointerup", () => {
+    handle.classList.remove("dragging");
+  });
 }
 
 function mountChatAuditSidebar() {
@@ -449,6 +744,7 @@ function mountChatAuditSidebar() {
   sidebar.id = "clawlens-audit-sidebar";
   sidebar.className = "clawlens-audit-sidebar";
   sidebar.innerHTML = `
+    <div class="clawlens-resize-handle" title="拖拽调整宽度"></div>
     <div class="clawlens-audit-header">
       <span class="clawlens-audit-title">ClawLens Audit</span>
       <button class="clawlens-audit-close" id="clawlens-audit-close-btn" title="Close">✕</button>
@@ -459,15 +755,57 @@ function mountChatAuditSidebar() {
   `;
   document.body.appendChild(sidebar);
   document.getElementById("clawlens-audit-close-btn")?.addEventListener("click", hideChatAuditSidebar);
+  sidebar.addEventListener("pointerenter", () => {
+    CHAT_STATE.pointerInsideSidebar = true;
+    bumpSidebarInteractionWindow();
+  });
+  sidebar.addEventListener("pointerleave", () => {
+    CHAT_STATE.pointerInsideSidebar = false;
+    bumpSidebarInteractionWindow(150);
+    scheduleDeferredSidebarRender();
+  });
+  sidebar.addEventListener("pointerdown", () => {
+    bumpSidebarInteractionWindow();
+  });
+  setupResizeHandle(sidebar);
+  document.body.classList.add("clawlens-audit-open");
   CHAT_STATE.visible = true;
-  // Fetch immediately — don't wait for MutationObserver debounce
-  refreshChatAudit();
+  debugLog("mountSidebar", {
+    sessionKey: CHAT_STATE.sessionKey,
+    sourceSessionKey: CHAT_STATE.sourceSessionKey,
+    hasData: !!CHAT_STATE.data,
+    runCount: CHAT_STATE.data?.runs?.length ?? 0,
+    loadError: CHAT_STATE.loadError,
+  });
+  if (CHAT_STATE.data?.runs?.length || CHAT_STATE.loadError) {
+    updateAuditSidebarContent();
+    void refreshCurrentMessageRunHint();
+  }
+  // Fetch immediately after mount. Hidden-state prefetch is intentionally avoided.
+  void refreshChatAudit();
 }
 
 function hideChatAuditSidebar() {
+  debugLog("hideSidebar", {
+    sessionKey: CHAT_STATE.sessionKey,
+    hasData: !!CHAT_STATE.data,
+    runCount: CHAT_STATE.data?.runs?.length ?? 0,
+  });
   const sidebar = document.getElementById("clawlens-audit-sidebar");
   if (sidebar) sidebar.remove();
+  document.body.classList.remove("clawlens-audit-open");
   CHAT_STATE.visible = false;
+  CHAT_STATE.pointerInsideSidebar = false;
+  CHAT_STATE.pendingSidebarRender = false;
+  CHAT_STATE.suppressRenderUntil = 0;
+  if (CHAT_STATE.deferredRenderTimer) {
+    clearTimeout(CHAT_STATE.deferredRenderTimer);
+    CHAT_STATE.deferredRenderTimer = null;
+  }
+  if (CHAT_STATE.pollTimer) {
+    clearInterval(CHAT_STATE.pollTimer);
+    CHAT_STATE.pollTimer = null;
+  }
 }
 
 function toggleChatAuditSidebar() {
@@ -486,57 +824,328 @@ function injectAuditToggleBtn() {
   header.appendChild(btn);
 }
 
+function mergeRuns(existing, incoming, mode) {
+  const existingMap = new Map((existing ?? []).filter((run) => run?.runId).map((run) => [run.runId, run]));
+  const incomingMap = new Map((incoming ?? []).filter((run) => run?.runId).map((run) => [run.runId, run]));
+  const orderedIds = mode === "prepend"
+    ? [...incomingMap.keys(), ...existingMap.keys()]
+    : [...existingMap.keys(), ...incomingMap.keys()];
+  const seen = new Set();
+  const out = [];
+  for (const runId of orderedIds) {
+    if (!runId || seen.has(runId)) continue;
+    seen.add(runId);
+    const prev = existingMap.get(runId);
+    const next = incomingMap.get(runId);
+    if (prev && next) {
+      const preserveDetail = prev.hasDetail === true;
+      out.push(preserveDetail ? { ...next, ...prev, hasDetail: true } : { ...prev, ...next });
+      continue;
+    }
+    if (next) {
+      out.push(next);
+      continue;
+    }
+    if (prev) {
+      out.push(prev);
+    }
+  }
+  out.sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0));
+  return out;
+}
+
+function getNewestIncomingRunId(incomingRuns) {
+  if (!Array.isArray(incomingRuns) || !incomingRuns.length) return null;
+  const sorted = [...incomingRuns].sort((a, b) => (b?.startedAt ?? 0) - (a?.startedAt ?? 0));
+  return sorted[0]?.runId ?? null;
+}
+
+async function fetchChatAuditChunk(params = {}) {
+  if (!CHAT_STATE.sessionKey) return null;
+  const usp = new URLSearchParams();
+  const limit = params.limit ?? 10;
+  usp.set("limit", String(limit));
+  usp.set("compact", "1");
+  usp.append("excludeKinds", "heartbeat");
+  usp.set("requireConversation", "1");
+  if (params.before) usp.set("before", String(params.before));
+  if (params.since) usp.set("since", String(params.since));
+  const path = "/audit/session/" + encodeURIComponent(CHAT_STATE.sessionKey) + "?" + usp.toString();
+  debugLog("fetchChatAuditChunk", {
+    sessionKey: CHAT_STATE.sessionKey,
+    params,
+    path,
+  });
+  return await apiFetch(path);
+}
+
+async function fetchCurrentMessageRun(sessionKey) {
+  if (!sessionKey) return null;
+  const path = "/audit/session/" + encodeURIComponent(sessionKey) + "/current-message-run";
+  debugLog("fetchCurrentMessageRun", { sessionKey, path });
+  return await apiFetch(path);
+}
+
+async function refreshCurrentMessageRunHint() {
+  if (!CHAT_STATE.sessionKey || !CHAT_STATE.data?.runs?.length) return;
+  const hint = await fetchCurrentMessageRun(CHAT_STATE.sessionKey);
+  if (!hint) return;
+  CHAT_STATE.currentMessageStatus = hint.status ?? null;
+  CHAT_STATE.currentMessageRunId = hint.run?.runId ?? null;
+  const runId = hint.run?.runId;
+  debugLog("refreshCurrentMessageRunHint:loaded", {
+    status: hint.status ?? null,
+    runId: runId ?? null,
+  });
+  if (!runId) return;
+  const hasRun = CHAT_STATE.data.runs.some((run) => run.runId === runId);
+  if (!hasRun) return;
+  const shouldAutoExpand = !CHAT_STATE.autoExpandDone && CHAT_STATE.expandedRunIds.size === 0;
+  if (shouldAutoExpand) {
+    CHAT_STATE.expandedRunIds.add(runId);
+    CHAT_STATE.autoExpandDone = true;
+    if (CHAT_STATE.visible) updateAuditSidebarContent();
+    startChatRunDetailFetch(runId);
+  }
+}
+
+async function ensureChatRunDetail(runId) {
+  return refreshChatRunDetail(runId, { force: false });
+}
+
+function startChatRunDetailFetch(runId, opts = {}) {
+  if (!runId || CHAT_STATE.loadingRunIds.has(runId)) return;
+  CHAT_STATE.loadingRunIds.add(runId);
+  if (CHAT_STATE.visible) updateAuditSidebarContent(true);
+  void refreshChatRunDetail(runId, opts);
+}
+
+async function refreshChatRunDetail(runId, opts = {}) {
+  if (!runId || !CHAT_STATE.data?.runs?.length) return;
+  const idx = CHAT_STATE.data.runs.findIndex((r) => r.runId === runId);
+  if (idx < 0) return;
+  const run = CHAT_STATE.data.runs[idx];
+  const force = opts.force === true;
+  if (!force && !needsRunDetailFetch(run)) return;
+  debugLog("ensureRunDetail:start", {
+    runId,
+    visible: CHAT_STATE.visible,
+    force,
+  });
+  const detail = await apiFetch("/audit/run/" + encodeURIComponent(runId));
+  CHAT_STATE.loadingRunIds.delete(runId);
+  if (!detail) {
+    debugLog("ensureRunDetail:empty", runId);
+    if (CHAT_STATE.visible) updateAuditSidebarContent(true);
+    return;
+  }
+  CHAT_STATE.data.runs[idx] = { ...run, ...detail, hasDetail: true };
+  debugLog("ensureRunDetail:done", {
+    runId,
+    turnCount: detail?.turns?.length ?? 0,
+    timelineCount: detail?.timeline?.length ?? 0,
+  });
+  if (CHAT_STATE.visible) updateAuditSidebarContent(true);
+}
+
+async function toggleChatRunExpanded(runId) {
+  if (!runId) return;
+  bumpSidebarInteractionWindow();
+  const implicitFirstRunId = CHAT_STATE.expandedRunIds.size === 0 && !CHAT_STATE.autoExpandDone
+    ? CHAT_STATE.data?.runs?.[0]?.runId ?? null
+    : null;
+  const isImplicitlyExpanded = implicitFirstRunId === runId;
+  const run = CHAT_STATE.data?.runs?.find((item) => item.runId === runId) ?? null;
+  CHAT_STATE.autoExpandDone = true;
+  if (CHAT_STATE.expandedRunIds.has(runId) || isImplicitlyExpanded) {
+    CHAT_STATE.expandedRunIds.delete(runId);
+    if (CHAT_STATE.visible) updateAuditSidebarContent(true);
+    return;
+  }
+  CHAT_STATE.expandedRunIds.add(runId);
+  if (run && needsRunDetailFetch(run)) {
+    startChatRunDetailFetch(runId, { immediate: true });
+    return;
+  }
+  if (CHAT_STATE.visible) updateAuditSidebarContent(true);
+}
+
+async function primeInitialChatRunDetail() {
+  const firstRunId = CHAT_STATE.data?.runs?.[0]?.runId;
+  if (!firstRunId) return;
+  if (!CHAT_STATE.expandedRunIds.size) {
+    CHAT_STATE.expandedRunIds.add(firstRunId);
+    CHAT_STATE.autoExpandDone = true;
+  }
+  startChatRunDetailFetch(firstRunId);
+}
+
 async function refreshChatAudit() {
-  const key = getCurrentSessionKey();
-  if (!key) return;
-  if (key !== CHAT_STATE.sessionKey) {
+  if (CHAT_STATE.refreshing) return;
+  const selection = getCurrentSessionSelection();
+  if (!selection) return;
+  const key = selection.resolved;
+  const needsInitialLoad = key !== CHAT_STATE.sessionKey || !CHAT_STATE.data;
+  debugLog("refreshChatAudit", {
+    raw: selection.raw,
+    resolved: selection.resolved,
+    currentSessionKey: CHAT_STATE.sessionKey,
+    needsInitialLoad,
+    hasData: !!CHAT_STATE.data,
+    visible: CHAT_STATE.visible,
+    latestStartedAt: CHAT_STATE.latestStartedAt,
+  });
+  if (needsInitialLoad) {
     CHAT_STATE.sessionKey = key;
+    CHAT_STATE.sourceSessionKey = selection.raw;
     CHAT_STATE.data = null;
+    CHAT_STATE.latestStartedAt = null;
+    CHAT_STATE.oldestStartedAt = null;
+    CHAT_STATE.hasMore = false;
+    CHAT_STATE.expandedRunIds.clear();
+    CHAT_STATE.loadingRunIds.clear();
+    CHAT_STATE.autoExpandDone = false;
+    CHAT_STATE.loading = true;
+    CHAT_STATE.loadError = null;
     if (CHAT_STATE.visible) updateAuditSidebarContent();
-  }
-  // API returns { sessionKey, runs: RunAuditDetail[] }
-  let d = await apiFetch("/audit/session/" + encodeURIComponent(key));
-  // If no runs found for the exact key, try progressively coarser fallbacks.
-  // Lifecycle events may omit channelId so "agent:main:main" is stored as
-  // "agent:main". Try each shorter prefix before giving up.
-  if (d && d.runs?.length === 0) {
-    const parts = key.split(":");
-    for (let i = parts.length - 1; i >= 1 && d.runs?.length === 0; i--) {
-      const shorter = parts.slice(0, i).join(":");
-      const fb = await apiFetch("/audit/session/" + encodeURIComponent(shorter));
-      if (fb?.runs?.length) { d = { ...fb, sessionKey: key, _fallback: true }; }
+    CHAT_STATE.refreshing = true;
+    try {
+      const d = await fetchChatAuditChunk({ limit: 8 });
+      if (d) {
+        debugLog("refreshChatAudit:initialLoaded", {
+          runCount: d.runs?.length ?? 0,
+          latestStartedAt: d.latestStartedAt ?? null,
+          oldestStartedAt: d.oldestStartedAt ?? null,
+          hasMore: !!d.hasMore,
+        });
+        CHAT_STATE.data = d;
+        CHAT_STATE.latestStartedAt = d.latestStartedAt ?? d.runs?.[0]?.startedAt ?? null;
+        CHAT_STATE.oldestStartedAt = d.oldestStartedAt ?? d.runs?.[d.runs.length - 1]?.startedAt ?? null;
+        CHAT_STATE.hasMore = !!d.hasMore;
+        primeInitialChatRunDetail();
+        await refreshCurrentMessageRunHint();
+        startChatPolling();
+      } else {
+        CHAT_STATE.loadError = "Failed to load audit data";
+        debugLog("refreshChatAudit:initialFailed");
+      }
+    } finally {
+      CHAT_STATE.loading = false;
+      CHAT_STATE.refreshing = false;
+      if (CHAT_STATE.visible) updateAuditSidebarContent();
     }
+    return;
   }
-  // Last resort: try the "unknown" bucket.
-  if (d && d.runs?.length === 0) {
-    const fallback = await apiFetch("/audit/session/unknown");
-    if (fallback?.runs?.length) {
-      d = { ...fallback, sessionKey: key, _fallback: true };
+
+  CHAT_STATE.sourceSessionKey = selection.raw;
+
+  if (!CHAT_STATE.latestStartedAt) return;
+  CHAT_STATE.refreshing = true;
+  try {
+    const d = await fetchChatAuditChunk({ limit: 6, since: CHAT_STATE.latestStartedAt });
+    if (!d?.runs?.length) {
+      debugLog("refreshChatAudit:incrementalEmpty", {
+        latestStartedAt: CHAT_STATE.latestStartedAt,
+      });
+      return;
     }
-  }
-  if (d) {
-    CHAT_STATE.data = d;
+    debugLog("refreshChatAudit:incrementalLoaded", {
+      runCount: d.runs?.length ?? 0,
+      latestStartedAt: d.latestStartedAt ?? null,
+      oldestStartedAt: d.oldestStartedAt ?? null,
+      hasMore: !!d.hasMore,
+    });
+    CHAT_STATE.data = {
+      ...CHAT_STATE.data,
+      ...d,
+      runs: mergeRuns(CHAT_STATE.data?.runs, d.runs, "prepend"),
+    };
+    const newestIncomingRunId = getNewestIncomingRunId(d.runs);
+    if (newestIncomingRunId) {
+      CHAT_STATE.expandedRunIds.add(newestIncomingRunId);
+      CHAT_STATE.autoExpandDone = true;
+      const newestRun = CHAT_STATE.data.runs.find((run) => run.runId === newestIncomingRunId);
+      if (newestRun && needsRunDetailFetch(newestRun)) {
+        startChatRunDetailFetch(newestIncomingRunId);
+      }
+    }
+    CHAT_STATE.latestStartedAt = Math.max(CHAT_STATE.latestStartedAt ?? 0, d.latestStartedAt ?? 0);
+    CHAT_STATE.oldestStartedAt = CHAT_STATE.data.runs[CHAT_STATE.data.runs.length - 1]?.startedAt ?? CHAT_STATE.oldestStartedAt;
+    CHAT_STATE.hasMore = CHAT_STATE.hasMore || !!d.hasMore;
+    CHAT_STATE.loadError = null;
+    await refreshCurrentMessageRunHint();
     if (CHAT_STATE.visible) updateAuditSidebarContent();
+  } finally {
+    CHAT_STATE.refreshing = false;
   }
+}
+
+async function loadOlderChatAudit() {
+  if (!CHAT_STATE.sessionKey || !CHAT_STATE.oldestStartedAt || CHAT_STATE.loadingMore || !CHAT_STATE.hasMore) return;
+  CHAT_STATE.loadingMore = true;
+  debugLog("loadOlder:start", {
+    sessionKey: CHAT_STATE.sessionKey,
+    oldestStartedAt: CHAT_STATE.oldestStartedAt,
+  });
+  if (CHAT_STATE.visible) updateAuditSidebarContent();
+  const d = await fetchChatAuditChunk({ limit: 8, before: CHAT_STATE.oldestStartedAt });
+  CHAT_STATE.loadingMore = false;
+  if (!d) {
+    debugLog("loadOlder:empty");
+    if (CHAT_STATE.visible) updateAuditSidebarContent();
+    return;
+  }
+  debugLog("loadOlder:loaded", {
+    runCount: d.runs?.length ?? 0,
+    oldestStartedAt: d.oldestStartedAt ?? null,
+    hasMore: !!d.hasMore,
+  });
+  CHAT_STATE.data = {
+    ...CHAT_STATE.data,
+    ...d,
+    runs: mergeRuns(CHAT_STATE.data?.runs, d.runs, "append"),
+  };
+  CHAT_STATE.oldestStartedAt = d.oldestStartedAt ?? CHAT_STATE.oldestStartedAt;
+  CHAT_STATE.hasMore = !!d.hasMore;
+  if (CHAT_STATE.visible) updateAuditSidebarContent();
 }
 
 function startChatPolling() {
   if (CHAT_STATE.pollTimer) return;
   CHAT_STATE.pollTimer = setInterval(async () => {
-    if (!isInChatView()) return;
+    if (!isInChatView() || !CHAT_STATE.visible || CHAT_STATE.loading || CHAT_STATE.refreshing || !CHAT_STATE.latestStartedAt) return;
     await refreshChatAudit();
+    await refreshExpandedChatRunDetails();
   }, 10000);
+}
+
+async function refreshExpandedChatRunDetails() {
+  if (!CHAT_STATE.visible || !CHAT_STATE.expandedRunIds.size) return;
+  const expandedRuns = CHAT_STATE.data?.runs
+    ?.filter((run) => CHAT_STATE.expandedRunIds.has(run.runId)) ?? [];
+  for (const run of expandedRuns) {
+    if (run.hasDetail === false) {
+      await refreshChatRunDetail(run.runId, { force: false });
+      continue;
+    }
+    if (run.status === "running") {
+      await refreshChatRunDetail(run.runId, { force: true });
+    }
+  }
 }
 
 function handleRouteChange() {
   if (isInChatView()) {
     injectAuditToggleBtn();
-    startChatPolling();
-    refreshChatAudit();
+    if (CHAT_STATE.visible) {
+      void refreshChatAudit();
+      scheduleDomDrivenAuditRefresh("route-change");
+    }
   } else {
     hideChatAuditSidebar();
     const btn = document.getElementById("clawlens-audit-toggle-btn");
     if (btn) btn.remove();
+    CHAT_STATE.lastDomMessageFingerprint = null;
   }
 }
 
@@ -550,6 +1159,26 @@ const _chatObs = new MutationObserver(() => {
   }, 200);
 });
 _chatObs.observe(document.body, { childList: true, subtree: true });
+
+const _chatMessageObs = new MutationObserver((mutations) => {
+  let relevant = false;
+  for (const mutation of mutations) {
+    if (mutation.type !== "childList") continue;
+    for (const node of mutation.addedNodes) {
+      if (!(node instanceof HTMLElement)) continue;
+      if (
+        node.matches?.(".chat-group") ||
+        node.querySelector?.(".chat-group")
+      ) {
+        relevant = true;
+        break;
+      }
+    }
+    if (relevant) break;
+  }
+  if (relevant) scheduleDomDrivenAuditRefresh("chat-mutation");
+});
+_chatMessageObs.observe(document.body, { childList: true, subtree: true });
 
 setTimeout(handleRouteChange, 1000);
 setTimeout(handleRouteChange, 3000);

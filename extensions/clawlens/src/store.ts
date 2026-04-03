@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
+import { isClawLensDebugEnabled, logClawLensDebug } from "./debug.js";
 
 // node:sqlite is available in Node.js >= 22.5.0
 // Lazy-load so the module can be imported without crashing on older runtimes.
@@ -20,6 +21,7 @@ type RunInsertOpts = {
   model?: string;
   compareGroupId?: string;
   isPrimary?: boolean;
+  runKind?: "heartbeat" | "chat";
 };
 
 type LlmCallOpts = {
@@ -59,6 +61,16 @@ type SnapshotData = {
   compactionCount?: number;
 };
 
+type ConversationTurnOpts = {
+  toolCallsCount?: number;
+  tokensUsed?: number;
+  messageId?: string;
+  sessionFile?: string;
+  sourceKind?: "transcript_explicit" | "llm_prompt_metadata" | "session_fallback";
+  sourceSessionId?: string;
+  sourceLoggerTs?: string;
+};
+
 type SessionFilters = {
   channel?: string;
   model?: string;
@@ -67,8 +79,21 @@ type SessionFilters = {
   offset?: number;
 };
 
+function classifyTurnKindFromPreview(preview?: string | null): "heartbeat" | "chat" {
+  const text = preview ?? "";
+  if (
+    text.includes("Read HEARTBEAT.md if it exists (workspace context).") ||
+    text.includes("/home/openclaw/.openclaw/workspace/HEARTBEAT.md") ||
+    text.includes("HEARTBEAT_OK")
+  ) {
+    return "heartbeat";
+  }
+  return "chat";
+}
+
 export class Store {
   private db: DatabaseSync;
+  private debugEnabled = isClawLensDebugEnabled();
 
   // Prepared statement caches
   private stmtInsertRun: ReturnType<DatabaseSync["prepare"]>;
@@ -79,18 +104,35 @@ export class Store {
   private stmtCleanup: ReturnType<DatabaseSync["prepare"]>;
   private stmtAggregateRun: ReturnType<DatabaseSync["prepare"]>;
   private stmtInsertConvTurn: ReturnType<DatabaseSync["prepare"]>;
+  private stmtUpdateConvTurnByMessageId: ReturnType<DatabaseSync["prepare"]>;
+  private stmtFindConvTurnByMessageId: ReturnType<DatabaseSync["prepare"]>;
+  private stmtNextTurnIndex: ReturnType<DatabaseSync["prepare"]>;
+
+  private static readonly SOURCE_PRIORITY = {
+    transcript_explicit: 3,
+    llm_prompt_metadata: 2,
+    session_fallback: 1,
+  } as const;
 
   private static computeCostMatch(
     official: number | null,
     calculated: number | null,
   ): { costMatch: boolean; costDiffReason?: string } {
-    if (official == null && calculated == null) return { costMatch: true };
+    if (official == null && calculated == null) return { costMatch: false, costDiffReason: "no cost data available" };
     if (official == null) return { costMatch: false, costDiffReason: "provider did not return cost, using fallback" };
     if (calculated == null) return { costMatch: false, costDiffReason: "no pricing config available" };
     const diff = Math.abs(official - calculated);
     const threshold = Math.max(official, calculated) * 0.001;
     if (diff <= threshold) return { costMatch: true };
     return { costMatch: false, costDiffReason: "pricing differs from config" };
+  }
+
+  setDebugEnabled(enabled?: boolean): void {
+    this.debugEnabled = isClawLensDebugEnabled(enabled);
+  }
+
+  private debug(message: string, details: Record<string, unknown>): void {
+    logClawLensDebug("clawlens-store", message, details, this.debugEnabled);
   }
 
   constructor(stateDir: string) {
@@ -109,6 +151,7 @@ export class Store {
         agent_id TEXT,
         provider TEXT,
         model TEXT,
+        run_kind TEXT,
         started_at INTEGER NOT NULL,
         ended_at INTEGER,
         duration_ms INTEGER,
@@ -187,12 +230,27 @@ export class Store {
         content_preview TEXT,
         content_length  INTEGER,
         timestamp       INTEGER,
+        message_id      TEXT,
+        session_file    TEXT,
+        source_kind     TEXT,
+        source_session_id TEXT,
+        source_logger_ts TEXT,
         tool_calls_count INTEGER DEFAULT 0,
         tokens_used     INTEGER
       );
 
       CREATE INDEX IF NOT EXISTS idx_conv_turns_run ON conversation_turns(run_id);
       CREATE INDEX IF NOT EXISTS idx_conv_turns_session ON conversation_turns(session_key);
+
+      CREATE TABLE IF NOT EXISTS logger_import_state (
+        file_path TEXT PRIMARY KEY,
+        file_mtime_ms INTEGER NOT NULL,
+        file_size_bytes INTEGER NOT NULL,
+        imported_at INTEGER NOT NULL,
+        total_mappings INTEGER NOT NULL,
+        applied_count INTEGER NOT NULL,
+        skipped_count INTEGER NOT NULL
+      );
     `);
 
     // Idempotent migrations
@@ -202,13 +260,24 @@ export class Store {
       "ALTER TABLE llm_calls ADD COLUMN calculated_cost REAL",
       "ALTER TABLE runs ADD COLUMN total_official_cost REAL",
       "ALTER TABLE runs ADD COLUMN total_calculated_cost REAL",
+      "ALTER TABLE runs ADD COLUMN run_kind TEXT",
+      "ALTER TABLE conversation_turns ADD COLUMN message_id TEXT",
+      "ALTER TABLE conversation_turns ADD COLUMN session_file TEXT",
+      "ALTER TABLE conversation_turns ADD COLUMN source_kind TEXT",
+      "ALTER TABLE conversation_turns ADD COLUMN source_session_id TEXT",
+      "ALTER TABLE conversation_turns ADD COLUMN source_logger_ts TEXT",
     ]) {
       try { this.db.exec(sql); } catch { /* column already exists */ }
     }
+    try {
+      this.db.exec(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_conv_turns_message_id ON conversation_turns(message_id) WHERE message_id IS NOT NULL",
+      );
+    } catch { /* older sqlite builds may reject partial index creation */ }
 
     this.stmtInsertRun = this.db.prepare(`
-      INSERT OR IGNORE INTO runs (run_id, session_key, channel, agent_id, provider, model, started_at, compare_group_id, is_primary)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT OR IGNORE INTO runs (run_id, session_key, channel, agent_id, provider, model, run_kind, started_at, compare_group_id, is_primary)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     this.stmtAggregateRun = this.db.prepare(`
@@ -264,8 +333,19 @@ export class Store {
     `);
 
     this.stmtInsertConvTurn = this.db.prepare(`
-      INSERT INTO conversation_turns (run_id, session_key, turn_index, role, content_preview, content_length, timestamp, tool_calls_count, tokens_used)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO conversation_turns (run_id, session_key, turn_index, role, content_preview, content_length, timestamp, message_id, session_file, source_kind, source_session_id, source_logger_ts, tool_calls_count, tokens_used)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    this.stmtUpdateConvTurnByMessageId = this.db.prepare(`
+      UPDATE conversation_turns
+      SET run_id = ?, session_key = ?, role = ?, content_preview = ?, content_length = ?, timestamp = ?, session_file = ?, source_kind = ?, source_session_id = ?, source_logger_ts = ?, tool_calls_count = ?, tokens_used = ?
+      WHERE message_id = ?
+    `);
+    this.stmtFindConvTurnByMessageId = this.db.prepare(`
+      SELECT id, run_id, turn_index, source_kind FROM conversation_turns WHERE message_id = ?
+    `);
+    this.stmtNextTurnIndex = this.db.prepare(`
+      SELECT COALESCE(MAX(turn_index), -1) + 1 AS next_turn_index FROM conversation_turns WHERE run_id = ?
     `);
   }
 
@@ -277,6 +357,7 @@ export class Store {
       opts?.agentId ?? null,
       opts?.provider ?? null,
       opts?.model ?? null,
+      opts?.runKind ?? null,
       startedAt,
       opts?.compareGroupId ?? null,
       opts?.isPrimary != null ? (opts.isPrimary ? 1 : 0) : null,
@@ -300,6 +381,20 @@ export class Store {
       model: string | null;
       provider: string | null;
     };
+    this.debug("completeRun:aggregate", {
+      runId,
+      endedAt,
+      status,
+      llmCount: agg.llm_count,
+      inputTokens: agg.input_tokens,
+      outputTokens: agg.output_tokens,
+      cacheRead: agg.cache_read,
+      cacheWrite: agg.cache_write,
+      officialCost: agg.official_cost,
+      calculatedCost: agg.calculated_cost,
+      model: agg.model,
+      provider: agg.provider,
+    });
 
     // Backfill model/provider from llm_calls if not set on the run row
     if (agg.model || agg.provider) {
@@ -328,6 +423,20 @@ export class Store {
 
   insertLlmCall(runId: string, callIndex: number, startedAt: number, opts: LlmCallOpts): void {
     const calculatedCost = opts.calculatedCost ?? opts.costUsd ?? null;
+    this.debug("insertLlmCall", {
+      runId,
+      callIndex,
+      startedAt,
+      endedAt: opts.endedAt ?? null,
+      provider: opts.provider ?? null,
+      model: opts.model ?? null,
+      inputTokens: opts.inputTokens ?? null,
+      outputTokens: opts.outputTokens ?? null,
+      cacheRead: opts.cacheRead ?? null,
+      cacheWrite: opts.cacheWrite ?? null,
+      officialCost: opts.officialCost ?? null,
+      calculatedCost,
+    });
     this.stmtInsertLlmCall.run(
       runId,
       callIndex,
@@ -351,6 +460,15 @@ export class Store {
   }
 
   insertToolExecution(runId: string, toolCallId: string, toolName: string, startedAt: number, opts: ToolExecOpts): void {
+    this.debug("insertToolExecution", {
+      runId,
+      toolCallId,
+      toolName,
+      startedAt,
+      endedAt: opts.endedAt ?? null,
+      durationMs: opts.durationMs ?? null,
+      isError: !!opts.isError,
+    });
     this.stmtInsertToolExec.run(
       runId,
       toolCallId,
@@ -503,19 +621,201 @@ export class Store {
   insertConversationTurn(
     runId: string, sessionKey: string, turnIndex: number, role: string,
     contentPreview: string | null, contentLength: number, timestamp: number,
-    opts?: { toolCallsCount?: number; tokensUsed?: number },
+    opts?: ConversationTurnOpts,
   ): void {
     this.stmtInsertConvTurn.run(
       runId, sessionKey, turnIndex, role,
       contentPreview, contentLength, timestamp,
+      opts?.messageId ?? null,
+      opts?.sessionFile ?? null,
+      opts?.sourceKind ?? null,
+      opts?.sourceSessionId ?? null,
+      opts?.sourceLoggerTs ?? null,
       opts?.toolCallsCount ?? 0,
       opts?.tokensUsed ?? null,
     );
   }
 
+  upsertConversationTurnByMessageId(
+    runId: string,
+    sessionKey: string,
+    role: string,
+    contentPreview: string | null,
+    contentLength: number,
+    timestamp: number,
+    opts: ConversationTurnOpts & { messageId: string },
+  ): void {
+    const existing = this.stmtFindConvTurnByMessageId.get(opts.messageId) as
+      | { id: number; run_id: string; turn_index: number; source_kind?: string | null }
+      | undefined;
+    const incomingPriority = this.getSourcePriority(opts.sourceKind);
+    if (existing) {
+      const existingPriority = this.getSourcePriority(existing.source_kind ?? undefined);
+      if (incomingPriority < existingPriority) {
+        return;
+      }
+      if (incomingPriority === existingPriority && existing.run_id !== runId) {
+        console.warn("[clawlens] conversation_turns: conflicting equal-priority binding", {
+          messageId: opts.messageId,
+          existingRunId: existing.run_id,
+          incomingRunId: runId,
+          sourceKind: opts.sourceKind ?? null,
+        });
+        return;
+      }
+      this.stmtUpdateConvTurnByMessageId.run(
+        runId,
+        sessionKey,
+        role,
+        contentPreview,
+        contentLength,
+        timestamp,
+        opts.sessionFile ?? null,
+        opts.sourceKind ?? null,
+        opts.sourceSessionId ?? null,
+        opts.sourceLoggerTs ?? null,
+        opts.toolCallsCount ?? 0,
+        opts.tokensUsed ?? null,
+        opts.messageId,
+      );
+      return;
+    }
+    const next = this.stmtNextTurnIndex.get(runId) as { next_turn_index: number };
+    this.insertConversationTurn(
+      runId,
+      sessionKey,
+      next.next_turn_index,
+      role,
+      contentPreview,
+      contentLength,
+      timestamp,
+      opts,
+    );
+  }
+
+  getConversationTurnCount(runId: string): number {
+    const row = this.db.prepare(
+      "SELECT COUNT(*) AS cnt FROM conversation_turns WHERE run_id = ?",
+    ).get(runId) as { cnt: number };
+    return row.cnt;
+  }
+
+  applyLoggerMessageMapping(params: {
+    messageId: string;
+    runId: string;
+    userTextPreview: string;
+    loggerTimestamp: string;
+    sourceSessionId?: string;
+  }): boolean {
+    const run = this.db.prepare(
+      "SELECT run_id, session_key, started_at FROM runs WHERE run_id = ?",
+    ).get(params.runId) as { run_id: string; session_key: string; started_at: number } | undefined;
+    if (!run) return false;
+    const ts = Date.parse(params.loggerTimestamp);
+    const timestamp = Number.isFinite(ts) ? ts : run.started_at;
+    this.upsertConversationTurnByMessageId(
+      run.run_id,
+      run.session_key,
+      "user",
+      params.userTextPreview.slice(0, 500),
+      params.userTextPreview.length,
+      timestamp,
+      {
+        messageId: params.messageId,
+        sourceKind: "llm_prompt_metadata",
+        sourceSessionId: params.sourceSessionId,
+        sourceLoggerTs: params.loggerTimestamp,
+      },
+    );
+    return true;
+  }
+
+  getLoggerImportState(filePath: string): {
+    filePath: string;
+    fileMtimeMs: number;
+    fileSizeBytes: number;
+    importedAt: number;
+    totalMappings: number;
+    appliedCount: number;
+    skippedCount: number;
+  } | null {
+    const row = this.db.prepare(`
+      SELECT
+        file_path,
+        file_mtime_ms,
+        file_size_bytes,
+        imported_at,
+        total_mappings,
+        applied_count,
+        skipped_count
+      FROM logger_import_state
+      WHERE file_path = ?
+    `).get(filePath) as {
+      file_path: string;
+      file_mtime_ms: number;
+      file_size_bytes: number;
+      imported_at: number;
+      total_mappings: number;
+      applied_count: number;
+      skipped_count: number;
+    } | undefined;
+    if (!row) return null;
+    return {
+      filePath: row.file_path,
+      fileMtimeMs: row.file_mtime_ms,
+      fileSizeBytes: row.file_size_bytes,
+      importedAt: row.imported_at,
+      totalMappings: row.total_mappings,
+      appliedCount: row.applied_count,
+      skippedCount: row.skipped_count,
+    };
+  }
+
+  recordLoggerImportState(params: {
+    filePath: string;
+    fileMtimeMs: number;
+    fileSizeBytes: number;
+    totalMappings: number;
+    appliedCount: number;
+    skippedCount: number;
+  }): void {
+    this.db.prepare(`
+      INSERT INTO logger_import_state (
+        file_path,
+        file_mtime_ms,
+        file_size_bytes,
+        imported_at,
+        total_mappings,
+        applied_count,
+        skipped_count
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(file_path) DO UPDATE SET
+        file_mtime_ms = excluded.file_mtime_ms,
+        file_size_bytes = excluded.file_size_bytes,
+        imported_at = excluded.imported_at,
+        total_mappings = excluded.total_mappings,
+        applied_count = excluded.applied_count,
+        skipped_count = excluded.skipped_count
+    `).run(
+      params.filePath,
+      params.fileMtimeMs,
+      params.fileSizeBytes,
+      Date.now(),
+      params.totalMappings,
+      params.appliedCount,
+      params.skippedCount,
+    );
+  }
+
+  private getSourcePriority(sourceKind?: string): number {
+    if (!sourceKind) return 0;
+    return Store.SOURCE_PRIORITY[sourceKind as keyof typeof Store.SOURCE_PRIORITY] ?? 0;
+  }
+
   // ── Audit v2 API ─────────────────────────────────────────────────────────
 
-  private buildRunAuditDetail(run: any): unknown {
+  private buildRunAuditDetail(run: any, opts?: { includeDetails?: boolean }): unknown {
+    const includeDetails = opts?.includeDetails !== false;
     const llmCalls = this.db.prepare(
       "SELECT * FROM llm_calls WHERE run_id = ? ORDER BY started_at ASC",
     ).all(run.run_id) as any[];
@@ -524,9 +824,11 @@ export class Store {
       "SELECT * FROM tool_executions WHERE run_id = ? ORDER BY started_at ASC",
     ).all(run.run_id) as any[];
 
-    const turns = this.db.prepare(
-      "SELECT * FROM conversation_turns WHERE run_id = ? ORDER BY turn_index ASC",
-    ).all(run.run_id) as any[];
+    const turns = includeDetails
+      ? this.db.prepare(
+        "SELECT * FROM conversation_turns WHERE run_id = ? ORDER BY turn_index ASC",
+      ).all(run.run_id) as any[]
+      : [];
 
     const runStart = run.started_at;
 
@@ -555,10 +857,27 @@ export class Store {
 
     const officialCost: number | null = run.total_official_cost ?? null;
     const calculatedCost: number | null = run.total_calculated_cost ?? run.total_cost_usd ?? null;
-    const { costMatch, costDiffReason } = Store.computeCostMatch(officialCost, calculatedCost);
+    const llmCount = llmCalls.length;
+    const toolCount = toolExecs.length;
+    const liveInputTokens = llmCalls.reduce((sum, lc) => sum + (lc.input_tokens ?? 0), 0);
+    const liveOutputTokens = llmCalls.reduce((sum, lc) => sum + (lc.output_tokens ?? 0), 0);
+    const liveCacheRead = llmCalls.reduce((sum, lc) => sum + (lc.cache_read ?? 0), 0);
+    const liveCacheWrite = llmCalls.reduce((sum, lc) => sum + (lc.cache_write ?? 0), 0);
+    const liveOfficialCost = llmCalls.reduce((sum, lc) => sum + (lc.official_cost ?? 0), 0);
+    const liveCalculatedCost = llmCalls.reduce((sum, lc) => sum + (lc.calculated_cost ?? lc.cost_usd ?? 0), 0);
+    const mergedOfficialCost = Math.max(officialCost ?? 0, liveOfficialCost || 0) || null;
+    const mergedCalculatedCost = Math.max(calculatedCost ?? 0, liveCalculatedCost || 0) || null;
+    const mergedTotalCost = mergedCalculatedCost ?? mergedOfficialCost ?? null;
+    const mergedCostMatch = Store.computeCostMatch(mergedOfficialCost, mergedCalculatedCost);
+
+    const detectedTurnKinds = turns.map((t: any) => classifyTurnKindFromPreview(t.content_preview));
+    const allHeartbeatTurns = detectedTurnKinds.length > 0 && detectedTurnKinds.every((kind) => kind === "heartbeat");
+    const runKind = run.run_kind === "heartbeat" || allHeartbeatTurns ? "heartbeat" : "chat";
+    const filteredTurns = turns.filter((t: any) => classifyTurnKindFromPreview(t.content_preview) === runKind);
 
     return {
       runId: run.run_id,
+      runKind,
       startedAt: run.started_at,
       duration: (run.ended_at ?? run.started_at) - run.started_at,
       status: run.status,
@@ -567,33 +886,85 @@ export class Store {
       errorMessage: run.error_message ?? null,
       userPrompt: (llmCalls[0] as any)?.user_prompt_preview ?? "",
       summary: {
-        llmCalls: run.total_llm_calls ?? llmCalls.length,
-        toolCalls: run.total_tool_calls ?? toolExecs.length,
-        totalInputTokens: run.total_input_tokens ?? 0,
-        totalOutputTokens: run.total_output_tokens ?? 0,
-        totalCacheRead: run.total_cache_read ?? 0,
-        totalCacheWrite: run.total_cache_write ?? 0,
-        totalCost: run.total_cost_usd ?? null,
-        officialCost,
-        calculatedCost,
-        costMatch,
-        costDiffReason,
+        llmCalls: Math.max(run.total_llm_calls ?? 0, llmCount),
+        toolCalls: Math.max(run.total_tool_calls ?? 0, toolCount),
+        totalInputTokens: Math.max(run.total_input_tokens ?? 0, liveInputTokens),
+        totalOutputTokens: Math.max(run.total_output_tokens ?? 0, liveOutputTokens),
+        totalCacheRead: Math.max(run.total_cache_read ?? 0, liveCacheRead),
+        totalCacheWrite: Math.max(run.total_cache_write ?? 0, liveCacheWrite),
+        totalCost: mergedTotalCost,
+        officialCost: mergedOfficialCost,
+        calculatedCost: mergedCalculatedCost,
+        costMatch: mergedCostMatch.costMatch,
+        costDiffReason: mergedCostMatch.costDiffReason,
       },
-      timeline,
-      turns: turns.map((t: any) => ({
+      timeline: includeDetails ? timeline : [],
+      turns: filteredTurns.map((t: any) => ({
         role: t.role,
         preview: t.content_preview ?? "",
         length: t.content_length ?? 0,
+        messageId: t.message_id ?? null,
+        sourceKind: t.source_kind ?? null,
         toolCallsCount: t.tool_calls_count,
       })),
+      hasDetail: includeDetails ? true : (llmCalls.length > 0 || toolExecs.length > 0),
     };
   }
 
-  getAuditSession(sessionKey: string): unknown {
-    const runs = this.db.prepare(
-      "SELECT * FROM runs WHERE session_key = ? ORDER BY started_at ASC",
-    ).all(sessionKey) as any[];
-    return { sessionKey, runs: runs.map((r) => this.buildRunAuditDetail(r)) };
+  getAuditSession(
+    sessionKey: string,
+    opts?: { limit?: number; before?: number; since?: number; includeDetails?: boolean; excludeKinds?: string[]; requireConversation?: boolean },
+  ): unknown {
+    const params: unknown[] = [sessionKey];
+    const conditions = [
+      "session_key = ?",
+      `(
+        EXISTS (SELECT 1 FROM llm_calls l WHERE l.run_id = runs.run_id)
+        OR EXISTS (SELECT 1 FROM tool_executions t WHERE t.run_id = runs.run_id)
+        OR EXISTS (SELECT 1 FROM conversation_turns c WHERE c.run_id = runs.run_id)
+      )`,
+    ];
+
+    if (typeof opts?.before === "number" && Number.isFinite(opts.before)) {
+      conditions.push("started_at < ?");
+      params.push(opts.before);
+    }
+    if (typeof opts?.since === "number" && Number.isFinite(opts.since)) {
+      conditions.push("started_at > ?");
+      params.push(opts.since);
+    }
+    if (opts?.excludeKinds?.length) {
+      const placeholders = opts.excludeKinds.map(() => "?").join(", ");
+      conditions.push(`COALESCE(run_kind, 'chat') NOT IN (${placeholders})`);
+      params.push(...opts.excludeKinds);
+    }
+    if (opts?.requireConversation) {
+      conditions.push("EXISTS (SELECT 1 FROM conversation_turns c WHERE c.run_id = runs.run_id)");
+    }
+
+    const limit = Math.max(1, Math.min(200, Math.floor(opts?.limit ?? 20)));
+    params.push(limit + 1);
+
+    const rows = this.db.prepare(
+      `SELECT * FROM runs
+       WHERE ${conditions.join(" AND ")}
+       ORDER BY started_at DESC
+       LIMIT ?`,
+    ).all(...params) as any[];
+
+    const hasMore = rows.length > limit;
+    const slice = hasMore ? rows.slice(0, limit) : rows;
+    const runs = slice.map((r) => this.buildRunAuditDetail(r, { includeDetails: opts?.includeDetails }));
+    const newest = slice[0]?.started_at ?? null;
+    const oldest = slice.length ? slice[slice.length - 1].started_at : null;
+
+    return {
+      sessionKey,
+      runs,
+      hasMore,
+      latestStartedAt: newest,
+      oldestStartedAt: oldest,
+    };
   }
 
   updateRunSessionKey(runId: string, sessionKey: string): void {
@@ -602,21 +973,154 @@ export class Store {
     ).run(sessionKey, runId);
   }
 
+  updateRunKind(runId: string, runKind: "heartbeat" | "chat"): void {
+    this.db.prepare(
+      "UPDATE runs SET run_kind = ? WHERE run_id = ?",
+    ).run(runKind, runId);
+  }
+
+  findRecentRunIdForSession(
+    sessionKey: string,
+    opts?: { timestamp?: number; kind?: "heartbeat" | "chat"; windowMs?: number },
+  ): string | null {
+    const ts = opts?.timestamp ?? Date.now();
+    const windowMs = opts?.windowMs ?? 5 * 60 * 1000;
+    const rows = this.db.prepare(`
+      SELECT run_id, started_at, ended_at, run_kind
+      FROM runs
+      WHERE session_key = ?
+        AND started_at <= ?
+        AND started_at >= ?
+      ORDER BY started_at DESC
+      LIMIT 10
+    `).all(sessionKey, ts, ts - windowMs) as Array<{
+      run_id: string;
+      started_at: number;
+      ended_at?: number | null;
+      run_kind?: string | null;
+    }>;
+    const desiredKind = opts?.kind ?? "chat";
+    for (const row of rows) {
+      const rowKind = row.run_kind ?? "chat";
+      if (rowKind !== desiredKind) continue;
+      return row.run_id;
+    }
+    for (const row of rows) {
+      if (!row.run_kind) return row.run_id;
+    }
+    return null;
+  }
+
   getAuditRun(runId: string): unknown {
     const run = this.db.prepare("SELECT * FROM runs WHERE run_id = ?").get(runId) as any;
     if (!run) return null;
     return this.buildRunAuditDetail(run);
   }
 
+  getAuditMessage(messageId: string): unknown {
+    const row = this.db.prepare(`
+      SELECT
+        t.message_id,
+        t.role,
+        t.content_preview,
+        t.timestamp,
+        t.source_kind,
+        t.source_session_id,
+        t.source_logger_ts,
+        r.run_id,
+        r.session_key,
+        r.status,
+        r.started_at
+      FROM conversation_turns t
+      LEFT JOIN runs r ON r.run_id = t.run_id
+      WHERE t.message_id = ?
+      LIMIT 1
+    `).get(messageId) as any;
+    if (!row) return null;
+    return {
+      messageId: row.message_id,
+      sourceKind: row.source_kind ?? null,
+      matchedTurn: {
+        role: row.role,
+        textPreview: row.content_preview ?? "",
+        timestamp: row.timestamp ?? null,
+      },
+      run: row.run_id ? {
+        runId: row.run_id,
+        status: row.status ?? null,
+        startedAt: row.started_at ?? null,
+      } : null,
+    };
+  }
+
+  getCurrentMessageRun(sessionKey: string): unknown {
+    const row = this.db.prepare(`
+      SELECT
+        t.message_id,
+        t.role,
+        t.content_preview,
+        t.timestamp,
+        t.source_kind,
+        t.source_session_id,
+        t.source_logger_ts,
+        r.run_id,
+        r.status,
+        r.started_at
+      FROM conversation_turns t
+      LEFT JOIN runs r ON r.run_id = t.run_id
+      WHERE t.session_key = ? AND t.role = 'user' AND COALESCE(r.run_kind, 'chat') != 'heartbeat'
+      ORDER BY COALESCE(t.timestamp, 0) DESC, t.id DESC
+      LIMIT 1
+    `).get(sessionKey) as any;
+    if (!row) {
+      return {
+        sessionKey,
+        status: "none",
+        lookupBasis: "latest-user-turn",
+        matchedTurn: null,
+        run: null,
+      };
+    }
+    const sourceKind = row.source_kind ?? "session_fallback";
+    const status = row.run_id
+      ? (sourceKind === "session_fallback" ? "fallback" : "resolved")
+      : "pending";
+    return {
+      sessionKey,
+      status,
+      lookupBasis: "latest-user-turn",
+      matchedTurn: {
+        role: row.role,
+        messageId: row.message_id ?? null,
+        sourceKind,
+        textPreview: row.content_preview ?? "",
+        timestamp: row.timestamp ?? null,
+      },
+      run: row.run_id ? {
+        runId: row.run_id,
+        status: row.status ?? null,
+        startedAt: row.started_at ?? null,
+      } : null,
+    };
+  }
+
   cleanup(retentionDays: number): void {
     const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
     const deletedRuns = this.db.prepare("SELECT run_id FROM runs WHERE started_at < ?").all(cutoff) as { run_id: string }[];
-    for (const { run_id } of deletedRuns) {
-      this.db.prepare("DELETE FROM llm_calls WHERE run_id = ?").run(run_id);
-      this.db.prepare("DELETE FROM tool_executions WHERE run_id = ?").run(run_id);
+    this.db.exec("BEGIN");
+    try {
+      for (const { run_id } of deletedRuns) {
+        this.db.prepare("DELETE FROM conversation_turns WHERE run_id = ?").run(run_id);
+        this.db.prepare("DELETE FROM llm_calls WHERE run_id = ?").run(run_id);
+        this.db.prepare("DELETE FROM tool_executions WHERE run_id = ?").run(run_id);
+      }
+      this.stmtCleanup.run(cutoff); // DELETE FROM runs WHERE started_at < ?
+      this.db.prepare("DELETE FROM session_snapshots WHERE snapshot_at < ?").run(cutoff);
+      this.db.exec("COMMIT");
+    } catch (e) {
+      this.db.exec("ROLLBACK");
+      throw e;
     }
-    this.stmtCleanup.run(cutoff);
-    this.db.prepare("DELETE FROM session_snapshots WHERE snapshot_at < ?").run(cutoff);
   }
 
   close(): void {

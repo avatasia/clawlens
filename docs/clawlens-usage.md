@@ -1,5 +1,8 @@
 # ClawLens 使用说明
 
+> [!IMPORTANT]
+> Current Authority: This is the active master version for end-user usage guidance.
+>
 ## 目录
 
 1. [安装确认](#1-安装确认)

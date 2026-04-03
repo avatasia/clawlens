@@ -3,6 +3,7 @@ import type { Store } from "./store.js";
 import type { SSEManager } from "./sse-manager.js";
 import { calculateCost, loadCostConfig } from "./cost-calculator.js";
 import type { ClawLensConfig } from "./types.js";
+import { isClawLensDebugEnabled, logClawLensDebug } from "./debug.js";
 
 type ActiveRun = {
   runId: string;
@@ -11,6 +12,7 @@ type ActiveRun = {
   llmCallIndex: number;
   lastUserPrompt?: string;
   systemPromptHash?: string;
+  runKind?: "heartbeat" | "chat";
 };
 
 function simpleHash(str: string): string {
@@ -28,13 +30,58 @@ type PendingComplete = {
   timer: ReturnType<typeof setTimeout>;
 };
 
+type PendingTranscriptTurn = {
+  sessionFile: string;
+  sessionKey: string;
+  messageId: string;
+  kind: "heartbeat" | "chat";
+  normalized: {
+    role: string;
+    preview: string;
+    length: number;
+    timestamp?: number;
+    toolCallsCount: number;
+    tokensUsed?: number;
+    explicitRunId?: string;
+  };
+};
+
+function classifyPromptRunKind(prompt?: string): "heartbeat" | "chat" {
+  const text = prompt ?? "";
+  if (
+    text.includes("Read HEARTBEAT.md if it exists (workspace context).") ||
+    text.includes("/home/openclaw/.openclaw/workspace/HEARTBEAT.md") ||
+    text.includes("HEARTBEAT_OK")
+  ) {
+    return "heartbeat";
+  }
+  return "chat";
+}
+
+function classifyTranscriptTurnKind(normalized: {
+  role: string;
+  preview: string;
+}): "heartbeat" | "chat" {
+  const text = normalized.preview ?? "";
+  if (
+    text.includes("Read HEARTBEAT.md if it exists (workspace context).") ||
+    text.includes("/home/openclaw/.openclaw/workspace/HEARTBEAT.md") ||
+    text.includes("HEARTBEAT_OK")
+  ) {
+    return "heartbeat";
+  }
+  return "chat";
+}
+
 export class Collector {
   private activeRuns = new Map<string, ActiveRun>();
   private pendingCompletes = new Map<string, PendingComplete>();
   private sessionIdToRunId = new Map<string, string>();
+  private pendingTranscriptTurns = new Map<string, PendingTranscriptTurn[]>();
   private queue: Array<() => void> = [];
   private flushInterval: ReturnType<typeof setInterval> | null = null;
   private costMap = new Map<string, { input: number; output: number; cacheRead: number; cacheWrite: number }>();
+  private debugEnabled = false;
 
   constructor(
     private store: Store,
@@ -43,8 +90,13 @@ export class Collector {
 
   start(runtime: unknown, globalConfig: unknown, pluginConfig: ClawLensConfig): void {
     this.costMap = loadCostConfig(globalConfig);
+    this.debugEnabled = isClawLensDebugEnabled(pluginConfig.collector?.debugLogs);
 
-    const intervalMs = pluginConfig.collector?.snapshotIntervalMs ?? 60_000;
+    // NOTE: snapshotIntervalMs is not yet wired up.
+    // This interval drives the write-queue flush at 100ms cadence, which is intentional.
+    // snapshotIntervalMs is reserved for a future independent snapshot scheduler —
+    // it must NOT be passed here, as that would slow DB writes from 100ms to 60s.
+    // const intervalMs = pluginConfig.collector?.snapshotIntervalMs ?? 60_000;
 
     this.flushInterval = setInterval(() => {
       this.flush();
@@ -65,7 +117,12 @@ export class Collector {
       });
     }
     this.pendingCompletes.clear();
+    this.sessionIdToRunId.clear();
     this.flush();
+  }
+
+  private debug(message: string, details: Record<string, unknown>): void {
+    logClawLensDebug("clawlens-debug", message, details, this.debugEnabled);
   }
 
   private flush(): void {
@@ -74,7 +131,7 @@ export class Collector {
       try {
         op();
       } catch (e) {
-        // swallow individual op errors
+        console.error("[clawlens] flush: store write failed:", e);
       }
     }
   }
@@ -108,6 +165,7 @@ export class Collector {
 
       const active: ActiveRun = { runId, sessionKey, startedAt, llmCallIndex: 0 };
       this.activeRuns.set(runId, active);
+      this.debug("lifecycle:start", { runId, sessionKey, startedAt });
 
       this.enqueue(() => {
         this.store.insertRun(runId, sessionKey, startedAt, {
@@ -119,12 +177,14 @@ export class Collector {
     } else if (phase === "end") {
       const runId = evt.runId;
       if (!runId) return;
+      this.debug("lifecycle:end", { runId, ts: evt.ts });
       this.activeRuns.delete(runId);
       const endedAt = (data.endedAt as number | undefined) ?? evt.ts ?? Date.now();
       this.scheduleComplete(runId, endedAt, "completed");
     } else if (phase === "error") {
       const runId = evt.runId;
       if (!runId) return;
+      this.debug("lifecycle:error", { runId, ts: evt.ts, error: data.error });
       this.activeRuns.delete(runId);
       const endedAt = evt.ts ?? Date.now();
       const errorMessage = (data.error as string | undefined) ?? "unknown error";
@@ -149,7 +209,11 @@ export class Collector {
     this.pendingCompletes.set(runId, { endedAt, status, errorMessage, timer });
   }
 
-  recordLlmCall(
+  /**
+   * Triggered by the `llm_output` hook. Called once per run — the written
+   * usage values are the full-run cumulative totals, not a single LLM call.
+   */
+  recordLlmOutput(
     event: {
       runId?: string;
       sessionId?: string;
@@ -169,6 +233,15 @@ export class Collector {
   ): void {
     const runId = event.runId;
     if (!runId) return;
+    this.debug("llm_output", {
+      runId,
+      sessionId: event.sessionId,
+      sessionKey: ctx.sessionKey,
+      provider: event.provider,
+      model: event.model,
+      hasActiveRun: this.activeRuns.has(runId),
+      usage: event.usage,
+    });
 
     const active = this.activeRuns.get(runId);
     const callIndex = active ? active.llmCallIndex++ : 0;
@@ -185,10 +258,17 @@ export class Collector {
       this.costMap.get(costKey),
     );
 
+    // event type is `any`; cost.total is a runtime field not in the TS type
+    const rawUsage = (event as any).usage ?? {};
+    const officialCost =
+      typeof rawUsage?.cost?.total === "number" && Number.isFinite(rawUsage.cost.total)
+        ? (rawUsage.cost.total as number)
+        : null;
+
     const userPromptPreview = active?.lastUserPrompt;
     const systemPromptHash = active?.systemPromptHash ?? event.systemPromptHash;
 
-    this.enqueue(() => {
+    try {
       this.store.insertLlmCall(runId, callIndex, now, {
         endedAt: now,
         inputTokens: event.usage?.input,
@@ -196,7 +276,7 @@ export class Collector {
         cacheRead: event.usage?.cacheRead,
         cacheWrite: event.usage?.cacheWrite,
         calculatedCost: calculatedCost ?? undefined,
-        officialCost: undefined,   // not yet provided by hook events
+        officialCost: officialCost ?? undefined,
         stopReason: event.stopReason,
         provider: event.provider,
         model: event.model,
@@ -213,7 +293,9 @@ export class Collector {
         outputTokens: event.usage?.output,
         calculatedCost,
       });
-    });
+    } catch (err) {
+      console.error("[clawlens] recordLlmOutput: store write failed:", err);
+    }
   }
 
   recordLlmInput(
@@ -227,6 +309,13 @@ export class Collector {
   ): void {
     const runId = event.runId;
     if (!runId) return;
+    this.debug("llm_input", {
+      runId,
+      sessionId: event.sessionId,
+      sessionKey: ctx.sessionKey,
+      hasActiveRun: this.activeRuns.has(runId),
+      promptPreview: typeof event.prompt === "string" ? event.prompt.slice(0, 80) : undefined,
+    });
 
     // Map sessionId → runId for agent_end correlation
     if (event.sessionId) {
@@ -237,6 +326,17 @@ export class Collector {
     if (active) {
       if (event.prompt) active.lastUserPrompt = event.prompt.slice(0, 200);
       if (event.systemPrompt) active.systemPromptHash = simpleHash(event.systemPrompt);
+      const runKind = classifyPromptRunKind(event.prompt);
+      if (active.runKind !== runKind) {
+        active.runKind = runKind;
+        this.enqueue(() => {
+          this.store.updateRunKind(runId, runKind);
+          const pendingTranscriptTurns = this.drainPendingTranscriptTurns(active.sessionKey, runKind);
+          for (const turn of pendingTranscriptTurns) {
+            this.persistTranscriptTurn(runId, turn);
+          }
+        });
+      }
 
       // Backfill session key: lifecycle events may lack channelId so keys like
       // "agent:main" get stored instead of the full "agent:main:main". The ctx
@@ -269,6 +369,13 @@ export class Collector {
   ): void {
     const runId = event.runId ?? (ctx as any).runId;
     if (!runId) return;
+    this.debug("after_tool_call", {
+      runId,
+      sessionKey: ctx.sessionKey,
+      toolName: event.toolName,
+      toolCallId: event.toolCallId ?? ctx.toolCallId,
+      hasError: event.error !== undefined && event.error !== null,
+    });
 
     const toolCallId = event.toolCallId ?? ctx.toolCallId ?? randomUUID();
     const toolName = event.toolName ?? "unknown";
@@ -283,7 +390,7 @@ export class Collector {
       ? JSON.stringify(event.result).slice(0, 200)
       : event.error?.slice(0, 200);
 
-    this.enqueue(() => {
+    try {
       this.store.insertToolExecution(runId, toolCallId, toolName, durationMs ? now - durationMs : now, {
         endedAt: now,
         durationMs,
@@ -298,7 +405,9 @@ export class Collector {
         isError,
         durationMs,
       });
-    });
+    } catch (err) {
+      console.error("[clawlens] recordToolCall: store write failed:", err);
+    }
   }
 
   recordAgentEnd(
@@ -306,14 +415,25 @@ export class Collector {
     ctx: { sessionKey?: string; sessionId?: string },
   ): void {
     const runId = ctx.sessionId ? this.sessionIdToRunId.get(ctx.sessionId) : undefined;
-    if (!runId || !ctx.sessionKey) return;
+    this.debug("agent_end", {
+      sessionId: ctx.sessionId,
+      sessionKey: ctx.sessionKey,
+      resolvedRunId: runId,
+      messageCount: Array.isArray(event.messages) ? event.messages.length : 0,
+    });
+    if (!runId) return;
+    // Fall back to sessionKey stored in activeRuns when ctx.sessionKey is absent
+    const sessionKey = ctx.sessionKey ?? this.activeRuns.get(runId)?.sessionKey;
+    if (!sessionKey) return;
 
     const messages = (event.messages ?? []) as Array<{ role?: string; content?: string | unknown[] }>;
     let turnIndex = 0;
-    const sessionKey = ctx.sessionKey;
     const now = Date.now();
 
     this.enqueue(() => {
+      if (this.store.getConversationTurnCount(runId) > 0) {
+        return;
+      }
       for (const msg of messages) {
         const role = msg.role ?? "unknown";
         const raw = typeof msg.content === "string"
@@ -322,8 +442,184 @@ export class Collector {
         this.store.insertConversationTurn(
           runId, sessionKey, turnIndex++, role,
           raw.slice(0, 500), raw.length, now,
+          { sourceKind: "session_fallback" },
         );
       }
     });
   }
+
+  recordTranscriptUpdate(update: {
+    sessionFile: string;
+    sessionKey?: string;
+    message?: unknown;
+    messageId?: string;
+  }): void {
+    const sessionKey = update.sessionKey;
+    if (!sessionKey || !update.messageId) return;
+
+    const normalized = normalizeTranscriptMessage(update.message);
+    if (!normalized) return;
+    const turnKind = classifyTranscriptTurnKind(normalized);
+    const runId =
+      normalized.explicitRunId
+      ?? this.findActiveRunIdForSessionKind(sessionKey, turnKind)
+      ?? this.store.findRecentRunIdForSession(sessionKey, {
+        timestamp: normalized.timestamp,
+        kind: turnKind,
+      });
+    this.debug("transcript_update", {
+      sessionKey,
+      messageId: update.messageId,
+      explicitRunId: normalized.explicitRunId,
+      resolvedRunId: runId,
+      turnKind,
+      role: normalized.role,
+      timestamp: normalized.timestamp,
+    });
+    const pendingTurn: PendingTranscriptTurn = {
+      sessionFile: update.sessionFile,
+      sessionKey,
+      messageId: update.messageId,
+      kind: turnKind,
+      normalized,
+    };
+
+    this.enqueue(() => {
+      if (!runId) {
+        this.queuePendingTranscriptTurn(pendingTurn);
+        return;
+      }
+      this.persistTranscriptTurn(runId, pendingTurn);
+    });
+  }
+
+  private findActiveRunIdForSession(sessionKey?: string): string | null {
+    return this.findActiveRunIdForSessionKind(sessionKey, "chat");
+  }
+
+  private findActiveRunIdForSessionKind(sessionKey: string | undefined, kind: "heartbeat" | "chat"): string | null {
+    if (!sessionKey) return null;
+    let candidate: ActiveRun | null = null;
+    for (const active of this.activeRuns.values()) {
+      const sameSession =
+        active.sessionKey === sessionKey
+        || sessionKey.startsWith(active.sessionKey + ":")
+        || active.sessionKey.startsWith(sessionKey + ":");
+      if (!sameSession) continue;
+      if (active.runKind && active.runKind !== kind) continue;
+      if (!candidate || active.startedAt > candidate.startedAt) {
+        candidate = active;
+      }
+    }
+    return candidate?.runId ?? null;
+  }
+
+  private queuePendingTranscriptTurn(turn: PendingTranscriptTurn): void {
+    const existing = this.pendingTranscriptTurns.get(turn.sessionKey) ?? [];
+    if (existing.some((entry) => entry.messageId === turn.messageId)) {
+      return;
+    }
+    existing.push(turn);
+    this.pendingTranscriptTurns.set(turn.sessionKey, existing);
+  }
+
+  private drainPendingTranscriptTurns(sessionKey: string, kind: "heartbeat" | "chat"): PendingTranscriptTurn[] {
+    const pending = this.pendingTranscriptTurns.get(sessionKey) ?? [];
+    if (!pending.length) return [];
+    const matched = pending.filter((turn) => turn.kind === kind);
+    const remaining = pending.filter((turn) => turn.kind !== kind);
+    if (remaining.length) {
+      this.pendingTranscriptTurns.set(sessionKey, remaining);
+    } else {
+      this.pendingTranscriptTurns.delete(sessionKey);
+    }
+    return matched;
+  }
+
+  private persistTranscriptTurn(runId: string, turn: PendingTranscriptTurn): void {
+    const timestamp = turn.normalized.timestamp ?? Date.now();
+      this.store.upsertConversationTurnByMessageId(
+        runId,
+        turn.sessionKey,
+        turn.normalized.role,
+      turn.normalized.preview,
+      turn.normalized.length,
+      timestamp,
+      {
+        messageId: turn.messageId,
+        sessionFile: turn.sessionFile,
+        sourceKind: "transcript_explicit",
+        toolCallsCount: turn.normalized.toolCallsCount,
+        tokensUsed: turn.normalized.tokensUsed,
+      },
+    );
+    this.sseManager.broadcast({
+      type: "transcript_turn",
+      runId,
+      sessionKey: turn.sessionKey,
+      messageId: turn.messageId,
+    });
+  }
+}
+
+function normalizeTranscriptMessage(message: unknown): {
+  role: string;
+  preview: string;
+  length: number;
+  timestamp?: number;
+  toolCallsCount: number;
+  tokensUsed?: number;
+  explicitRunId?: string;
+} | null {
+  if (!message || typeof message !== "object") return null;
+  const msg = message as Record<string, unknown>;
+  const role = typeof msg.role === "string" ? msg.role : "unknown";
+  const content = msg.content;
+  const raw = typeof content === "string" ? content : JSON.stringify(content ?? "");
+  const toolCalls = Array.isArray(msg.toolCalls)
+    ? msg.toolCalls.length
+    : Array.isArray(msg.tool_calls)
+      ? msg.tool_calls.length
+      : 0;
+  const usage = (msg.usage && typeof msg.usage === "object") ? msg.usage as Record<string, unknown> : null;
+  const tokensUsed = typeof usage?.totalTokens === "number"
+    ? usage.totalTokens as number
+    : typeof usage?.total_tokens === "number"
+      ? usage.total_tokens as number
+      : undefined;
+  const explicitRunId = extractExplicitRunId(msg);
+  return {
+    role,
+    preview: raw.slice(0, 500),
+    length: raw.length,
+    timestamp: typeof msg.timestamp === "number" ? msg.timestamp : undefined,
+    toolCallsCount: toolCalls,
+    tokensUsed,
+    explicitRunId,
+  };
+}
+
+function extractExplicitRunId(message: Record<string, unknown>): string | undefined {
+  const abortMeta = (message.openclawAbort && typeof message.openclawAbort === "object")
+    ? message.openclawAbort as Record<string, unknown>
+    : null;
+  if (typeof abortMeta?.runId === "string" && abortMeta.runId.trim()) {
+    return abortMeta.runId.trim();
+  }
+
+  const idempotencyKey = typeof message.idempotencyKey === "string"
+    ? message.idempotencyKey.trim()
+    : "";
+  if (!idempotencyKey) return undefined;
+
+  if (idempotencyKey.endsWith(":assistant")) {
+    const runId = idempotencyKey.slice(0, -":assistant".length).trim();
+    return runId || undefined;
+  }
+
+  if (/^[A-Za-z0-9:_-]+$/.test(idempotencyKey) && !idempotencyKey.startsWith("idem-")) {
+    return idempotencyKey;
+  }
+
+  return undefined;
 }

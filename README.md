@@ -1,173 +1,198 @@
 # ClawLens
 
-An audit plugin for [OpenClaw](https://github.com/openclaw/openclaw) that provides per-run execution tracing, cost verification, and multi-model comparison — capabilities the built-in Usage view doesn't offer.
+ClawLens is an [OpenClaw](https://github.com/openclaw/openclaw) audit plugin focused on run-level visibility. It adds a Chat-side Audit panel, per-run execution detail, message-to-run lookup, heartbeat separation, and logger-based message mapping that the built-in Usage view does not provide.
 
-## Why ClawLens?
+## What It Does
 
-OpenClaw's Usage view already tracks session-level token counts, cost breakdowns, daily trends, and conversation logs. ClawLens doesn't duplicate any of that. Instead, it answers questions the official view can't:
+ClawLens is built around one question:
 
-- **What happened inside a single run?** — When a user message triggers 3 LLM calls and 2 tool executions, the Usage view shows only the aggregate. ClawLens shows the full waterfall: LLM → tool → LLM → tool → LLM, with per-step tokens, cost, and duration.
+- when a single chat message triggers one run, what exactly happened inside that run?
 
-- **Is the cost data accurate?** — ClawLens captures both the cost returned by the LLM provider (via pi-ai) and an independently calculated cost using OpenClaw's own pricing config. If they differ, ClawLens flags the discrepancy and explains why.
+Current capabilities include:
 
-- **Are different channels getting different system prompts?** — ClawLens hashes the system prompt on every LLM call and detects when the same agent sends different prompts to the same model across channels.
+- Run-level audit cards in Chat
+- Timeline and turns for each run
+- `current-message-run` lookup for the latest chat message
+- Separation of normal chat runs and heartbeat/background runs
+- Live refresh for current runs while the panel is open
+- SSE updates for run lifecycle, LLM calls, tool execution, and transcript turns
+- Optional logger import for `message_id -> runId` mapping enrichment
+- Dual-cost display support from stored official/calculated totals
 
-- **How do models compare on the same task?** — ClawLens can intercept a user message and fan it out to multiple models in parallel, recording a side-by-side comparison of their tool usage, token consumption, and results.
+## Current Architecture
 
-## Architecture
+```text
+OpenClaw runtime/hooks
+  -> Collector
+  -> Store (SQLite)
+  -> API routes / SSE
+  -> Chat-side injected Audit UI
 
-```
-┌───────────────────────────────────────────────┐
-│              OpenClaw Gateway                  │
-│                                               │
-│  ┌─────────────────────────────────────────┐  │
-│  │           ClawLens Plugin               │  │
-│  │                                         │  │
-│  │  Collector ──→ Store (SQLite)           │  │
-│  │  Comparator        ↓                    │  │
-│  │  SSE Manager ←── API Routes             │  │
-│  └─────────────────────────────────────────┘  │
-│                                               │
-│  Control UI ←── inject.js (audit sidebar)     │
-└───────────────────────────────────────────────┘
-```
-
-### Data Collection
-
-| Source | Granularity | What it captures |
-|--------|-------------|-----------------|
-| `onSessionTranscriptUpdate` | per-LLM-call | Token usage + cost per individual model call (waterfall data) |
-| `onAgentEvent` | per-run | Run lifecycle — start, end, error, duration |
-| `api.on("llm_input")` | per-LLM-call | System prompt hash, user prompt preview |
-| `api.on("after_tool_call")` | per-tool-call | Tool name, params, result, duration, errors |
-| `api.on("agent_end")` | per-run | Full conversation turn chain |
-| `api.on("llm_output")` | per-run | Cumulative run usage (for overview totals) |
-
-### Three-Tier Data Model
-
-Every data point in the UI is labeled with its source:
-
-| Label | Color | Meaning |
-|-------|-------|---------|
-| `OFFICIAL` | Gray | Same data source as the built-in Usage view (identical `message.usage` object) |
-| `CALCULATED` | Blue | ClawLens independently re-calculates cost using OpenClaw's 3-layer pricing fallback |
-| `EXCLUSIVE` | Teal | Data the Usage view doesn't have at all (waterfall, tool details, system prompt diff) |
-
-When OFFICIAL and CALCULATED costs match (within 0.1%), a green checkmark appears. When they differ, a yellow warning shows the reason (e.g., pi-ai built-in pricing vs. user-configured pricing).
-
-## Features
-
-### Per-Run Audit Waterfall
-
-Injected as a sidebar in the Chat view. Each user message maps to a Run card showing:
-
-```
-#1 Run                                    6.8s
-帮我搜索今天的新闻并写个摘要
-4,800 tok  OFFICIAL    $0.0150  OFFICIAL
-                       $0.0148  CALCULATED  ≈ ✓
-2 LLM · 1 tool
-
-TIMELINE  EXCLUSIVE
-|■■■LLM 1.2s■■■|  |■■■■tool 3.5s■■■■|  |■■LLM 2.1s■■|
-
-TURNS
-  user       帮我搜索今天的新闻并写个摘要
-  assistant  我来帮你搜索...[tool_call: web_search]
-  tool       web_search → 5 results
-  assistant  以下是今天的新闻摘要...
+Optional side path:
+llm-api-logger files
+  -> logger-message-mapper
+  -> logger-import
+  -> Store source upgrade / message mapping enrichment
 ```
 
-### Cost Verification
+Core modules:
 
-ClawLens stores two cost values for every LLM call:
+- `extensions/clawlens/src/collector.ts`
+  collects lifecycle, transcript, llm, and tool events
+- `extensions/clawlens/src/store.ts`
+  persists runs, turns, llm calls, tool executions, logger import state
+- `extensions/clawlens/src/api-routes.ts`
+  serves audit/session/run/message/import endpoints
+- `extensions/clawlens/ui/inject.js`
+  injects the Audit sidebar into OpenClaw Chat
+- `extensions/clawlens/ui/styles.css`
+  styles the sidebar and host-layout offset
 
-- **`official_cost`** — Extracted directly from `message.usage.cost.total` (calculated by pi-ai using its built-in pricing table)
-- **`calculated_cost`** — Re-calculated by ClawLens using `resolveModelCostConfig()` with the full 3-layer fallback (models.json → user config → gateway pricing cache)
+## Data Sources
 
-This catches pricing mismatches that would otherwise go unnoticed.
+ClawLens currently uses these OpenClaw/plugin sources:
 
-### Multi-Model Comparison (Module B)
+- `api.runtime.events.onAgentEvent`
+  run lifecycle start/end/error
+- `api.runtime.events.onSessionTranscriptUpdate`
+  transcript turn capture and message-level indexing
+- `api.on("llm_input")`
+  prompt preview and run kind classification
+- `api.on("llm_output")`
+  LLM call detail
+- `api.on("after_tool_call")`
+  tool execution detail
+- `api.on("agent_end")`
+  end-of-run fallback conversation capture
 
-When enabled, intercepts user messages on specified channels and runs the same prompt through multiple models in parallel:
+Important behavior notes:
 
-```yaml
-clawlens:
-  compare:
-    enabled: true
-    models:
-      - provider: anthropic
-        model: claude-sonnet-4-20250514
-      - provider: openai
-        model: gpt-4o
-      - provider: google
-        model: gemini-2.5-flash
-    channels: ["telegram"]
-```
-
-### System Prompt Diff Detection
-
-Hashes the system prompt on every `llm_input` event. Detects when:
-- Different channels inject different system prompts for the same agent
-- System prompts change between runs in the same session
-- A compaction or reset altered the effective system prompt
-
-## Installation
-
-ClawLens is an OpenClaw extension. No build step required — `.ts` files are loaded directly.
-
-```bash
-# Copy to extensions directory
-cp -r clawlens/ ~/.openclaw/extensions/clawlens/
-
-# Register in config
-openclaw config set plugins.installs.clawlens.source path
-openclaw config set plugins.installs.clawlens.spec ~/.openclaw/extensions/clawlens
-
-# Restart gateway
-openclaw gateway restart
-
-# Verify
-curl -s http://localhost:18789/plugins/clawlens/api/overview
-```
+- transcript turns and run detail are not derived from a single source; they are merged
+- heartbeat traffic is treated as a separate run kind and excluded from chat-facing audit queries by default
+- logger import is optional and exists to strengthen `message_id -> runId` mapping, not to make the base audit UI work
 
 ## API
 
-| Endpoint | Description |
-|----------|-------------|
-| `GET /plugins/clawlens/api/overview` | Global stats: active runs, 24h totals |
-| `GET /plugins/clawlens/api/audit/session/:key` | Full audit data for a session — all runs with waterfall + turns |
-| `GET /plugins/clawlens/api/audit/run/:id` | Single run audit detail |
-| `GET /plugins/clawlens/api/events?token=...` | SSE stream for real-time updates |
+Current plugin routes:
+
+- `GET /plugins/clawlens/api/overview`
+- `GET /plugins/clawlens/api/sessions`
+- `GET /plugins/clawlens/api/run/:runId`
+- `GET /plugins/clawlens/api/audit`
+- `GET /plugins/clawlens/api/audit/run/:runId`
+- `GET /plugins/clawlens/api/audit/message/:messageId`
+- `GET /plugins/clawlens/api/audit/session/:sessionKey`
+- `GET /plugins/clawlens/api/audit/session/:sessionKey/current-message-run`
+- `POST /plugins/clawlens/api/audit/logger/import`
+- `GET /plugins/clawlens/api/events?token=...`
+
+Useful query options on `audit/session/:sessionKey`:
+
+- `limit`
+- `before`
+- `since`
+- `compact=1`
+- `excludeKinds=heartbeat`
+- `requireConversation=1`
+
+## Configuration
+
+Plugin config schema currently supports:
+
+```json
+{
+  "collector": {
+    "enabled": true,
+    "snapshotIntervalMs": 60000,
+    "retentionDays": 30,
+    "debugLogs": false,
+    "loggerImportDir": "/path/to/logger-dir",
+    "loggerImportMaxFileSizeMb": 100
+  },
+  "compare": {
+    "enabled": false,
+    "models": [
+      { "provider": "anthropic", "model": "claude-sonnet-4-20250514" }
+    ],
+    "channels": ["telegram"],
+    "timeoutMs": 300000,
+    "maxConcurrent": 3
+  }
+}
+```
+
+Notes:
+
+- `collector.debugLogs` enables structured debug logging for collector/store paths
+- `collector.loggerImportDir` enables startup-time logger import attempts
+- `collector.loggerImportMaxFileSizeMb` protects against oversized logger files
+
+## Installation
+
+ClawLens is loaded as an OpenClaw extension from source files.
+
+```bash
+cp -r extensions/clawlens ~/.openclaw/extensions/clawlens
+
+openclaw config set plugins.installs.clawlens.source path
+openclaw config set plugins.installs.clawlens.spec ~/.openclaw/extensions/clawlens
+
+openclaw gateway restart
+
+curl -s http://localhost:18789/plugins/clawlens/api/overview
+```
+
+If you use logger import, also configure:
+
+```bash
+openclaw config set plugins.config.clawlens.collector.loggerImportDir /path/to/logger-dir
+openclaw config set plugins.config.clawlens.collector.loggerImportMaxFileSizeMb 100
+```
 
 ## Compatibility
 
-- **OpenClaw**: v2026.3.22+ (verified through v2026.3.23-2, no breaking changes)
-- **Node.js**: 22.16+ (24 recommended)
-- **Storage**: SQLite via `node:sqlite` (Node built-in, no npm dependencies)
+- Node.js: `22.5.0+`
+- Storage: `node:sqlite`
+- OpenClaw: current code targets the plugin/runtime APIs used in this repository snapshot
 
-## Project Documents
+If Node is below `22.5.0`, ClawLens now fails fast during plugin registration.
 
-| Document | Description |
-|----------|-------------|
-| [analysis-raw.md](docs/analysis-raw.md) | OpenClaw source code analysis — call chains, hooks, data structures |
-| [architecture.md](docs/architecture.md) | ClawLens architecture design with data consistency proofs |
-| [claude-code-prompt.md](docs/claude-code-prompt.md) | Implementation prompt for creating ClawLens from scratch |
-| [claude-code-prompt-update.md](docs/claude-code-prompt-update.md) | Incremental prompt for adding audit view to existing codebase |
-| [clawlens-usage.md](docs/clawlens-usage.md) | End-user UI documentation |
+## Document Map
 
-## How This Project Was Built
+Recommended current-entry documents:
 
-ClawLens was designed entirely through conversation with Claude (Anthropic), including:
+- [architecture.md](docs/architecture.md) — current architecture authority
+- [clawlens-usage.md](docs/clawlens-usage.md)
+- [PROMPT_IMPLEMENTATION.md](docs/PROMPT_IMPLEMENTATION.md)
+- [ANALYSIS_CHAT_AUDIT.md](docs/ANALYSIS_CHAT_AUDIT.md)
+- [ANALYSIS_CHAT_AUDIT_REMAINING_WORK.md](docs/ANALYSIS_CHAT_AUDIT_REMAINING_WORK.md)
+- [IMPLEMENTATION_CHAT_AUDIT_REMAINING_WORK.md](docs/IMPLEMENTATION_CHAT_AUDIT_REMAINING_WORK.md)
+- [ANALYSIS_LLM_API_LOGGER_MESSAGE_MAPPING.md](docs/ANALYSIS_LLM_API_LOGGER_MESSAGE_MAPPING.md)
+- [PLAYBOOK_ENGINEERING_LESSONS.md](docs/PLAYBOOK_ENGINEERING_LESSONS.md)
+- [GOVERNANCE_DOCS_PLAN.md](docs/GOVERNANCE_DOCS_PLAN.md)
+- [archive/history/README.md](docs/archive/history/README.md)
 
-- Deep source code analysis of OpenClaw v2026.3.22 internals
-- Architecture design with full data consistency proofs against the official Usage view
-- Discovery that `llm_output` hook fires once per-run (not per-call), leading to the `onSessionTranscriptUpdate` approach
-- Discovery that pi-ai embeds cost calculations in `message.usage.cost`, enabling dual-cost verification
-- UI mockup design using OpenClaw's actual CSS variables and layout patterns
-- Version compatibility analysis across 3.22 → 3.23 → 3.23-2
+Prompt / analysis playbooks:
 
-The implementation prompts in `docs/` are designed to be fed directly to [Claude Code](https://docs.anthropic.com/en/docs/claude-code) for automated code generation and deployment.
+- [PLAYBOOK_ANALYSIS_PROMPT.md](docs/PLAYBOOK_ANALYSIS_PROMPT.md)
+- [ANALYSIS_PROMPT_PLAYBOOK_GENERAL.md](docs/prompts/ANALYSIS_PROMPT_PLAYBOOK_GENERAL.md)
+- [ANALYSIS_PROMPT_PLAYBOOK_DOC_REVIEW.md](docs/prompts/ANALYSIS_PROMPT_PLAYBOOK_DOC_REVIEW.md)
+- [ANALYSIS_PROMPT_PLAYBOOK_DEBUG.md](docs/prompts/ANALYSIS_PROMPT_PLAYBOOK_DEBUG.md)
+
+## Current Status
+
+The main Chat Audit path is working:
+
+- latest message to current run lookup
+- run detail capture
+- turns rendering
+- heartbeat/chat separation in chat-facing audit queries
+- logger import entrypoint and idempotent import state
+
+Known work that remains is tracked in:
+
+- [ANALYSIS_CHAT_AUDIT_REMAINING_WORK.md](docs/ANALYSIS_CHAT_AUDIT_REMAINING_WORK.md)
+- [IMPLEMENTATION_CHAT_AUDIT_REMAINING_WORK.md](docs/IMPLEMENTATION_CHAT_AUDIT_REMAINING_WORK.md)
 
 ## License
 

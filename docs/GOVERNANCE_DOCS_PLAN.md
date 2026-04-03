@@ -1,0 +1,140 @@
+# Docs Governance Plan
+
+> [!IMPORTANT]
+> Current Authority: This is the active master version for docs governance rules.
+>
+当前主文档，描述 `docs/` 目录的治理规则。
+
+当前规则：
+
+- 顶层 `docs/` 只保留当前主入口文档
+- `docs/prompts/` 用于存放当前活跃的提示词分支文档
+- 带日期的过程稿、研究稿、旧复核稿原则上不留在顶层
+- 历史材料统一进入 `docs/archive/`
+- 每个主题在顶层尽量只保留一个无日期主文档
+
+## History 体系
+
+`docs/archive/history/` 是主题历史索引的法定入口。
+
+规则如下：
+
+1. 每个重要主题应有对应的 `*_HISTORY.md`。
+2. 只要某份主题文档被归档，就必须同步登记到对应主题的 history。
+3. 仅把文件移动到 `docs/archive/` 而不更新 history，视为不完整归档。
+4. 如果某份归档材料跨多个主题都有关联，应在主归属主题的 history 中登记，并在其他主题文档中做交叉引用说明。
+
+## Archive 分类职责
+
+`docs/archive/` 下的子目录按职责分工：
+
+- `reviews/`
+  架构复核、合规复核、旧审查稿。
+- `analysis/`
+  研究稿、分析稿、原始记录、中间稿、postmortem、rectification。
+- `prompts/`
+  历史 AI 提示词、修订提示词链、旧实现提示词。
+- `chat-audit/`
+  Chat Audit 专项修复记录、阶段性修复稿、专项排障稿。
+- `history/`
+  各主题历史索引，不存放普通过程稿。
+
+分类原则：
+
+1. 优先按业务主题和长期检索习惯归类，不按临时文件名随意投递。
+2. 如果某主题已经有专门分类目录，相关归档材料优先放入该主题目录。
+3. 若无法判断主题归属，才放入更通用的 `analysis/`。
+
+## `docs/prompts/` 目录职责
+
+`docs/prompts/` 用于存放**当前仍在使用的提示词分支文档**。
+
+规则如下：
+
+1. 顶层主索引仍放在 `docs/` 顶层，例如：
+   `PLAYBOOK_ANALYSIS_PROMPT.md`
+2. `docs/prompts/` 只放当前活跃的分支提示词，不放历史提示词。
+3. 历史提示词、旧提示词链、带日期的提示词快照，应进入：
+   `docs/archive/prompts/`
+4. 若某分支提示词不再是当前活跃内容，应归档并在对应 history 中登记。
+
+## 文件命名规则
+
+新建带日期文档时，统一采用：
+
+`TYPE_TOPIC[_DETAIL]_YYYY-MM-DD.md`
+
+其中：
+
+- `TYPE`：文档类型，必须放在最前面
+- `TOPIC`：主题
+- `DETAIL`：可选，表示更细的范围
+- `YYYY-MM-DD`：日期
+
+### 类型前缀
+
+当前统一使用以下首单词：
+
+- `ANALYSIS`：分析文档
+- `RESEARCH`：研究文档
+- `IMPLEMENTATION`：实施方案
+- `PROMPT`：提示词
+- `REVIEW`：审查 / 复核
+- `FIX`：缺陷修复
+- `CHANGELOG`：变更记录
+- `POSTMORTEM`：事后复盘
+- `GOVERNANCE`：治理规则
+- `PLAYBOOK`：方法论文档 / 操作手册
+- `HISTORY`：历史索引
+
+### 命名示例
+
+- `ANALYSIS_CHAT_AUDIT_2026-04-02.md`
+- `RESEARCH_LLM_API_LOGGER_MESSAGE_MAPPING_2026-04-02.md`
+- `IMPLEMENTATION_CHAT_AUDIT_REMAINING_WORK_2026-04-02.md`
+- `PROMPT_DOCS_AUDIT_2026-04-03.md`
+- `FIX_CHAT_AUDIT_DETAIL_CAPTURE_2026-04-02.md`
+
+## 顶层与归档规则
+
+1. 无日期文件只保留给当前主文档。
+2. 带日期文件默认视为快照、过程稿或历史材料。
+3. 带日期文件完成其阶段性作用后，应进入 `docs/archive/` 或写入对应 `history`。
+4. 若某主题已有无日期主文档，不再把新的带日期稿长期保留在顶层。
+
+## 路径引用规则
+
+1. 文档中**绝对不要使用本项目文件的绝对路径**。
+2. 本规则适用于仓库内文件与目录，例如：
+   - `docs/...`
+   - `extensions/clawlens/...`
+   - `projects-ref/...`
+3. 文档中的项目内引用应统一使用仓库相对路径。
+4. 如果引用的是外部运行环境、系统路径、运行库路径，且与当前仓库的 `home` 目录无关，可以按需要保留。
+5. 归档、重命名、重构目录后，必须同步检查并修复旧的项目内绝对路径引用。
+
+## 归档 SOP
+
+每次归档至少执行以下步骤：
+
+1. 识别候选文件
+   区分当前主入口文档与历史材料。
+2. 选择 archive 分类
+   在 `reviews`、`analysis`、`prompts`、`chat-audit` 中确定目标目录。
+3. 执行文件移动
+   将历史材料移入 `docs/archive/` 对应目录。
+4. 修复引用路径
+   包括顶层主文档、`README.md`、`docs/archive/README.md`、其他索引文档。
+5. 更新主题 history
+   在对应 `docs/archive/history/*_HISTORY.md` 中登记被归档文件。
+6. 验证顶层收敛
+   确认 `docs/` 顶层是否仍残留不应存在的带日期旧稿。
+
+推荐规则：
+
+- 归档动作应尽量原子化。
+- 文件移动、链接修复、history 更新，三者应在同一轮提交中完成。
+
+历史日期版：
+
+- [DOCS_GOVERNANCE_PLAN_2026-04-03.md](archive/analysis/DOCS_GOVERNANCE_PLAN_2026-04-03.md)

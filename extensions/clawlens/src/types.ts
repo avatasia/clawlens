@@ -3,6 +3,9 @@ export type ClawLensConfig = {
     enabled?: boolean;
     snapshotIntervalMs?: number;
     retentionDays?: number;
+    debugLogs?: boolean;
+    loggerImportDir?: string;
+    loggerImportMaxFileSizeMb?: number;
   };
   compare?: {
     enabled?: boolean;
@@ -14,6 +17,6 @@ export type ClawLensConfig = {
 };
 
 export type ClawLensEvent = {
-  type: "run_started" | "run_ended" | "llm_call" | "tool_executed" | "compare_completed" | "connected";
+  type: "run_started" | "run_ended" | "llm_call" | "tool_executed" | "transcript_turn" | "compare_completed" | "connected";
   [key: string]: unknown;
 };

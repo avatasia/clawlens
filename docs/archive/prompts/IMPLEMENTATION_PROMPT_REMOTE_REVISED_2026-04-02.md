@@ -1,7 +1,21 @@
-# ClawLens — 代码实现提示词
+# ClawLens — 代码实现提示词（远程部署章节修订版）
 
-> 基于四份复核文档（2026-04-01）生成。
-> 涵盖 Bug 修复、功能补全、本地验证与远程部署，合并自 `claude-code-prompt.md` 和 `claude-code-prompt-update.md`。
+> **本轮修改说明**
+>
+> - 原文件：`docs/IMPLEMENTATION_PROMPT.md`（**未修改**）
+> - 本文件：仅修订 §6-C、§6-D 及其相关前提说明
+> - 修订原因：原文远程部署章节存在以下具体误操作风险，逐一列于下方；实现修复类章节（§0–§5、§7–§8）原文照搬，不做改动
+>
+> | 编号 | 原文风险 | 本次改法 |
+> |---|---|---|
+> | R1 | `scp -r dir/ host:target/` 在目标已存在时可能产生 `target/dir/` 嵌套 | 禁止该写法；改用 `scp dir/* target/` 或 `rsync --delete` |
+> | R2 | `sshpass + 明文密码` 被写成默认发布路径 | 改为 SSH key / host alias 作为默认；`sshpass` 降级为"key 未就绪时的兼容备用" |
+> | R3 | 未在发布前确认远端目录存在状态即覆盖 | 新增发布前检查步骤 |
+> | R4 | 未在发布后验证文件实际落点即跳到 API 验证 | 新增发布后文件结构验证步骤 |
+> | R5 | `openclaw gateway restart` / `openclaw gateway logs` 被写成"默认可执行"，实际远端 shell 不一定有 PATH | 加"若 PATH 不含 openclaw"的绝对路径备用方式 |
+> | R6 | `openclaw dashboard --no-open` 同上 PATH 问题 | 同上处理 |
+> | R7 | API 验证放在 CLI 验证后面，顺序不合理 | 调整为 API 验证优先，CLI 验证作为附加项 |
+> | R8 | UI 截图章节把 `sshpass` 列为前提依赖，忽略 SSH key 路径 | 改为 SSH key 隧道为默认，`sshpass` 为备用 |
 
 ---
 
@@ -474,16 +488,14 @@ function loadCostConfig(config) {
   }
   return map;
 }
-// 不完整 config 不应入表
 const m = loadCostConfig({models:{providers:{p:{models:{m:{cost:{input:1}}}}}}});
 console.assert(m.size === 0, '不完整 config 不应入表');
-// 完整 config 应入表
 const m2 = loadCostConfig({models:{providers:{p:{models:{m:{cost:{input:1,output:2,cacheRead:0,cacheWrite:0}}}}}}});
 console.assert(m2.size === 1, '完整 config 应入表');
 console.log('✅ cost-calculator NaN 修复 OK');
 "
 
-# 3. NaN 查询参数修复验证（验证修复后的解析逻辑，而不是只复现旧错误）
+# 3. NaN 查询参数修复验证
 node -e "
 const { DatabaseSync } = await import('node:sqlite');
 const db = new DatabaseSync(':memory:');
@@ -505,46 +517,197 @@ console.log('✅ NaN 防护 OK');
 
 只有在先补齐测试运行方案（见第 5 节）后，才执行测试；不要把"尚未配置完成的命令"当成必过验证。
 
+---
+
 ### 6-C 远程部署
 
-> **前提**：以下命令依赖本地已配置的 `rscp`/`rssh` alias、`$REMOTE_HOST`/`$REMOTE_PORT` 环境变量。
-> 这些不是仓库内可推导出的通用前提，**执行前确认本地环境已就绪**，不要把这段当成默认可执行步骤。
+<!-- ═══════════════════════════════════════════════════════════════════
+  修改原因（对应修订表 R1–R5）：
+  - 原文 rscp -r 写法在目标目录已存在时有嵌套风险（R1）
+  - 原文把 sshpass + 明文密码写成默认路径（R2）
+  - 原文未要求发布前确认目录状态（R3）
+  - 原文未要求发布后验证文件落点（R4）
+  - 原文把 openclaw CLI 写成默认可执行，实际远端 PATH 不保证（R5）
+═══════════════════════════════════════════════════════════════════ -->
+
+> **前提与连接方式说明**
+>
+> 本节命令有两种连接路径，优先级如下：
+>
+> **默认推荐：SSH key / 已配置 host alias**
+> - 若已执行过 `ssh-copy-id` 或远端已信任本机公钥，可直接用 `ssh szhdy`
+> - 以下示例均以 `szhdy` 作为 host alias 占位符，请替换成实际配置的名称
+>
+> **兼容备用：环境变量 + sshpass（仅 key 未就绪时使用）**
+> - 明文密码不应长期保留在仓库或脚本中，仅适合一次性临时操作
+> - 用法：`export SSHPASS="..."; sshpass -e ssh $REMOTE_HOST`
+> - `REMOTE_HOST` 格式：`user@ip`；`REMOTE_PORT` 默认 22
+>
+> ⚠️ **不要把用户名、IP、密码硬编码进脚本后提交进仓库。**
+
+#### 步骤 1：发布前检查远端目录
 
 ```bash
-# 同步文件到远程（rscp 为已配置的 alias）
-rscp -r extensions/clawlens/ $REMOTE_HOST:~/.openclaw/extensions/clawlens/
+# 确认远端 HOME 路径，不要凭猜测假定
+ssh szhdy 'echo "$HOME"'
 
-# 重启 gateway
-rssh "openclaw gateway restart 2>&1"
-sleep 10
-
-# 验证插件加载
-rssh "openclaw gateway logs 2>&1 | grep -i clawlens | tail -10"
-
-# 验证 API 端点
-rssh "curl -s http://localhost:18789/plugins/clawlens/api/overview"
-rssh "curl -s 'http://localhost:18789/plugins/clawlens/api/sessions?limit=5'"
-rssh "curl -s 'http://localhost:18789/plugins/clawlens/api/audit?days=7&limit=10'"
-
-# 验证 NaN 修复（应返回正常数据，不是 500）
-rssh "curl -s 'http://localhost:18789/plugins/clawlens/api/sessions?limit=foo'"
-rssh "curl -s 'http://localhost:18789/plugins/clawlens/api/audit?days=foo'"
+# 确认插件目录的实际存在状态
+ssh szhdy 'ls -la ~/.openclaw/extensions'
+ssh szhdy 'ls -la ~/.openclaw/extensions/clawlens || echo "目录不存在，将新建"'
 ```
+
+若目录不存在，先创建：
+
+```bash
+ssh szhdy 'mkdir -p ~/.openclaw/extensions/clawlens/src ~/.openclaw/extensions/clawlens/ui'
+```
+
+#### 步骤 2：同步文件到远端
+
+> ⚠️ **禁止使用的高风险写法**：
+> ```bash
+> # 错误示例 — 目标目录已存在时会产生嵌套 clawlens/clawlens/
+> scp -r extensions/clawlens/ szhdy:~/.openclaw/extensions/clawlens/
+> ```
+
+**方式 A（推荐）：rsync，同步目录内容**
+
+```bash
+# trailing slash 表示同步目录内容而非目录本身，--delete 移除远端多余文件
+rsync -av --delete -e "ssh" \
+  extensions/clawlens/ \
+  "szhdy:~/.openclaw/extensions/clawlens/"
+```
+
+**方式 B：scp 逐类文件同步（rsync 不可用时）**
+
+```bash
+# 同步目录内容而非目录本身（注意 /* 而不是 /）
+scp extensions/clawlens/openclaw.plugin.json \
+    extensions/clawlens/index.ts \
+    extensions/clawlens/package.json \
+    szhdy:~/.openclaw/extensions/clawlens/
+
+scp extensions/clawlens/src/*.ts \
+    szhdy:~/.openclaw/extensions/clawlens/src/
+
+scp extensions/clawlens/ui/inject.js \
+    extensions/clawlens/ui/styles.css \
+    szhdy:~/.openclaw/extensions/clawlens/ui/
+```
+
+#### 步骤 3：发布后验证文件落点
+
+```bash
+# 先验证文件结构，再做 API / UI 验证
+ssh szhdy 'find ~/.openclaw/extensions/clawlens -maxdepth 2 -type f | sort | sed -n "1,80p"'
+```
+
+预期输出中应包含：
+- `~/.openclaw/extensions/clawlens/openclaw.plugin.json`
+- `~/.openclaw/extensions/clawlens/src/collector.ts`（等 src 文件）
+- `~/.openclaw/extensions/clawlens/ui/inject.js`
+
+**如果出现 `clawlens/clawlens/` 嵌套，说明发布命令用错了，需要手动清理后重发。**
+
+#### 步骤 4：重启 gateway
+
+```bash
+# 若远端已配置好 openclaw 命令（PATH 包含该命令）：
+ssh szhdy 'openclaw gateway restart 2>&1'
+
+# 若 openclaw 不在远端 PATH（常见于 nvm 安装），改用已知绝对路径：
+# 先找到绝对路径：
+ssh szhdy 'find ~/.nvm/versions -name "openclaw" -type f 2>/dev/null | head -3'
+# 然后用绝对路径执行（将路径替换为上一步找到的结果）：
+ssh szhdy '/home/openclaw/.nvm/versions/node/v24.14.0/bin/openclaw gateway restart 2>&1'
+
+sleep 10
+```
+
+#### 步骤 5：API 探活（优先验证）
+
+API 返回正常比 CLI 日志更直接地证明插件在线。
+
+```bash
+# 在远端本机直接 curl，不依赖本地隧道
+ssh szhdy 'curl -s http://localhost:18789/plugins/clawlens/api/overview'
+ssh szhdy 'curl -s "http://localhost:18789/plugins/clawlens/api/sessions?limit=5"'
+ssh szhdy 'curl -s "http://localhost:18789/plugins/clawlens/api/audit?days=7&limit=3"'
+
+# 验证 NaN 防护（应返回正常数据，不是 500 或 datatype mismatch）
+ssh szhdy 'curl -s "http://localhost:18789/plugins/clawlens/api/sessions?limit=foo"'
+ssh szhdy 'curl -s "http://localhost:18789/plugins/clawlens/api/audit?days=foo"'
+```
+
+#### 步骤 6：插件加载日志（附加验证，环境允许时执行）
+
+```bash
+# 若 openclaw 在远端 PATH 中：
+ssh szhdy 'openclaw logs 2>&1 | grep -i "clawlens\|plugin" | tail -10'
+
+# 若不在 PATH，改用 journalctl（gateway 以 systemd service 运行时）：
+ssh szhdy 'journalctl -u openclaw-gateway.service --since "5 min ago" | grep -i clawlens | tail -10'
+```
+
+---
 
 ### 6-D UI 验证（截图）
 
-> **前提**：依赖 `sshpass`、`google-chrome --headless`，以及已配置的 `rssh` alias。
-> **执行前确认本地环境具备**，不要混入通用步骤中。
+<!-- ═══════════════════════════════════════════════════════════════════
+  修改原因（对应修订表 R6–R8）：
+  - 原文把 sshpass 写成截图验证的默认前提依赖（R8）
+  - 原文的 openclaw dashboard --no-open 假设 PATH 可用（R6）
+  - 原文没有明确列出本节所有工具依赖（R7）
+═══════════════════════════════════════════════════════════════════ -->
+
+> **前提（全部具备才可执行本节）**
+>
+> - 本地已安装 `google-chrome`（支持 `--headless=new`）
+> - 本地已安装 `ssh`
+> - 本地端口 18789 空闲（或已有隧道在运行）
+> - 远端 gateway 监听 `127.0.0.1:18789`
+>
+> 本节**不是通用默认步骤**，工具链不具备时跳过，不要强行执行。
+
+#### 建立 SSH 隧道
+
+**默认推荐：SSH key（已配置 host alias）**
 
 ```bash
-# 建立 SSH 隧道（若尚未建立）
+# 检查隧道是否已建立
+curl -s --max-time 2 http://localhost:18789/ > /dev/null 2>&1 && echo "隧道已就绪" || {
+  ssh -L 18789:127.0.0.1:18789 -N -f szhdy
+  sleep 2
+}
+```
+
+**兼容备用：sshpass（仅 key 未就绪时）**
+
+```bash
+export SSHPASS="..."   # 不要硬编码，每次临时设置
 sshpass -e ssh -o StrictHostKeyChecking=no -p $REMOTE_PORT \
   -L 18789:127.0.0.1:18789 -N -f $REMOTE_HOST
+sleep 2
+```
 
-# 获取 dashboard URL
-DASHBOARD_URL=$(rssh "openclaw dashboard --no-open 2>&1" | grep -oP 'http://[^\s]+')
+#### 获取 Dashboard URL 与 Token
+
+```bash
+# 若 openclaw 在远端 PATH 中：
+DASHBOARD_URL=$(ssh szhdy 'openclaw dashboard --no-open 2>&1' | grep -oP 'http://[^\s]+')
+
+# 若不在 PATH（使用已知绝对路径，替换为实际路径）：
+DASHBOARD_URL=$(ssh szhdy '/home/openclaw/.nvm/versions/node/v24.14.0/bin/openclaw dashboard --no-open 2>&1' | grep -oP 'http://[^\s]+')
+
 TOKEN=$(echo "$DASHBOARD_URL" | grep -oP 'token=\K[^&]+')
+echo "Dashboard: $DASHBOARD_URL"
+echo "Token: ${TOKEN:0:8}..."   # 只打印前 8 位，避免 token 完整暴露在终端历史
+```
 
+#### 截图
+
+```bash
 # Overview 截图
 google-chrome --headless=new --no-sandbox --disable-gpu \
   --screenshot=/tmp/clawlens-overview.png \
@@ -557,7 +720,7 @@ google-chrome --headless=new --no-sandbox --disable-gpu \
   --window-size=2560,1440 \
   "http://localhost:18789/chat?token=${TOKEN}"
 
-echo "截图: /tmp/clawlens-overview.png  /tmp/clawlens-chat.png"
+echo "截图已保存：/tmp/clawlens-overview.png  /tmp/clawlens-chat.png"
 ```
 
 ---

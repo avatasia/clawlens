@@ -5,5 +5,8 @@
   "type": "module",
   "openclaw": {
     "extensions": ["./index.ts"]
+  },
+  "scripts": {
+    "test": "npx tsx --test tests/*.test.ts"
   }
 }

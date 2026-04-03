@@ -54,7 +54,10 @@ export function registerStaticRoutes(api: PluginApi, rootDir: string): void {
         return;
       }
 
-      res.writeHead(200, { "Content-Type": MIME_TYPES[ext] ?? "application/octet-stream" });
+      res.writeHead(200, {
+        "Content-Type": MIME_TYPES[ext] ?? "application/octet-stream",
+        "Cache-Control": "no-store",
+      });
       res.end(content);
     },
   });

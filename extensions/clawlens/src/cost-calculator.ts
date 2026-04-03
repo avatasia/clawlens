@@ -22,7 +22,15 @@ export function loadCostConfig(config: unknown): Map<string, ModelCostConfig> {
     if (!models || typeof models !== "object") continue;
     for (const [mName, mConfig] of Object.entries(models)) {
       const cost = (mConfig as any)?.cost;
-      if (cost && typeof cost.input === "number") map.set(`${pName}:${mName}`, cost as ModelCostConfig);
+      if (
+        cost &&
+        typeof cost.input === "number" && Number.isFinite(cost.input) &&
+        typeof cost.output === "number" && Number.isFinite(cost.output) &&
+        typeof cost.cacheRead === "number" && Number.isFinite(cost.cacheRead) &&
+        typeof cost.cacheWrite === "number" && Number.isFinite(cost.cacheWrite)
+      ) {
+        map.set(`${pName}:${mName}`, cost as ModelCostConfig);
+      }
     }
   }
   return map;

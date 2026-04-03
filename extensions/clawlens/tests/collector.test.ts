@@ -25,7 +25,9 @@ function makeMockStore() {
     completeRun: record("completeRun"),
     insertLlmCall: record("insertLlmCall"),
     insertToolExecution: record("insertToolExecution"),
+    insertConversationTurn: record("insertConversationTurn"),
     insertSessionSnapshot: record("insertSessionSnapshot"),
+    updateRunSessionKey: record("updateRunSessionKey"),
     getOverview: () => ({ activeRuns: 0, totalRuns24h: 0, totalTokens24h: 0, totalCost24h: 0 }),
     getSessions: () => [],
     getRunDetail: () => ({ run: null, llmCalls: [], toolExecutions: [] }),
@@ -109,7 +111,7 @@ describe("Collector — 正常值", () => {
   test("recordLlmCall → insertLlmCall + broadcast llm_call", () => {
     const { collector, store, sse } = makeCollector();
     collector.handleAgentEvent(lifecycleEvent("start"));
-    collector.recordLlmCall(
+    collector.recordLlmOutput(
       { runId: "run-001", provider: "openai", model: "gpt-4o", usage: { input: 100, output: 50 } },
       { sessionKey: "sess-001" },
     );
@@ -124,7 +126,7 @@ describe("Collector — 正常值", () => {
     const { collector, store, sse } = makeCollector();
     collector.handleAgentEvent(lifecycleEvent("start"));
     collector.recordToolCall(
-      { toolName: "bash", toolCallId: "tc-1", input: { cmd: "ls" }, isError: false, durationMs: 42 },
+      { toolName: "bash", toolCallId: "tc-1", params: { cmd: "ls" }, durationMs: 42 },
       { runId: "run-001" } as any,
     );
     collector.stop();
@@ -137,9 +139,9 @@ describe("Collector — 正常值", () => {
   test("llmCallIndex 在同一 run 内递增", () => {
     const { collector, store } = makeCollector();
     collector.handleAgentEvent(lifecycleEvent("start"));
-    collector.recordLlmCall({ runId: "run-001", usage: {} }, {});
-    collector.recordLlmCall({ runId: "run-001", usage: {} }, {});
-    collector.recordLlmCall({ runId: "run-001", usage: {} }, {});
+    collector.recordLlmOutput({ runId: "run-001", usage: {} }, {});
+    collector.recordLlmOutput({ runId: "run-001", usage: {} }, {});
+    collector.recordLlmOutput({ runId: "run-001", usage: {} }, {});
     collector.stop();
 
     const calls = store.callsOf("insertLlmCall");
@@ -176,7 +178,7 @@ describe("Collector — 异常值", () => {
 
   test("recordLlmCall runId 缺失 → 不写入", () => {
     const { collector, store } = makeCollector();
-    collector.recordLlmCall({ usage: { input: 100 } }, {});
+    collector.recordLlmOutput({ usage: { input: 100 } }, {});
     collector.stop();
     assert.equal(store.callsOf("insertLlmCall").length, 0);
   });
@@ -253,7 +255,7 @@ describe("Collector — 不同状态", () => {
     const { collector, store } = makeCollector();
     collector.handleAgentEvent(lifecycleEvent("start"));
     collector.recordToolCall(
-      { toolName: "bash", toolCallId: "tc-err", isError: true, durationMs: 5 },
+      { toolName: "bash", toolCallId: "tc-err", error: "err", durationMs: 5 },
       { runId: "run-001" } as any,
     );
     collector.stop();
@@ -292,7 +294,7 @@ describe("Collector — 并发", () => {
     await Promise.all(
       Array.from({ length: 50 }, () =>
         Promise.resolve(
-          collector.recordLlmCall(
+          collector.recordLlmOutput(
             { runId: "run-001", usage: { input: 10, output: 5 } },
             { sessionKey: "sess-001" },
           ),
@@ -311,8 +313,8 @@ describe("Collector — 并发", () => {
     const { collector, store } = makeCollector();
     collector.handleAgentEvent(lifecycleEvent("start"));
     await Promise.all([
-      Promise.resolve(collector.recordLlmCall({ runId: "run-001", usage: { input: 100 } }, {})),
-      Promise.resolve(collector.recordLlmCall({ runId: "run-001", usage: { input: 200 } }, {})),
+      Promise.resolve(collector.recordLlmOutput({ runId: "run-001", usage: { input: 100 } }, {})),
+      Promise.resolve(collector.recordLlmOutput({ runId: "run-001", usage: { input: 200 } }, {})),
       Promise.resolve(
         collector.recordToolCall({ toolName: "read", toolCallId: "t1", durationMs: 10 }, { runId: "run-001" } as any),
       ),
@@ -366,8 +368,8 @@ describe("Collector — 边界值", () => {
       {
         toolName: "bash",
         toolCallId: "tc-long",
-        input: { cmd: "x".repeat(500) },
-        content: "y".repeat(500),
+        params: { cmd: "x".repeat(500) },
+        result: "y".repeat(500),
         durationMs: 1,
       },
       { runId: "run-001" } as any,
@@ -381,7 +383,7 @@ describe("Collector — 边界值", () => {
   test("recordLlmCall 无 usage → insertLlmCall 不崩溃", () => {
     const { collector, store } = makeCollector();
     collector.handleAgentEvent(lifecycleEvent("start"));
-    collector.recordLlmCall({ runId: "run-001" }, {});
+    collector.recordLlmOutput({ runId: "run-001" }, {});
     collector.stop();
     assert.equal(store.callsOf("insertLlmCall").length, 1);
   });
@@ -401,7 +403,7 @@ describe("Collector — 边界值", () => {
     const { collector, store } = makeCollector();
     collector.handleAgentEvent(lifecycleEvent("start"));
     for (let i = 0; i < 999; i++) {
-      collector.recordLlmCall({ runId: "run-001", usage: { input: 1 } }, {});
+      collector.recordLlmOutput({ runId: "run-001", usage: { input: 1 } }, {});
     }
     collector.stop();
     assert.equal(store.callsOf("insertLlmCall").length, 999);
