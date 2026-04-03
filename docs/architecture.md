@@ -52,13 +52,13 @@ llm-api-logger files
 主要模块：
 
 - `extensions/clawlens/index.ts`
-  插件入口、版本检查、服务注册、静态注入、可选启动时 logger 导入
+  插件入口、版本检查、服务注册、静态注入、启动时 logger 导入与历史 `run_kind` 自动补强
 - `extensions/clawlens/src/collector.ts`
   事件采集、run 生命周期管理、transcript 归属、run kind 判定
 - `extensions/clawlens/src/store.ts`
   SQLite 存储、聚合、查询、logger 导入状态、消息映射
 - `extensions/clawlens/src/api-routes.ts`
-  审计接口、message lookup、logger 导入接口
+  审计接口、message lookup、logger 导入接口、历史补强接口
 - `extensions/clawlens/src/logger-message-mapper.ts`
   解析 llm-api-logger 三段式日志文件
 - `extensions/clawlens/src/logger-import.ts`
@@ -300,6 +300,8 @@ pending queue 仍然存在，但已从“按纯 sessionKey 出队”改成“按
 - `GET /plugins/clawlens/api/audit/session/:sessionKey`
 - `GET /plugins/clawlens/api/audit/session/:sessionKey/current-message-run`
 - `POST /plugins/clawlens/api/audit/logger/import`
+- `GET /plugins/clawlens/api/audit/logger/status`
+- `POST /plugins/clawlens/api/audit/backfill/run-kinds`
 - `GET /plugins/clawlens/api/events?token=...`
 
 ### `audit/session/:sessionKey`
@@ -340,6 +342,23 @@ pending queue 仍然存在，但已从“按纯 sessionKey 出队”改成“按
 - 幂等跳过
 - 明确错误返回
 
+`GET /audit/logger/status` 用于暴露：
+
+- 当前配置目录
+- 目录是否存在
+- 候选 `.jsonl` 文件
+- 最近导入状态
+
+### 历史补强
+
+`POST /audit/backfill/run-kinds` 用于对历史 run 做有限元数据补强。
+
+当前策略是：
+
+- 只补强 `run_kind`
+- 只在 prompt preview 或 turns 特征足够强时回填
+- 不做全量历史重建
+
 ## 9. 前端架构
 
 `inject.js` 当前承担三类 UI：
@@ -378,8 +397,10 @@ pending queue 仍然存在，但已从“按纯 sessionKey 出队”改成“按
 - 流式解析三段式 `.jsonl`
 - 只对 `user-entry` prompt 提取 `message_id`
 - 手动导入接口
+- 状态诊断接口
 - 启动时自动尝试导入
 - 幂等跳过
+- 已完成真实线上命中验证
 
 ### 当前边界
 
@@ -399,6 +420,8 @@ pending queue 仍然存在，但已从“按纯 sessionKey 出队”改成“按
   - `collector.debugLogs`
   - `collector.loggerImportDir`
   - `collector.loggerImportMaxFileSizeMb`
+  - `collector.backfillRunKindsOnStart`
+  - `collector.backfillRunKindsLimit`
   - `compare.*`
 
 当前 `snapshotIntervalMs` 仍未真正接入 snapshot 调度器。
@@ -424,8 +447,8 @@ pending queue 仍然存在，但已从“按纯 sessionKey 出队”改成“按
 1. [architecture.md](architecture.md)
 2. [clawlens-usage.md](clawlens-usage.md)
 3. [CHAT_AUDIT_CHANGELOG_2026-04-03.md](archive/chat-audit/CHAT_AUDIT_CHANGELOG_2026-04-03.md)
-4. [ANALYSIS_CHAT_AUDIT_REMAINING_WORK.md](ANALYSIS_CHAT_AUDIT_REMAINING_WORK.md)
-5. [IMPLEMENTATION_CHAT_AUDIT_REMAINING_WORK.md](IMPLEMENTATION_CHAT_AUDIT_REMAINING_WORK.md)
+4. [ANALYSIS_CHAT_AUDIT_ENHANCEMENTS.md](ANALYSIS_CHAT_AUDIT_ENHANCEMENTS.md)
+5. [CHAT_AUDIT_HISTORY.md](archive/history/CHAT_AUDIT_HISTORY.md)
 
 历史复核、研究过程、旧稿请去：
 

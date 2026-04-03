@@ -6,6 +6,78 @@ import { parseLoggerMessageMappings } from "./logger-message-mapper.js";
 
 type LoggerImportConfig = NonNullable<ClawLensConfig["collector"]>;
 
+export function inspectLoggerImportDir(config: LoggerImportConfig): {
+  configured: boolean;
+  importDir: string | null;
+  exists: boolean;
+  isDirectory: boolean;
+  jsonlFiles: Array<{
+    name: string;
+    path: string;
+    sizeBytes: number;
+    mtimeMs: number;
+  }>;
+  latestFile: string | null;
+} {
+  const importDir = config.loggerImportDir?.trim() ?? "";
+  if (!importDir) {
+    return {
+      configured: false,
+      importDir: null,
+      exists: false,
+      isDirectory: false,
+      jsonlFiles: [],
+      latestFile: null,
+    };
+  }
+  const dirPath = path.resolve(importDir);
+  if (!fs.existsSync(dirPath)) {
+    return {
+      configured: true,
+      importDir: dirPath,
+      exists: false,
+      isDirectory: false,
+      jsonlFiles: [],
+      latestFile: null,
+    };
+  }
+  const stat = fs.statSync(dirPath);
+  if (!stat.isDirectory()) {
+    return {
+      configured: true,
+      importDir: dirPath,
+      exists: true,
+      isDirectory: false,
+      jsonlFiles: [],
+      latestFile: null,
+    };
+  }
+
+  const jsonlFiles = fs.readdirSync(dirPath)
+    .filter((name) => name.endsWith(".jsonl"))
+    .sort()
+    .reverse()
+    .map((name) => {
+      const filePath = path.join(dirPath, name);
+      const fileStat = fs.statSync(filePath);
+      return {
+        name,
+        path: filePath,
+        sizeBytes: fileStat.size,
+        mtimeMs: Math.floor(fileStat.mtimeMs),
+      };
+    });
+
+  return {
+    configured: true,
+    importDir: dirPath,
+    exists: true,
+    isDirectory: true,
+    jsonlFiles,
+    latestFile: jsonlFiles[0]?.path ?? null,
+  };
+}
+
 export function resolveLoggerImportFile(
   config: LoggerImportConfig,
   requestedFile?: string | null,
@@ -75,13 +147,20 @@ export async function importLoggerMappings(params: {
   let applied = 0;
   let skipped = 0;
   for (const mapping of mappings) {
-    const ok = params.store.applyLoggerMessageMapping({
-      messageId: mapping.messageId,
-      runId: mapping.runId,
-      userTextPreview: mapping.userTextPreview,
-      loggerTimestamp: mapping.loggerTimestamp,
-      sourceSessionId: mapping.sessionId,
-    });
+    const ok = mapping.messageId
+      ? params.store.applyLoggerMessageMapping({
+          messageId: mapping.messageId,
+          runId: mapping.runId,
+          userTextPreview: mapping.userTextPreview,
+          loggerTimestamp: mapping.loggerTimestamp,
+          sourceSessionId: mapping.sessionId,
+        })
+      : params.store.applyLoggerSessionPreviewMapping({
+          runId: mapping.runId,
+          sessionId: mapping.sessionId,
+          userTextPreview: mapping.userTextPreview,
+          loggerTimestamp: mapping.loggerTimestamp,
+        });
     if (ok) applied++;
     else skipped++;
   }

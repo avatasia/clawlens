@@ -102,6 +102,8 @@ const defaultConfig: ClawLensConfig = {
     retentionDays: 30,
     debugLogs: false,
     loggerImportMaxFileSizeMb: 100,
+    backfillRunKindsOnStart: true,
+    backfillRunKindsLimit: 200,
   },
   compare: { enabled: false, models: [], channels: [], timeoutMs: 300_000, maxConcurrent: 3 },
 };
@@ -162,6 +164,21 @@ export default definePluginEntry({
             }
           } catch (err) {
             api.logger.warn(`ClawLens: logger import failed: ${String(err)}`);
+          }
+        }
+        if (config.collector?.backfillRunKindsOnStart !== false) {
+          try {
+            const result = store.backfillRunKinds({
+              limit: config.collector?.backfillRunKindsLimit ?? 200,
+            });
+            if (result.updated > 0) {
+              api.logger.info(
+                `ClawLens: run_kind backfill finished ` +
+                `(scanned=${result.scanned}, updated=${result.updated}, unchanged=${result.unchanged})`,
+              );
+            }
+          } catch (err) {
+            api.logger.warn(`ClawLens: run_kind backfill failed: ${String(err)}`);
           }
         }
         patchControlUiIndexHtml(api);

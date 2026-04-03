@@ -31,12 +31,15 @@ export type ParsedLoggerMessageMapping = {
   sessionId?: string;
   loggerTimestamp: string;
   promptKind: LoggerPromptKind;
-  messageId: string;
+  messageId?: string;
   userTextPreview: string;
 };
 
 export function classifyPrompt(prompt: string): LoggerPromptKind {
-  if (prompt.startsWith("Conversation info (untrusted metadata):")) return "user-entry";
+  if (
+    prompt.startsWith("Conversation info (untrusted metadata):")
+    || prompt.startsWith("Sender (untrusted metadata):")
+  ) return "user-entry";
   if (prompt.includes("[Subagent Task]:")) return "subagent-task";
   if (prompt.includes("[Internal task completion event]")) return "subagent-announce";
   if (prompt.startsWith("A new session was started via /new or /reset.")) return "startup";
@@ -153,14 +156,15 @@ export async function parseLoggerMessageMappings(filePath: string): Promise<Pars
     const promptKind = classifyPrompt(prompt);
     if (promptKind !== "user-entry") continue;
     const messageId = extractPromptMessageId(prompt);
-    if (!messageId) continue;
+    const userTextPreview = extractPromptUserText(prompt).slice(0, 200);
+    if (!messageId && !userTextPreview) continue;
     parsed.push({
       runId: record.header.runId,
       sessionId: record.header.sessionId,
       loggerTimestamp: record.header.timestamp,
       promptKind,
       messageId,
-      userTextPreview: extractPromptUserText(prompt).slice(0, 200),
+      userTextPreview,
     });
   }
   return parsed;

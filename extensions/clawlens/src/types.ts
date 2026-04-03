@@ -6,6 +6,8 @@ export type ClawLensConfig = {
     debugLogs?: boolean;
     loggerImportDir?: string;
     loggerImportMaxFileSizeMb?: number;
+    backfillRunKindsOnStart?: boolean;
+    backfillRunKindsLimit?: number;
   };
   compare?: {
     enabled?: boolean;

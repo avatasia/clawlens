@@ -37,20 +37,17 @@ Chat Audit 依赖三条主链：
 
 ## 当前剩余工作
 
-仍未完成但不阻塞当前主功能的事项：
+当前主链已收口。后续重点已转为长期增强：
 
-- logger 自动导入与真实线上日志命中验证
-- 前端实时层继续收口
-- 历史脏数据补偿策略
 - message-level 强绑定继续增强
+- 前端交互体验持续优化
+- 历史元数据有限补强的后续扩展
 
 ## 推荐阅读
 
 - 当前架构：
   [architecture.md](architecture.md)
-- 当前剩余工作分析：
-  [ANALYSIS_CHAT_AUDIT_REMAINING_WORK.md](ANALYSIS_CHAT_AUDIT_REMAINING_WORK.md)
-- 当前剩余工作实施计划：
-  [IMPLEMENTATION_CHAT_AUDIT_REMAINING_WORK.md](IMPLEMENTATION_CHAT_AUDIT_REMAINING_WORK.md)
+- 当前长期增强项：
+  [ANALYSIS_CHAT_AUDIT_ENHANCEMENTS.md](ANALYSIS_CHAT_AUDIT_ENHANCEMENTS.md)
 - 历史记录入口：
   [CHAT_AUDIT_HISTORY.md](archive/history/CHAT_AUDIT_HISTORY.md)

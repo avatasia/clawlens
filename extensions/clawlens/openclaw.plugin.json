@@ -13,7 +13,9 @@
           "retentionDays":           { "type": "number" },
           "debugLogs":               { "type": "boolean" },
           "loggerImportDir":         { "type": "string", "minLength": 1 },
-          "loggerImportMaxFileSizeMb": { "type": "number", "exclusiveMinimum": 0 }
+          "loggerImportMaxFileSizeMb": { "type": "number", "exclusiveMinimum": 0 },
+          "backfillRunKindsOnStart": { "type": "boolean" },
+          "backfillRunKindsLimit":   { "type": "number", "exclusiveMinimum": 0 }
         }
       },
       "compare": {

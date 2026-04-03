@@ -5,6 +5,7 @@
 const API = "/plugins/clawlens/api";
 const OVERVIEW_INTERVAL = 30_000;
 const DEBUG_PREFIX = "[ClawLens Audit]";
+const DEBUG_STORAGE_KEYS = ["clawlens.debug", "clawlens.audit.debug"];
 
 // ── State ─────────────────────────────────────────────────────────────────
 
@@ -36,7 +37,19 @@ function authHeaders() {
   return S.token ? { Authorization: `Bearer ${S.token}` } : {};
 }
 
+function isDebugEnabled() {
+  try {
+    if (window.__CLAWLENS_DEBUG__ === true) return true;
+    for (const key of DEBUG_STORAGE_KEYS) {
+      const raw = localStorage.getItem(key)?.trim().toLowerCase();
+      if (raw === "1" || raw === "true" || raw === "yes" || raw === "on") return true;
+    }
+  } catch {}
+  return false;
+}
+
 function debugLog(...args) {
+  if (!isDebugEnabled()) return;
   console.log(DEBUG_PREFIX, ...args);
 }
 
@@ -166,7 +179,7 @@ function connectSSE() {
         if (S.drawerOpen) fetchAuditSessions();
         if (S.selSession && ev.sessionKey === S.selSession) selectSession(S.selSession);
         if (CHAT_STATE.visible) {
-          refreshChatAudit();
+          requestChatAuditRefresh(`sse:${ev.type}`, { force: true, withDetails: true });
           if (ev.runId && CHAT_STATE.expandedRunIds.has(ev.runId)) {
             void refreshChatRunDetail(ev.runId, { force: true });
           }
@@ -565,9 +578,18 @@ const CHAT_STATE = {
   suppressRenderUntil: 0,
   pendingSidebarRender: false,
   deferredRenderTimer: null,
+  refreshTimer: null,
+  pendingRefreshReason: null,
+  pendingRefreshWithDetails: false,
+  lastRefreshAt: 0,
+  lastRouteSignature: null,
+  lastDetailRefreshAt: new Map(),
+  lastDataSignature: null,
 };
 
 const SIDEBAR_RENDER_SUPPRESS_MS = 800;
+const CHAT_AUDIT_REFRESH_MIN_GAP_MS = 1200;
+const CHAT_AUDIT_DETAIL_REFRESH_MIN_GAP_MS = 2500;
 
 function getCurrentSessionSelection() {
   const url = new URL(location.href);
@@ -615,6 +637,7 @@ function getLatestChatDomMessageCandidate() {
 function scheduleDomDrivenAuditRefresh(reason) {
   if (!isInChatView()) return;
   if (!CHAT_STATE.visible) return;
+  if (document.hidden) return;
   if (CHAT_STATE.domRefreshTimer) clearTimeout(CHAT_STATE.domRefreshTimer);
   CHAT_STATE.domRefreshTimer = setTimeout(async () => {
     CHAT_STATE.domRefreshTimer = null;
@@ -624,9 +647,57 @@ function scheduleDomDrivenAuditRefresh(reason) {
     CHAT_STATE.lastDomMessageFingerprint = candidate.fingerprint;
     if (candidate.role !== "user" && candidate.role !== "assistant") return;
     debugLog("domRefresh", { reason, role: candidate.role, textPreview: candidate.text.slice(0, 120) });
-    await refreshChatAudit();
-    await refreshExpandedChatRunDetails();
+    requestChatAuditRefresh(`dom:${reason}`, { withDetails: true });
   }, 250);
+}
+
+function clearScheduledChatAuditRefresh() {
+  if (CHAT_STATE.refreshTimer) {
+    clearTimeout(CHAT_STATE.refreshTimer);
+    CHAT_STATE.refreshTimer = null;
+  }
+}
+
+function requestChatAuditRefresh(reason, opts = {}) {
+  const withDetails = opts.withDetails === true;
+  const force = opts.force === true;
+  if (!CHAT_STATE.visible && !force) return;
+  if (document.hidden && !force) return;
+
+  CHAT_STATE.pendingRefreshReason = reason;
+  CHAT_STATE.pendingRefreshWithDetails = CHAT_STATE.pendingRefreshWithDetails || withDetails;
+
+  if (CHAT_STATE.loading || CHAT_STATE.refreshing) {
+    return;
+  }
+
+  const now = Date.now();
+  const waitMs = force ? 0 : Math.max(0, CHAT_AUDIT_REFRESH_MIN_GAP_MS - (now - CHAT_STATE.lastRefreshAt));
+  if (CHAT_STATE.refreshTimer && !force) return;
+
+  clearScheduledChatAuditRefresh();
+  CHAT_STATE.refreshTimer = setTimeout(async () => {
+    CHAT_STATE.refreshTimer = null;
+    const queuedReason = CHAT_STATE.pendingRefreshReason ?? reason;
+    const queuedWithDetails = CHAT_STATE.pendingRefreshWithDetails;
+    CHAT_STATE.pendingRefreshReason = null;
+    CHAT_STATE.pendingRefreshWithDetails = false;
+    CHAT_STATE.lastRefreshAt = Date.now();
+    debugLog("requestChatAuditRefresh:run", {
+      reason: queuedReason,
+      withDetails: queuedWithDetails,
+      force,
+    });
+    await refreshChatAudit();
+    if (queuedWithDetails) {
+      await refreshExpandedChatRunDetails();
+    }
+    if (CHAT_STATE.pendingRefreshReason) {
+      requestChatAuditRefresh(CHAT_STATE.pendingRefreshReason, {
+        withDetails: CHAT_STATE.pendingRefreshWithDetails,
+      });
+    }
+  }, waitMs);
 }
 
 function updateAuditSidebarContent(forceImmediate = false) {
@@ -659,6 +730,7 @@ function updateAuditSidebarContent(forceImmediate = false) {
     body.innerHTML = '<div style="color:var(--muted,#838387);padding:20px;text-align:center">Loading…</div>';
     return;
   }
+  CHAT_STATE.lastDataSignature = buildChatAuditDataSignature(CHAT_STATE.data);
   if (!CHAT_STATE.data.runs?.length) {
     body.dataset.clawlensRenderedStable = "1";
     body.innerHTML = renderAuditEmptyState(
@@ -782,7 +854,7 @@ function mountChatAuditSidebar() {
     void refreshCurrentMessageRunHint();
   }
   // Fetch immediately after mount. Hidden-state prefetch is intentionally avoided.
-  void refreshChatAudit();
+  requestChatAuditRefresh("sidebar-open", { force: true, withDetails: true });
 }
 
 function hideChatAuditSidebar() {
@@ -852,6 +924,29 @@ function mergeRuns(existing, incoming, mode) {
   }
   out.sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0));
   return out;
+}
+
+function buildChatAuditDataSignature(data) {
+  const runs = Array.isArray(data?.runs) ? data.runs : [];
+  return JSON.stringify({
+    latestStartedAt: data?.latestStartedAt ?? null,
+    oldestStartedAt: data?.oldestStartedAt ?? null,
+    hasMore: !!data?.hasMore,
+    runs: runs.map((run) => ({
+      runId: run?.runId ?? null,
+      status: run?.status ?? null,
+      hasDetail: run?.hasDetail ?? null,
+      duration: run?.duration ?? null,
+      runKind: run?.runKind ?? null,
+      llmCalls: run?.summary?.llmCalls ?? null,
+      toolCalls: run?.summary?.toolCalls ?? null,
+      totalInputTokens: run?.summary?.totalInputTokens ?? null,
+      totalOutputTokens: run?.summary?.totalOutputTokens ?? null,
+      totalCost: run?.summary?.totalCost ?? null,
+      turnCount: Array.isArray(run?.turns) ? run.turns.length : null,
+      timelineCount: Array.isArray(run?.timeline) ? run.timeline.length : null,
+    })),
+  });
 }
 
 function getNewestIncomingRunId(incomingRuns) {
@@ -926,6 +1021,12 @@ async function refreshChatRunDetail(runId, opts = {}) {
   if (idx < 0) return;
   const run = CHAT_STATE.data.runs[idx];
   const force = opts.force === true;
+  const now = Date.now();
+  const lastRefreshAt = CHAT_STATE.lastDetailRefreshAt.get(runId) ?? 0;
+  if (force && !opts.immediate && now - lastRefreshAt < CHAT_AUDIT_DETAIL_REFRESH_MIN_GAP_MS) {
+    CHAT_STATE.loadingRunIds.delete(runId);
+    return;
+  }
   if (!force && !needsRunDetailFetch(run)) return;
   debugLog("ensureRunDetail:start", {
     runId,
@@ -939,6 +1040,7 @@ async function refreshChatRunDetail(runId, opts = {}) {
     if (CHAT_STATE.visible) updateAuditSidebarContent(true);
     return;
   }
+  CHAT_STATE.lastDetailRefreshAt.set(runId, Date.now());
   CHAT_STATE.data.runs[idx] = { ...run, ...detail, hasDetail: true };
   debugLog("ensureRunDetail:done", {
     runId,
@@ -1004,6 +1106,7 @@ async function refreshChatAudit() {
     CHAT_STATE.hasMore = false;
     CHAT_STATE.expandedRunIds.clear();
     CHAT_STATE.loadingRunIds.clear();
+    CHAT_STATE.lastDetailRefreshAt.clear();
     CHAT_STATE.autoExpandDone = false;
     CHAT_STATE.loading = true;
     CHAT_STATE.loadError = null;
@@ -1019,6 +1122,7 @@ async function refreshChatAudit() {
           hasMore: !!d.hasMore,
         });
         CHAT_STATE.data = d;
+        CHAT_STATE.lastDataSignature = buildChatAuditDataSignature(d);
         CHAT_STATE.latestStartedAt = d.latestStartedAt ?? d.runs?.[0]?.startedAt ?? null;
         CHAT_STATE.oldestStartedAt = d.oldestStartedAt ?? d.runs?.[d.runs.length - 1]?.startedAt ?? null;
         CHAT_STATE.hasMore = !!d.hasMore;
@@ -1055,11 +1159,21 @@ async function refreshChatAudit() {
       oldestStartedAt: d.oldestStartedAt ?? null,
       hasMore: !!d.hasMore,
     });
-    CHAT_STATE.data = {
+    const nextData = {
       ...CHAT_STATE.data,
       ...d,
       runs: mergeRuns(CHAT_STATE.data?.runs, d.runs, "prepend"),
     };
+    const nextSignature = buildChatAuditDataSignature(nextData);
+    if (nextSignature === CHAT_STATE.lastDataSignature) {
+      debugLog("refreshChatAudit:incrementalNoop", {
+        latestStartedAt: d.latestStartedAt ?? null,
+      });
+      CHAT_STATE.latestStartedAt = Math.max(CHAT_STATE.latestStartedAt ?? 0, d.latestStartedAt ?? 0);
+      return;
+    }
+    CHAT_STATE.data = nextData;
+    CHAT_STATE.lastDataSignature = nextSignature;
     const newestIncomingRunId = getNewestIncomingRunId(d.runs);
     if (newestIncomingRunId) {
       CHAT_STATE.expandedRunIds.add(newestIncomingRunId);
@@ -1100,11 +1214,20 @@ async function loadOlderChatAudit() {
     oldestStartedAt: d.oldestStartedAt ?? null,
     hasMore: !!d.hasMore,
   });
-  CHAT_STATE.data = {
+  const nextData = {
     ...CHAT_STATE.data,
     ...d,
     runs: mergeRuns(CHAT_STATE.data?.runs, d.runs, "append"),
   };
+  const nextSignature = buildChatAuditDataSignature(nextData);
+  if (nextSignature === CHAT_STATE.lastDataSignature) {
+    CHAT_STATE.oldestStartedAt = d.oldestStartedAt ?? CHAT_STATE.oldestStartedAt;
+    CHAT_STATE.hasMore = !!d.hasMore;
+    if (CHAT_STATE.visible) updateAuditSidebarContent();
+    return;
+  }
+  CHAT_STATE.data = nextData;
+  CHAT_STATE.lastDataSignature = nextSignature;
   CHAT_STATE.oldestStartedAt = d.oldestStartedAt ?? CHAT_STATE.oldestStartedAt;
   CHAT_STATE.hasMore = !!d.hasMore;
   if (CHAT_STATE.visible) updateAuditSidebarContent();
@@ -1113,9 +1236,9 @@ async function loadOlderChatAudit() {
 function startChatPolling() {
   if (CHAT_STATE.pollTimer) return;
   CHAT_STATE.pollTimer = setInterval(async () => {
+    if (document.hidden) return;
     if (!isInChatView() || !CHAT_STATE.visible || CHAT_STATE.loading || CHAT_STATE.refreshing || !CHAT_STATE.latestStartedAt) return;
-    await refreshChatAudit();
-    await refreshExpandedChatRunDetails();
+    requestChatAuditRefresh("poll", { withDetails: true });
   }, 10000);
 }
 
@@ -1137,15 +1260,21 @@ async function refreshExpandedChatRunDetails() {
 function handleRouteChange() {
   if (isInChatView()) {
     injectAuditToggleBtn();
+    const selection = getCurrentSessionSelection();
+    const routeSignature = `${location.pathname}|${selection?.resolved ?? ""}`;
+    const routeChanged = CHAT_STATE.lastRouteSignature !== routeSignature;
+    CHAT_STATE.lastRouteSignature = routeSignature;
     if (CHAT_STATE.visible) {
-      void refreshChatAudit();
-      scheduleDomDrivenAuditRefresh("route-change");
+      if (routeChanged) {
+        requestChatAuditRefresh("route-change", { force: true, withDetails: true });
+      }
     }
   } else {
     hideChatAuditSidebar();
     const btn = document.getElementById("clawlens-audit-toggle-btn");
     if (btn) btn.remove();
     CHAT_STATE.lastDomMessageFingerprint = null;
+    CHAT_STATE.lastRouteSignature = null;
   }
 }
 
@@ -1162,10 +1291,17 @@ _chatObs.observe(document.body, { childList: true, subtree: true });
 
 const _chatMessageObs = new MutationObserver((mutations) => {
   let relevant = false;
+  const chatRoot = document.querySelector(".chat-split-container, main.chat, .shell.shell--chat");
   for (const mutation of mutations) {
     if (mutation.type !== "childList") continue;
     for (const node of mutation.addedNodes) {
       if (!(node instanceof HTMLElement)) continue;
+      if (chatRoot) {
+        const insideChatRoot =
+          chatRoot.contains(node)
+          || !!node.querySelector?.(".chat-split-container, main.chat, .shell.shell--chat");
+        if (!insideChatRoot) continue;
+      }
       if (
         node.matches?.(".chat-group") ||
         node.querySelector?.(".chat-group")
@@ -1179,6 +1315,15 @@ const _chatMessageObs = new MutationObserver((mutations) => {
   if (relevant) scheduleDomDrivenAuditRefresh("chat-mutation");
 });
 _chatMessageObs.observe(document.body, { childList: true, subtree: true });
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && CHAT_STATE.visible) {
+    requestChatAuditRefresh("visibility-resume", { force: true, withDetails: true });
+  } else if (document.hidden && CHAT_STATE.domRefreshTimer) {
+    clearTimeout(CHAT_STATE.domRefreshTimer);
+    CHAT_STATE.domRefreshTimer = null;
+  }
+});
 
 setTimeout(handleRouteChange, 1000);
 setTimeout(handleRouteChange, 3000);

@@ -655,7 +655,7 @@ export class Store {
         return;
       }
       if (incomingPriority === existingPriority && existing.run_id !== runId) {
-        console.warn("[clawlens] conversation_turns: conflicting equal-priority binding", {
+        this.debug("conversation_turns: conflicting equal-priority binding", {
           messageId: opts.messageId,
           existingRunId: existing.run_id,
           incomingRunId: runId,
@@ -726,6 +726,73 @@ export class Store {
         sourceSessionId: params.sourceSessionId,
         sourceLoggerTs: params.loggerTimestamp,
       },
+    );
+    return true;
+  }
+
+  applyLoggerSessionPreviewMapping(params: {
+    runId: string;
+    sessionId?: string;
+    userTextPreview: string;
+    loggerTimestamp: string;
+  }): boolean {
+    if (!params.sessionId || !params.userTextPreview.trim()) return false;
+    const run = this.db.prepare(
+      "SELECT run_id, session_key, started_at FROM runs WHERE run_id = ?",
+    ).get(params.runId) as { run_id: string; session_key: string; started_at: number } | undefined;
+    if (!run) return false;
+
+    const ts = Date.parse(params.loggerTimestamp);
+    const loggerTs = Number.isFinite(ts) ? ts : run.started_at;
+    const sessionFileSuffix = `${params.sessionId}.jsonl`;
+    const row = this.db.prepare(`
+      SELECT id, run_id, message_id, source_kind, source_session_id, source_logger_ts
+      FROM conversation_turns
+      WHERE role = 'user'
+        AND session_file LIKE ?
+        AND content_preview LIKE ?
+        AND timestamp BETWEEN ? AND ?
+      ORDER BY ABS(timestamp - ?) ASC, id DESC
+      LIMIT 1
+    `).get(
+      `%${sessionFileSuffix}`,
+      `%${params.userTextPreview.replace(/[%_]/g, "")}%`,
+      loggerTs - 10 * 60_000,
+      loggerTs + 10 * 60_000,
+      loggerTs,
+    ) as {
+      id: number;
+      run_id: string;
+      message_id?: string | null;
+      source_kind?: string | null;
+      source_session_id?: string | null;
+      source_logger_ts?: string | null;
+    } | undefined;
+    if (!row) return false;
+
+    const existingPriority = this.getSourcePriority(row.source_kind ?? undefined);
+    const incomingPriority = this.getSourcePriority("llm_prompt_metadata");
+    if (row.run_id !== run.run_id && existingPriority >= incomingPriority) {
+      return false;
+    }
+
+    this.db.prepare(`
+      UPDATE conversation_turns
+      SET run_id = ?,
+          session_key = ?,
+          source_kind = CASE
+            WHEN source_kind IS NULL OR source_kind = 'session_fallback' THEN 'llm_prompt_metadata'
+            ELSE source_kind
+          END,
+          source_session_id = COALESCE(source_session_id, ?),
+          source_logger_ts = COALESCE(source_logger_ts, ?)
+      WHERE id = ?
+    `).run(
+      run.run_id,
+      run.session_key,
+      params.sessionId,
+      params.loggerTimestamp,
+      row.id,
     );
     return true;
   }
@@ -977,6 +1044,78 @@ export class Store {
     this.db.prepare(
       "UPDATE runs SET run_kind = ? WHERE run_id = ?",
     ).run(runKind, runId);
+  }
+
+  backfillRunKinds(opts?: { limit?: number }): {
+    scanned: number;
+    updated: number;
+    unchanged: number;
+  } {
+    const limit = Math.max(1, Math.min(1000, Math.floor(opts?.limit ?? 200)));
+    const rows = this.db.prepare(`
+      SELECT run_id, run_kind
+      FROM runs
+      WHERE run_kind IS NULL
+         OR run_id IN (
+           SELECT DISTINCT run_id
+           FROM conversation_turns
+         )
+      ORDER BY started_at DESC
+      LIMIT ?
+    `).all(limit) as Array<{
+      run_id: string;
+      run_kind?: string | null;
+    }>;
+
+    let updated = 0;
+    let unchanged = 0;
+
+    for (const row of rows) {
+      const promptPreview = this.db.prepare(`
+        SELECT user_prompt_preview
+        FROM llm_calls
+        WHERE run_id = ? AND user_prompt_preview IS NOT NULL AND TRIM(user_prompt_preview) != ''
+        ORDER BY started_at ASC
+        LIMIT 1
+      `).get(row.run_id) as { user_prompt_preview?: string | null } | undefined;
+
+      let inferredKind: "heartbeat" | "chat" | null = null;
+      if (promptPreview?.user_prompt_preview) {
+        inferredKind = classifyTurnKindFromPreview(promptPreview.user_prompt_preview);
+      } else {
+        const turnRows = this.db.prepare(`
+          SELECT content_preview
+          FROM conversation_turns
+          WHERE run_id = ?
+          ORDER BY turn_index ASC
+        `).all(row.run_id) as Array<{ content_preview?: string | null }>;
+        if (turnRows.length > 0) {
+          const kinds = turnRows.map((turn) => classifyTurnKindFromPreview(turn.content_preview));
+          const allHeartbeat = kinds.every((kind) => kind === "heartbeat");
+          const allChat = kinds.every((kind) => kind === "chat");
+          if (allHeartbeat) inferredKind = "heartbeat";
+          else if (allChat) inferredKind = "chat";
+        }
+      }
+
+      if (!inferredKind) {
+        unchanged++;
+        continue;
+      }
+      if (row.run_kind === inferredKind) {
+        unchanged++;
+        continue;
+      }
+
+      this.updateRunKind(row.run_id, inferredKind);
+      updated++;
+    }
+
+    return {
+      scanned: rows.length,
+      updated,
+      unchanged,
+    };
   }
 
   findRecentRunIdForSession(

@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Store } from "./store.js";
 import type { SSEManager } from "./sse-manager.js";
 import type { ClawLensConfig } from "./types.js";
-import { importLoggerMappings } from "./logger-import.js";
+import { importLoggerMappings, inspectLoggerImportDir } from "./logger-import.js";
 
 type PluginApi = {
   registerHttpRoute(opts: {
@@ -154,6 +154,41 @@ export function registerApiRoutes(api: PluginApi, store: Store, sseManager: SSEM
           }
           sendJson(res, 400, { error: message });
         }
+        return;
+      }
+
+      // /audit/logger/status
+      if (pathname.endsWith("/audit/logger/status")) {
+        const collectorConfig = pluginConfig?.collector ?? {};
+        const inspection = inspectLoggerImportDir(collectorConfig);
+        const latestImportState = inspection.latestFile
+          ? store.getLoggerImportState(inspection.latestFile)
+          : null;
+        sendJson(res, 200, {
+          configured: inspection.configured,
+          importDir: inspection.importDir,
+          exists: inspection.exists,
+          isDirectory: inspection.isDirectory,
+          latestFile: inspection.latestFile,
+          fileCount: inspection.jsonlFiles.length,
+          maxFileSizeMb: collectorConfig.loggerImportMaxFileSizeMb ?? 100,
+          files: inspection.jsonlFiles.slice(0, 10),
+          latestImportState,
+        });
+        return;
+      }
+
+      // /audit/backfill/run-kinds
+      if (pathname.endsWith("/audit/backfill/run-kinds")) {
+        if ((req.method ?? "GET").toUpperCase() !== "POST") {
+          sendJson(res, 405, { error: "method not allowed" });
+          return;
+        }
+        const limit = parseIntParam(url.searchParams.get("limit"), 200);
+        sendJson(res, 200, {
+          ok: true,
+          ...store.backfillRunKinds({ limit }),
+        });
         return;
       }
 

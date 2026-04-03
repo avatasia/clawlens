@@ -21,3 +21,9 @@
 
 - 想看当前状态，请先看 `docs/` 顶层无日期文档
 - 想追溯变更过程，请从本文件进入 archive
+
+## 当前主题 history
+
+- [CHAT_AUDIT_HISTORY.md](CHAT_AUDIT_HISTORY.md)
+- [CHAT_AUDIT_REMAINING_WORK_HISTORY.md](CHAT_AUDIT_REMAINING_WORK_HISTORY.md)
+- [CHAT_AUDIT_ENHANCEMENTS_HISTORY.md](CHAT_AUDIT_ENHANCEMENTS_HISTORY.md)
