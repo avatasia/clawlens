@@ -15,6 +15,7 @@ Chat Audit 主链路当前已经可用：
 - chat 侧栏默认排除 heartbeat
 - 运行中 detail 与增量刷新链路已打通
 - logger import 已具备工程入口，但属于增强链路
+- 与 Chat Audit 正确性强相关的上游 `toolResult replay pollution` 第一阶段治理已完成验证并形成 patch
 
 ## 当前架构边界
 
@@ -43,11 +44,18 @@ Chat Audit 依赖三条主链：
 - 前端交互体验持续优化
 - 历史元数据有限补强的后续扩展
 
+不再列为当前剩余工作的事项：
+
+- OpenClaw `stale diagnostic toolResult replay` 第一阶段治理
+  - 该项已完成本地原型、完整包远端验证与 patch 导出
+
 ## 推荐阅读
 
 - 当前架构：
   [architecture.md](architecture.md)
 - 当前长期增强项：
   [ANALYSIS_CHAT_AUDIT_ENHANCEMENTS.md](ANALYSIS_CHAT_AUDIT_ENHANCEMENTS.md)
+- 上游 replay 治理历史：
+  [OPENCLAW_STALE_TOOL_RESULT_REPLAY_MITIGATION_HISTORY.md](archive/history/OPENCLAW_STALE_TOOL_RESULT_REPLAY_MITIGATION_HISTORY.md)
 - 历史记录入口：
   [CHAT_AUDIT_HISTORY.md](archive/history/CHAT_AUDIT_HISTORY.md)

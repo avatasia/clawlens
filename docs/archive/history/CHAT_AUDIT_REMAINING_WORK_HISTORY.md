@@ -12,6 +12,21 @@
 
 该主题对应的 Phase 执行链已收口，不再保留顶层当前主文档。
 
+## 2026-04-04 完工节点
+
+与 Chat Audit 正确性直接相关的一项上游依赖治理已完成：
+
+- OpenClaw `stale diagnostic toolResult replay mitigation`
+
+该成果当前已进入：
+
+- 架构回填：
+  [architecture.md](../../architecture.md)
+- OpenClaw 主题 history：
+  [OPENCLAW_STALE_TOOL_RESULT_REPLAY_MITIGATION_HISTORY.md](OPENCLAW_STALE_TOOL_RESULT_REPLAY_MITIGATION_HISTORY.md)
+
+因此，Chat Audit 的“剩余工作”当前不再包含该 Phase 1。
+
 后续长期增强项已转入：
 
 - [ANALYSIS_CHAT_AUDIT_ENHANCEMENTS.md](../../ANALYSIS_CHAT_AUDIT_ENHANCEMENTS.md)

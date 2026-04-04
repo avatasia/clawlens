@@ -56,6 +56,10 @@ llm-api-logger files
   -> logger-message-mapper
   -> logger-import
   -> Store source upgrade
+
+Reference hardening in upstream OpenClaw:
+  diagnostic toolResult tagging
+  -> stale replay omission before model input
 ```
 
 主要模块：
@@ -96,11 +100,44 @@ llm-api-logger files
 |---|---|
 | llm-api-logger `.jsonl` | 从 prompt 中提取 `message_id -> runId`，提升消息映射精度 |
 
+### 4.1 上游上下文治理基座
+
+当前已完成并验证的一项上游基座工作是：
+
+- OpenClaw `stale diagnostic toolResult replay mitigation`
+
+该机制不属于 ClawLens 插件运行时主链，但已经成为当前审计与验证体系的重要参考前提。
+
+核心逻辑是：
+
+1. 在高时效性诊断型 `toolResult` 源头打标
+2. 在后续 replay 前识别旧结果
+3. 满足失效条件时，不再把旧原文继续喂给模型
+
+当前采用的最小元数据模型包括：
+
+- `__openclaw.transient = true`
+- `__openclaw.diagnosticType = <type>`
+
+当前已验证的最小失效规则包括：
+
+1. `Date.now() - timestamp > 1 hour`
+2. 同类 `diagnosticType` 已出现更近的一条结果
+   - 新结果可以是成功
+   - 也可以是失败、`(no output)` 或空内容
+
+处理方式是：
+
+- 保留 transcript 审计链
+- 只在 replay 输入侧做摘要化替换
+- 不改写原始历史落盘
+
 ### 关键认识
 
 - transcript update 是当前消息级能力的核心，不再只是 run 结束后的附属数据
 - `llm_output` / `after_tool_call` 必须稳定落库，否则 run detail 会只剩 turns
 - logger 导入不是基础链路，而是后续增强链路
+- 若上游 OpenClaw 不约束旧诊断结果 replay，模型后续轮次仍可能在脏历史里做错误延续
 
 ## 5. 核心数据模型
 
