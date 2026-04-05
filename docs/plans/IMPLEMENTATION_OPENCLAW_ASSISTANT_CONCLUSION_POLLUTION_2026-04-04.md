@@ -61,6 +61,26 @@
 - 很容易被旧结论污染
 - 可以通过 fresh 工具检查重新确认
 
+第一版要明确：
+
+- 高风险判断不是按“命令名是否为 `openclaw`”来做
+- 而是按“这次查询是否在回答当前环境状态”来做
+
+因此，以下来源都可能落入同一高风险集合：
+
+1. `openclaw` CLI 查询
+   - `openclaw plugins list`
+   - `openclaw status`
+   - `openclaw config get`
+2. 环境快照读取/解析命令
+   - `cat`
+   - `read`
+   - `grep`
+   - `rg`
+   - `jq`
+   - `find`
+   - `ls`
+
 ## 核心策略
 
 ### Step 1：识别高风险问题
@@ -89,14 +109,26 @@
 - 当前轮没有 fresh tool check
 - 当前上下文中与该问题相关的信息主要来自旧 assistant 结论
 
-第一版必须把这一步写成显式算法，而不是概念判断。建议最低标准是：
+第一版必须把这一步写成显式算法，而不是概念判断。
 
-1. 先把高风险问题映射到有限的 `diagnosticType`
-2. 遍历最近 `N` 条历史消息
-3. 查找是否存在：
-   - 带对应 `diagnosticType` 的 fresh `toolResult`
-   - 且时间距离未超过阈值
-4. 若不存在，则判定 freshness 不足
+当前建议的最小算法如下：
+
+1. 将当前问题映射到有限的 `diagnosticType`
+2. 遍历最近 `N = 50` 条历史消息
+3. 只检查满足以下条件的消息：
+   - `role = toolResult`
+   - `__openclaw.transient = true`
+   - `diagnosticType` 与当前问题匹配
+4. 若存在一条同时满足以下条件的结果，则视为已有 fresh 证据：
+   - `__openclaw.replayOmitted !== true`
+   - `now - timestamp <= 1 hour`
+5. 若不存在，则判定 freshness 不足
+
+第一版明确不把以下内容当 fresh 证据：
+
+- 普通 assistant 文本结论
+- 无结构化 `diagnosticType` 的旧工具输出
+- 已被 omitted 的历史诊断结果
 
 当前仍待重设计的是：
 
@@ -121,6 +153,23 @@
 
 因为现有 `run/attempt.ts` 的单次流式执行链并没有这个独立控制层。
 
+第一版当前更具体的目标不是“强制执行工具”，而是：
+
+- 在 system prompt 中加入一段非常短的约束
+- 明确要求：
+  - 对当前高风险问题
+  - 如果没有 fresh 证据
+  - 必须先调用对应工具核验
+  - 不得仅依据历史 assistant 结论直接回答
+
+也就是说，第一版的 gate 本质上是：
+
+- `prompt-level hard guidance`
+
+而不是：
+
+- runtime-level hard interception
+
 ### Step 4：保持对正常对话的最小影响
 
 该 gate 只应作用于高风险问题。
@@ -135,12 +184,16 @@
 
 按当前代码事实，第一版只应考虑以下入口：
 
-1. `before_agent_start` / `before_model_resolve`
-   - 只能做 prompt / model 级引导
-   - 不能直接代替模型执行工具
-2. system prompt override
-   - 可用于附加“高风险问题必须先核验”的动态约束
-3. `sanitizeSessionHistory(...)`
+1. `before_prompt_build`
+   - 可基于当前 prompt + 历史消息做问题识别
+   - 可返回 `prependSystemContext` / `appendSystemContext`
+2. `before_agent_start`
+   - 作为兼容入口，可提供同类 prompt 级附加约束
+3. `resolvePromptBuildHookResult(...)`
+   - 当前会合并 `before_prompt_build` 与 `before_agent_start` 的结果
+4. `composeSystemPromptWithHookContext(...)`
+   - 当前会把 hook 注入内容并入最终 system prompt
+5. `sanitizeSessionHistory(...)`
    - 适合继续治理 replay 输入
    - 不适合直接解决“当前轮必须先查再答”
 
@@ -149,6 +202,53 @@
 - 独立 planning 层
 - 独立 dispatch 层
 - 一个能在模型外部拦截问题并无声执行工具的前置路由器
+
+## 当前推荐重设计路线
+
+第一版当前最可行的路线是：
+
+### Route A：Hook 驱动的 prompt-level freshness gate
+
+1. 在 `before_prompt_build` 或 `before_agent_start` 中识别高风险问题
+2. 结合当前历史消息，判断是否缺少 fresh 证据
+3. 若不足，则通过：
+   - `prependSystemContext`
+   - 或 `appendSystemContext`
+   注入一段强约束，要求模型本轮必须先使用指定工具核验
+4. 由模型正常发起 tool call
+5. 用 fresh 结果完成回答
+
+这条路线当前的优点是：
+
+- 不需要增加新的运行控制层
+- 不破坏单次流式 agent 循环
+- 与现有 hook / system prompt 合并机制一致
+
+这条路线当前的风险是：
+
+- prompt 注入只是“强约束”，不是系统级硬阻断
+- 仍要验证模型在该约束下是否足够稳定地先查后答
+
+第一版建议的注入内容也应限制在最小模板，不要做大段提示词工程。目标只保留：
+
+1. 当前问题属于高风险环境问题
+2. 你当前没有 fresh 证据
+3. 必须先调用指定类型工具核验
+4. 不得仅依据历史 assistant 结论回答
+
+在进入代码原型前，建议先固定：
+
+1. 单一模板文本
+2. 问题类型 -> `diagnosticType` 映射表
+3. 最小观测日志字段
+
+### Route B：暂不进入
+
+以下路线当前不建议进入第一版：
+
+- 系统外部静默执行工具
+- 直接重写 assistant history
+- 对 assistant 文本做大范围 replay 降权
 ## 推荐实现边界
 
 第一版原则是：
@@ -178,6 +278,7 @@
 
 - 只在 freshness 明显不足时触发
 - 当前轮已有 fresh 结果则不再重复查
+- 高风险问题类型必须保持小集合
 
 ### 风险 3：影响多轮连续任务流畅性
 
@@ -185,6 +286,14 @@
 
 - 当前轮已有 fresh 证据时，不打断流程
 - 不把 gate 扩展到所有 assistant 消息
+
+### 风险 4：Prompt 注入被原有 system prompt 稀释
+
+缓解：
+
+- 只使用短、强约束、任务相关的注入文本
+- 优先使用 `prependSystemContext`
+- 第一版必须验证注入后的最终 prompt 确实包含该约束
 
 ## 验证标准
 
@@ -196,11 +305,42 @@
    模型不再直接复述旧错误结论
 3. 普通非高风险问题不被额外打断
 4. 当前轮已经有 fresh 结果时，不重复触发检查
+5. `prependSystemContext` / `appendSystemContext` 注入后，不会破坏原有 system prompt 结构
+6. 注入后的约束在当前 provider 下足以稳定引导工具调用
 
 另外在进入代码实现前，还必须补充：
 
 5. 具体接入函数与文件路径
 6. 如何在不引入外部控制层的前提下，把约束传递给当前轮模型
+7. 如何避免注入内容被已有 system prompt / skills / workspace notes 稀释
+
+## 当前建议的具体接入点
+
+如果继续推进到代码原型，第一批应只尝试以下文件：
+
+1. `projects-ref/openclaw/src/agents/pi-embedded-runner/run/attempt.prompt-helpers.ts`
+   - `resolvePromptBuildHookResult(...)`
+2. `projects-ref/openclaw/src/agents/pi-embedded-runner/run/attempt.ts`
+   - `composeSystemPromptWithHookContext(...)` 的应用链
+3. `projects-ref/openclaw/src/plugins/hooks.ts`
+   - `before_prompt_build` / `before_agent_start` 的结果拼装
+
+当前不应在别处先开新控制层。
+
+## 当前建议的第一批原型范围
+
+如果继续进入最小代码原型，第一批只建议做：
+
+1. 高风险问题 -> `diagnosticType` 映射表
+2. 最近 `50` 条历史消息的 fresh 证据扫描
+3. `prependSystemContext` 最小约束注入
+4. 日志与观测点
+
+第一批不建议做：
+
+- assistant 结论结构化打标
+- compaction 同步
+- 泛化问题分类
 
 ## 回退策略
 
