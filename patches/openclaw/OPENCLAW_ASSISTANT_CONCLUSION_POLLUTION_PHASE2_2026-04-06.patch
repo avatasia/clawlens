@@ -1,0 +1,1294 @@
+diff --git a/src/agents/pi-embedded-runner.sanitize-session-history.test.ts b/src/agents/pi-embedded-runner.sanitize-session-history.test.ts
+index 0a24e5fe08..69109fdc06 100644
+--- a/src/agents/pi-embedded-runner.sanitize-session-history.test.ts
++++ b/src/agents/pi-embedded-runner.sanitize-session-history.test.ts
+@@ -772,6 +772,120 @@ describe("sanitizeSessionHistory", () => {
+     ).toBe(false);
+   });
+ 
++  it("omits stale transient diagnostic tool results older than the replay threshold", async () => {
++    setNonGoogleModelApi();
++    const oldTimestamp = Date.now() - 2 * 60 * 60 * 1000;
++    const messages = castAgentMessages([
++      makeAssistantMessage([{ type: "toolCall", id: "call_old", name: "exec", arguments: {} }], {
++        stopReason: "toolUse",
++        timestamp: oldTimestamp - 1,
++      }),
++      {
++        role: "toolResult",
++        toolCallId: "call_old",
++        toolName: "exec",
++        content: [{ type: "text", text: "old plugin output" }],
++        isError: false,
++        timestamp: oldTimestamp,
++        __openclaw: {
++          transient: true,
++          diagnosticType: "openclaw.plugins_list",
++          taggedAt: oldTimestamp,
++          sourceTool: "exec",
++        },
++      },
++    ]);
++
++    const result = await sanitizeSessionHistory({
++      messages,
++      modelApi: "openai-responses",
++      provider: "openai",
++      sessionManager: mockSessionManager,
++      sessionId: TEST_SESSION_ID,
++    });
++
++    expect(result[1]).toMatchObject({
++      role: "toolResult",
++      content: [
++        {
++          type: "text",
++          text: "[Previous environment diagnostic output omitted from replay for accuracy.]",
++        },
++      ],
++      __openclaw: expect.objectContaining({
++        replayOmitted: true,
++        diagnosticType: "openclaw.plugins_list",
++      }),
++    });
++  });
++
++  it("omits older transient diagnostic tool results when a newer result of the same type exists", async () => {
++    setNonGoogleModelApi();
++    const older = Date.now() - 10 * 60 * 1000;
++    const newer = Date.now() - 30 * 1000;
++    const messages = castAgentMessages([
++      makeAssistantMessage([{ type: "toolCall", id: "call_old", name: "exec", arguments: {} }], {
++        stopReason: "toolUse",
++        timestamp: older - 1,
++      }),
++      {
++        role: "toolResult",
++        toolCallId: "call_old",
++        toolName: "exec",
++        content: "plugins list old output",
++        isError: false,
++        timestamp: older,
++        __openclaw: {
++          transient: true,
++          diagnosticType: "openclaw.plugins_list",
++          taggedAt: older,
++          sourceTool: "exec",
++        },
++      },
++      makeAssistantMessage([{ type: "toolCall", id: "call_new", name: "exec", arguments: {} }], {
++        stopReason: "toolUse",
++        timestamp: newer - 1,
++      }),
++      {
++        role: "toolResult",
++        toolCallId: "call_new",
++        toolName: "exec",
++        content: "(no output)",
++        isError: false,
++        timestamp: newer,
++        __openclaw: {
++          transient: true,
++          diagnosticType: "openclaw.plugins_list",
++          taggedAt: newer,
++          sourceTool: "exec",
++        },
++      },
++    ]);
++
++    const result = await sanitizeSessionHistory({
++      messages,
++      modelApi: "openai-responses",
++      provider: "openai",
++      sessionManager: mockSessionManager,
++      sessionId: TEST_SESSION_ID,
++    });
++
++    expect(result[1]).toMatchObject({
++      role: "toolResult",
++      content: "[Previous environment diagnostic output omitted from replay for accuracy.]",
++      __openclaw: expect.objectContaining({
++        replayOmitted: true,
++      }),
++    });
++    expect(result[3]).toMatchObject({
++      role: "toolResult",
++      content: "(no output)",
++    });
++    expect((result[3] as { __openclaw?: { replayOmitted?: boolean } }).__openclaw?.replayOmitted).not.toBe(
++      true,
++    );
++  });
++
+   it("preserves latest assistant thinking blocks for github-copilot models", async () => {
+     setNonGoogleModelApi();
+ 
+diff --git a/src/agents/pi-embedded-runner/google.ts b/src/agents/pi-embedded-runner/google.ts
+index 39ff44b305..381174e3ff 100644
+--- a/src/agents/pi-embedded-runner/google.ts
++++ b/src/agents/pi-embedded-runner/google.ts
+@@ -31,6 +31,11 @@ import {
+   stripToolResultDetails,
+   sanitizeToolUseResultPairing,
+ } from "../session-transcript-repair.js";
++import {
++  getToolResultReplayMetadata,
++  replaceToolResultReplayContent,
++  STALE_TOOL_RESULT_REPLAY_THRESHOLD_MS,
++} from "../tool-result-replay-metadata.js";
+ import type { AnyAgentTool } from "../tools/common.js";
+ import type { TranscriptPolicy } from "../transcript-policy.js";
+ import { resolveTranscriptPolicy } from "../transcript-policy.js";
+@@ -376,6 +381,48 @@ function ensureAssistantUsageSnapshots(messages: AgentMessage[]): AgentMessage[]
+   return touched ? out : messages;
+ }
+ 
++function omitStaleTransientDiagnosticToolResults(messages: AgentMessage[]): AgentMessage[] {
++  const latestByDiagnosticType = new Map<string, number>();
++  for (let i = 0; i < messages.length; i += 1) {
++    const meta = getToolResultReplayMetadata(messages[i] as AgentMessage);
++    if (!meta) {
++      continue;
++    }
++    latestByDiagnosticType.set(meta.diagnosticType, i);
++  }
++
++  if (latestByDiagnosticType.size === 0) {
++    return messages;
++  }
++
++  const now = Date.now();
++  let touched = false;
++  const out = [...messages];
++  for (let i = 0; i < out.length; i += 1) {
++    const message = out[i] as AgentMessage;
++    const meta = getToolResultReplayMetadata(message);
++    if (!meta) {
++      continue;
++    }
++    const latestIndex = latestByDiagnosticType.get(meta.diagnosticType) ?? i;
++    const timestamp = parseMessageTimestamp(
++      (message as { timestamp?: unknown }).timestamp ?? meta.taggedAt ?? null,
++    );
++    const staleByNewerResult = latestIndex > i;
++    const staleByAge =
++      timestamp !== null && now - timestamp > STALE_TOOL_RESULT_REPLAY_THRESHOLD_MS;
++    if (!staleByNewerResult && !staleByAge) {
++      continue;
++    }
++    out[i] = replaceToolResultReplayContent(
++      message,
++      "[Previous environment diagnostic output omitted from replay for accuracy.]",
++    );
++    touched = true;
++  }
++  return touched ? out : messages;
++}
++
+ export function findUnsupportedSchemaKeywords(schema: unknown, path: string): string[] {
+   if (!schema || typeof schema !== "object") {
+     return [];
+@@ -674,8 +721,11 @@ export async function sanitizeSessionHistory(params: {
+       })
+     : sanitizedToolCalls;
+   const sanitizedToolResults = stripToolResultDetails(repairedTools);
++  const sanitizedTransientDiagnostics = omitStaleTransientDiagnosticToolResults(
++    sanitizedToolResults,
++  );
+   const sanitizedCompactionUsage = ensureAssistantUsageSnapshots(
+-    stripStaleAssistantUsageBeforeLatestCompaction(sanitizedToolResults),
++    stripStaleAssistantUsageBeforeLatestCompaction(sanitizedTransientDiagnostics),
+   );
+ 
+   const isOpenAIResponsesApi =
+diff --git a/src/agents/pi-embedded-runner/run/attempt.prompt-helpers.ts b/src/agents/pi-embedded-runner/run/attempt.prompt-helpers.ts
+index 7748d09f43..9eb3e20733 100644
+--- a/src/agents/pi-embedded-runner/run/attempt.prompt-helpers.ts
++++ b/src/agents/pi-embedded-runner/run/attempt.prompt-helpers.ts
+@@ -6,6 +6,10 @@ import type {
+ } from "../../../plugins/types.js";
+ import { isCronSessionKey, isSubagentSessionKey } from "../../../routing/session-key.js";
+ import { joinPresentTextSegments } from "../../../shared/text/join-segments.js";
++import {
++  resolveAssistantConclusionFreshnessGate,
++  summarizeAssistantConclusionFreshnessGateLog,
++} from "../../assistant-conclusion-freshness-gate.js";
+ import { resolveEffectiveToolFsWorkspaceOnly } from "../../tool-fs-policy.js";
+ import type { CompactEmbeddedPiSessionParams } from "../compact.js";
+ import { buildEmbeddedCompactionRuntimeContext } from "../compaction-runtime-context.js";
+@@ -32,6 +36,11 @@ export async function resolvePromptBuildHookResult(params: {
+   hookRunner?: PromptBuildHookRunner | null;
+   legacyBeforeAgentStartResult?: PluginHookBeforeAgentStartResult;
+ }): Promise<PluginHookBeforePromptBuildResult> {
++  const freshnessGateResult = resolveAssistantConclusionFreshnessGate({
++    prompt: params.prompt,
++    messages: params.messages,
++  });
++  log.debug(summarizeAssistantConclusionFreshnessGateLog(freshnessGateResult));
+   const promptBuildResult = params.hookRunner?.hasHooks("before_prompt_build")
+     ? await params.hookRunner
+         .runBeforePromptBuild(
+@@ -71,6 +80,7 @@ export async function resolvePromptBuildHookResult(params: {
+       legacyResult?.prependContext,
+     ]),
+     prependSystemContext: joinPresentTextSegments([
++      freshnessGateResult.prependSystemContext,
+       promptBuildResult?.prependSystemContext,
+       legacyResult?.prependSystemContext,
+     ]),
+diff --git a/src/agents/pi-embedded-runner/run/attempt.test.ts b/src/agents/pi-embedded-runner/run/attempt.test.ts
+index 44b55e5781..a5f4e91986 100644
+--- a/src/agents/pi-embedded-runner/run/attempt.test.ts
++++ b/src/agents/pi-embedded-runner/run/attempt.test.ts
+@@ -8,6 +8,10 @@ import {
+ } from "../../../plugin-sdk/ollama.js";
+ import { appendBootstrapPromptWarning } from "../../bootstrap-budget.js";
+ import { buildAgentSystemPrompt } from "../../system-prompt.js";
++import {
++  ASSISTANT_FRESHNESS_GATE_TEMPLATE_A,
++  resolveAssistantConclusionFreshnessGate,
++} from "../../assistant-conclusion-freshness-gate.js";
+ import {
+   buildAfterTurnRuntimeContext,
+   composeSystemPromptWithHookContext,
+@@ -141,6 +145,259 @@ describe("resolvePromptBuildHookResult", () => {
+     expect(result.prependSystemContext).toBe("prompt prepend\n\nlegacy prepend");
+     expect(result.appendSystemContext).toBe("prompt append\n\nlegacy append");
+   });
++
++  it("prepends internal freshness gate before hook-provided system context when fresh evidence is missing", async () => {
++    const hookRunner = {
++      hasHooks: vi.fn(() => true),
++      runBeforePromptBuild: vi.fn(async () => ({
++        prependSystemContext: "prompt prepend",
++      })),
++      runBeforeAgentStart: vi.fn(async () => undefined),
++    };
++
++    const result = await resolvePromptBuildHookResult({
++      prompt: "What plugins are currently installed?",
++      messages: [],
++      hookCtx: {},
++      hookRunner,
++    });
++
++    expect(result.prependSystemContext).toBe(
++      `${ASSISTANT_FRESHNESS_GATE_TEMPLATE_A}\n\nprompt prepend`,
++    );
++  });
++
++  it("does not inject freshness gate when fresh structured evidence already exists", async () => {
++    const now = Date.now();
++    const messages = [
++      {
++        role: "toolResult",
++        toolCallId: "call_1",
++        toolName: "exec",
++        content: "plugin output",
++        timestamp: now - 1_000,
++        __openclaw: {
++          transient: true,
++          diagnosticType: "openclaw.plugins_list",
++          taggedAt: now - 1_000,
++          sourceTool: "exec",
++        },
++      },
++    ];
++
++    const result = await resolvePromptBuildHookResult({
++      prompt: "What plugins are currently installed?",
++      messages,
++      hookCtx: {},
++      hookRunner: undefined,
++    });
++
++    expect(result.prependSystemContext).toBeUndefined();
++  });
++});
++
++describe("resolveAssistantConclusionFreshnessGate", () => {
++  it("classifies plugin install questions and injects gate when no evidence exists", () => {
++    const result = resolveAssistantConclusionFreshnessGate({
++      prompt: "What plugins are installed right now?",
++      messages: [],
++      now: 1_000_000,
++    });
++
++    expect(result).toMatchObject({
++      questionType: "plugin_install_state",
++      diagnosticType: "openclaw.plugins_list",
++      freshnessState: "missing",
++      prependSystemContext: ASSISTANT_FRESHNESS_GATE_TEMPLATE_A,
++      templateId: "A",
++    });
++  });
++
++  it("classifies config questions and treats old evidence as stale", () => {
++    const now = 2_000_000;
++    const result = resolveAssistantConclusionFreshnessGate({
++      prompt: "Does the config contain this key?",
++      now,
++      messages: [
++        {
++          role: "toolResult",
++          toolCallId: "call_cfg",
++          toolName: "read",
++          content: "config json",
++          timestamp: now - 2 * 60 * 60 * 1000,
++          __openclaw: {
++            transient: true,
++            diagnosticType: "openclaw.config_snapshot",
++            taggedAt: now - 2 * 60 * 60 * 1000,
++            sourceTool: "read",
++          },
++        },
++      ],
++    });
++
++    expect(result).toMatchObject({
++      questionType: "config_key_presence",
++      diagnosticType: "openclaw.config_snapshot",
++      freshnessState: "stale",
++      prependSystemContext: ASSISTANT_FRESHNESS_GATE_TEMPLATE_A,
++    });
++  });
++
++  it("treats recent gateway config.get history as fresh evidence via toolCall fallback", () => {
++    const now = 4_000_000;
++    const result = resolveAssistantConclusionFreshnessGate({
++      prompt: "当前配置里有没有 plugins.installs.openclaw-qqbot 这一项？",
++      now,
++      messages: [
++        {
++          role: "assistant",
++          content: [
++            {
++              type: "toolCall",
++              id: "call_cfg_gateway_1",
++              name: "gateway",
++              arguments: {
++                action: "config.get",
++                path: "plugins.installs",
++              },
++            },
++          ],
++        },
++        {
++          role: "toolResult",
++          toolCallId: "call_cfg_gateway_1",
++          toolName: "gateway",
++          content: [
++            {
++              type: "text",
++              text: "{\"ok\":true}",
++            },
++          ],
++          details: {
++            ok: true,
++            result: {
++              path: "plugins.installs",
++            },
++          },
++          timestamp: now - 5_000,
++        },
++      ],
++    });
++
++    expect(result).toMatchObject({
++      questionType: "config_key_presence",
++      diagnosticType: "openclaw.config_snapshot",
++      freshnessState: "fresh",
++    });
++    expect(result.prependSystemContext).toBeUndefined();
++  });
++
++  it("treats recent gateway plugins.entries history as fresh evidence via toolCall fallback", () => {
++    const now = 5_000_000;
++    const result = resolveAssistantConclusionFreshnessGate({
++      prompt: "qqbot 现在在 plugins.entries 里还是 enabled 吗？",
++      now,
++      messages: [
++        {
++          role: "assistant",
++          content: [
++            {
++              type: "toolCall",
++              id: "call_plugins_entries_1",
++              name: "gateway",
++              arguments: {
++                action: "config.get",
++                path: "plugins.entries",
++              },
++            },
++          ],
++        },
++        {
++          role: "toolResult",
++          toolCallId: "call_plugins_entries_1",
++          toolName: "gateway",
++          content: [
++            {
++              type: "text",
++              text: "{\"ok\":true}",
++            },
++          ],
++          details: {
++            ok: true,
++            result: {
++              path: "plugins.entries",
++            },
++          },
++          timestamp: now - 10_000,
++        },
++      ],
++    });
++
++    expect(result).toMatchObject({
++      questionType: "plugin_install_state",
++      diagnosticType: "openclaw.plugins_list",
++      freshnessState: "fresh",
++    });
++    expect(result.prependSystemContext).toBeUndefined();
++  });
++
++  it("ignores replay-omitted evidence when evaluating freshness", () => {
++    const now = 3_000_000;
++    const result = resolveAssistantConclusionFreshnessGate({
++      prompt: "What plugins are installed right now?",
++      now,
++      messages: [
++        {
++          role: "toolResult",
++          toolCallId: "call_1",
++          toolName: "exec",
++          content: "old plugin output",
++          timestamp: now - 5_000,
++          __openclaw: {
++            transient: true,
++            diagnosticType: "openclaw.plugins_list",
++            taggedAt: now - 5_000,
++            sourceTool: "exec",
++            replayOmitted: true,
++          },
++        },
++      ],
++    });
++
++    expect(result.freshnessState).toBe("stale");
++    expect(result.prependSystemContext).toBe(ASSISTANT_FRESHNESS_GATE_TEMPLATE_A);
++  });
++
++  it("treats tagged gateway config.get evidence as fresh for config questions", () => {
++    const now = 4_000_000;
++    const result = resolveAssistantConclusionFreshnessGate({
++      prompt: "Does the config currently contain this key?",
++      now,
++      messages: [
++        {
++          role: "toolResult",
++          toolCallId: "call_gateway_cfg",
++          toolName: "gateway",
++          content: "config json",
++          timestamp: now - 5_000,
++          __openclaw: {
++            transient: true,
++            diagnosticType: "openclaw.config_snapshot",
++            taggedAt: now - 5_000,
++            sourceTool: "gateway",
++          },
++        },
++      ],
++    });
++
++    expect(result).toMatchObject({
++      questionType: "config_key_presence",
++      diagnosticType: "openclaw.config_snapshot",
++      freshnessState: "fresh",
++      matchedTimestamp: now - 5_000,
++    });
++    expect(result.prependSystemContext).toBeUndefined();
++  });
+ });
+ 
+ describe("composeSystemPromptWithHookContext", () => {
+diff --git a/src/agents/pi-embedded-runner/run/attempt.ts b/src/agents/pi-embedded-runner/run/attempt.ts
+index 70de5b13d8..ca60b261ef 100644
+--- a/src/agents/pi-embedded-runner/run/attempt.ts
++++ b/src/agents/pi-embedded-runner/run/attempt.ts
+@@ -762,7 +762,7 @@ export async function runEmbeddedAttempt(
+       await prewarmSessionFile(params.sessionFile);
+       sessionManager = guardSessionManager(SessionManager.open(params.sessionFile), {
+         agentId: sessionAgentId,
+-        sessionKey: params.sessionKey,
++        sessionKey: params.sessionKey ?? params.sessionId,
+         inputProvenance: params.inputProvenance,
+         allowSyntheticToolResults: transcriptPolicy.allowSyntheticToolResults,
+         allowedToolNames,
+diff --git a/src/agents/pi-embedded-subscribe.handlers.tools.ts b/src/agents/pi-embedded-subscribe.handlers.tools.ts
+index 693c694a91..7721a9b5b3 100644
+--- a/src/agents/pi-embedded-subscribe.handlers.tools.ts
++++ b/src/agents/pi-embedded-subscribe.handlers.tools.ts
+@@ -26,6 +26,7 @@ import {
+ } from "./pi-embedded-subscribe.tools.js";
+ import { inferToolMetaFromArgs } from "./pi-embedded-utils.js";
+ import { consumeAdjustedParamsForToolCall } from "./pi-tools.before-tool-call.js";
++import { recordPendingToolResultReplayMetadata } from "./tool-result-replay-metadata.js";
+ import { buildToolMutationState, isSameToolMutationAction } from "./tool-mutation.js";
+ import { normalizeToolName } from "./tool-policy.js";
+ 
+@@ -360,6 +361,12 @@ export function handleToolExecutionStart(
+ 
+     // Track start time and args for after_tool_call hook
+     toolStartData.set(buildToolStartKey(runId, toolCallId), { startTime: Date.now(), args });
++    recordPendingToolResultReplayMetadata({
++      sessionKey: ctx.params.sessionKey ?? ctx.params.sessionId,
++      toolCallId,
++      toolName,
++      args,
++    });
+ 
+     if (toolName === "read") {
+       const record = args && typeof args === "object" ? (args as Record<string, unknown>) : {};
+diff --git a/src/agents/session-tool-result-guard.test.ts b/src/agents/session-tool-result-guard.test.ts
+index 36e06d52de..9c84b0fd5a 100644
+--- a/src/agents/session-tool-result-guard.test.ts
++++ b/src/agents/session-tool-result-guard.test.ts
+@@ -3,6 +3,7 @@ import { SessionManager } from "@mariozechner/pi-coding-agent";
+ import { describe, expect, it } from "vitest";
+ import { installSessionToolResultGuard } from "./session-tool-result-guard.js";
+ import { castAgentMessage } from "./test-helpers/agent-message-fixtures.js";
++import { recordPendingToolResultReplayMetadata } from "./tool-result-replay-metadata.js";
+ 
+ type AppendMessage = Parameters<SessionManager["appendMessage"]>[0];
+ 
+@@ -180,6 +181,161 @@ describe("installSessionToolResultGuard", () => {
+     expect(messages[1]?.toolName).toBe("read");
+   });
+ 
++  it("tags persisted diagnostic exec tool results for replay policy", () => {
++    const sm = SessionManager.inMemory();
++    installSessionToolResultGuard(sm, { sessionKey: "agent:main:main" });
++
++    sm.appendMessage(
++      asAppendMessage({
++        role: "assistant",
++        content: [{ type: "toolCall", id: "call_1", name: "exec", arguments: {} }],
++      }),
++    );
++    recordPendingToolResultReplayMetadata({
++      sessionKey: "agent:main:main",
++      toolCallId: "call_1",
++      toolName: "exec",
++      args: { command: "openclaw plugins list" },
++    });
++    sm.appendMessage(
++      asAppendMessage({
++        role: "toolResult",
++        toolCallId: "call_1",
++        toolName: "exec",
++        content: [{ type: "text", text: "plugin output" }],
++        isError: false,
++        timestamp: Date.now(),
++      }),
++    );
++
++    const messages = expectPersistedRoles(sm, ["assistant", "toolResult"]) as Array<
++      AgentMessage & { __openclaw?: Record<string, unknown> }
++    >;
++    expect(messages[1]?.__openclaw?.transient).toBe(true);
++    expect(messages[1]?.__openclaw?.diagnosticType).toBe("openclaw.plugins_list");
++    expect(messages[1]?.__openclaw?.sourceTool).toBe("exec");
++  });
++
++  it("tags persisted gateway config.get plugins.entries tool results for replay policy", () => {
++    const sm = SessionManager.inMemory();
++    installSessionToolResultGuard(sm, { sessionKey: "agent:main:main" });
++
++    sm.appendMessage(
++      asAppendMessage({
++        role: "assistant",
++        content: [{ type: "toolCall", id: "call_gateway_entries", name: "gateway", arguments: {} }],
++      }),
++    );
++    recordPendingToolResultReplayMetadata({
++      sessionKey: "agent:main:main",
++      toolCallId: "call_gateway_entries",
++      toolName: "gateway",
++      args: { action: "config.get", path: "plugins.entries" },
++    });
++    sm.appendMessage(
++      asAppendMessage({
++        role: "toolResult",
++        toolCallId: "call_gateway_entries",
++        toolName: "gateway",
++        content: [{ type: "text", text: "{\"ok\":true}" }],
++        isError: false,
++        timestamp: Date.now(),
++      }),
++    );
++
++    const messages = expectPersistedRoles(sm, ["assistant", "toolResult"]) as Array<
++      AgentMessage & { __openclaw?: Record<string, unknown> }
++    >;
++    expect(messages[1]?.__openclaw?.transient).toBe(true);
++    expect(messages[1]?.__openclaw?.diagnosticType).toBe("openclaw.plugins_list");
++    expect(messages[1]?.__openclaw?.sourceTool).toBe("gateway");
++  });
++
++  it("tags persisted gateway config.get plugins.installs tool results for replay policy", () => {
++    const sm = SessionManager.inMemory();
++    installSessionToolResultGuard(sm, { sessionKey: "agent:main:main" });
++
++    sm.appendMessage(
++      asAppendMessage({
++        role: "assistant",
++        content: [{ type: "toolCall", id: "call_gateway_installs", name: "gateway", arguments: {} }],
++      }),
++    );
++    recordPendingToolResultReplayMetadata({
++      sessionKey: "agent:main:main",
++      toolCallId: "call_gateway_installs",
++      toolName: "gateway",
++      args: { action: "config.get", path: "plugins.installs" },
++    });
++    sm.appendMessage(
++      asAppendMessage({
++        role: "toolResult",
++        toolCallId: "call_gateway_installs",
++        toolName: "gateway",
++        content: [{ type: "text", text: "{\"ok\":true}" }],
++        isError: false,
++        timestamp: Date.now(),
++      }),
++    );
++
++    const messages = expectPersistedRoles(sm, ["assistant", "toolResult"]) as Array<
++      AgentMessage & { __openclaw?: Record<string, unknown> }
++    >;
++    expect(messages[1]?.__openclaw?.transient).toBe(true);
++    expect(messages[1]?.__openclaw?.diagnosticType).toBe("openclaw.config_snapshot");
++    expect(messages[1]?.__openclaw?.sourceTool).toBe("gateway");
++  });
++
++  it("re-applies replay metadata after tool_result_persist transformations", () => {
++    const sm = SessionManager.inMemory();
++    installSessionToolResultGuard(sm, {
++      sessionKey: "agent:main:main",
++      transformToolResultForPersistence: (message) => {
++        if (message.role !== "toolResult") {
++          return message;
++        }
++        return {
++          role: "toolResult",
++          toolCallId: message.toolCallId,
++          toolName: message.toolName,
++          content: message.content,
++          isError: message.isError,
++          timestamp: message.timestamp,
++        } as AgentMessage;
++      },
++    });
++
++    sm.appendMessage(
++      asAppendMessage({
++        role: "assistant",
++        content: [{ type: "toolCall", id: "call_gateway_entries_hook", name: "gateway", arguments: {} }],
++      }),
++    );
++    recordPendingToolResultReplayMetadata({
++      sessionKey: "agent:main:main",
++      toolCallId: "call_gateway_entries_hook",
++      toolName: "gateway",
++      args: { action: "config.get", path: "plugins.entries.qqbot" },
++    });
++    sm.appendMessage(
++      asAppendMessage({
++        role: "toolResult",
++        toolCallId: "call_gateway_entries_hook",
++        toolName: "gateway",
++        content: [{ type: "text", text: "{\"ok\":true}" }],
++        isError: false,
++        timestamp: Date.now(),
++      }),
++    );
++
++    const messages = expectPersistedRoles(sm, ["assistant", "toolResult"]) as Array<
++      AgentMessage & { __openclaw?: Record<string, unknown> }
++    >;
++    expect(messages[1]?.__openclaw?.transient).toBe(true);
++    expect(messages[1]?.__openclaw?.diagnosticType).toBe("openclaw.plugins_list");
++    expect(messages[1]?.__openclaw?.sourceTool).toBe("gateway");
++  });
++
+   it("preserves ordering with multiple tool calls and partial results", () => {
+     const sm = SessionManager.inMemory();
+     const guard = installSessionToolResultGuard(sm);
+diff --git a/src/agents/session-tool-result-guard.ts b/src/agents/session-tool-result-guard.ts
+index 36150800fd..761e97f006 100644
+--- a/src/agents/session-tool-result-guard.ts
++++ b/src/agents/session-tool-result-guard.ts
+@@ -11,6 +11,10 @@ import {
+ } from "./pi-embedded-runner/tool-result-truncation.js";
+ import { createPendingToolCallState } from "./session-tool-result-state.js";
+ import { makeMissingToolResult, sanitizeToolCallInputs } from "./session-transcript-repair.js";
++import {
++  applyToolResultReplayMetadata,
++  consumePendingToolResultReplayMetadata,
++} from "./tool-result-replay-metadata.js";
+ import { extractToolCallsFromAssistant, extractToolResultId } from "./tool-call-id.js";
+ 
+ const GUARD_TRUNCATION_SUFFIX =
+@@ -168,12 +172,22 @@ export function installSessionToolResultGuard(
+     if (allowSyntheticToolResults) {
+       for (const [id, name] of pendingState.entries()) {
+         const synthetic = makeMissingToolResult({ toolCallId: id, toolName: name });
++        const replayMeta = consumePendingToolResultReplayMetadata({
++          sessionKey: opts?.sessionKey,
++          toolCallId: id,
++        });
+         const flushed = applyBeforeWriteHook(
+-          persistToolResult(persistMessage(synthetic), {
+-            toolCallId: id,
+-            toolName: name,
+-            isSynthetic: true,
+-          }),
++          applyToolResultReplayMetadata(
++            persistToolResult(
++              applyToolResultReplayMetadata(persistMessage(synthetic), replayMeta),
++              {
++                toolCallId: id,
++                toolName: name,
++                isSynthetic: true,
++              },
++            ),
++            replayMeta,
++          ),
+         );
+         if (flushed) {
+           originalAppend(flushed as never);
+@@ -207,19 +221,28 @@ export function installSessionToolResultGuard(
+     if (nextRole === "toolResult") {
+       const id = extractToolResultId(nextMessage as Extract<AgentMessage, { role: "toolResult" }>);
+       const toolName = id ? pendingState.getToolName(id) : undefined;
++      const replayMeta = consumePendingToolResultReplayMetadata({
++        sessionKey: opts?.sessionKey,
++        toolCallId: id ?? undefined,
++      });
+       if (id) {
+         pendingState.delete(id);
+       }
+       const normalizedToolResult = normalizePersistedToolResultName(nextMessage, toolName);
++      const taggedToolResult = applyToolResultReplayMetadata(normalizedToolResult, replayMeta);
+       // Apply hard size cap before persistence to prevent oversized tool results
+       // from consuming the entire context window on subsequent LLM calls.
+-      const capped = capToolResultSize(persistMessage(normalizedToolResult));
+-      const persisted = applyBeforeWriteHook(
++      const capped = capToolResultSize(persistMessage(taggedToolResult));
++      const persistedToolResult = applyToolResultReplayMetadata(
+         persistToolResult(capped, {
+           toolCallId: id ?? undefined,
+           toolName,
+           isSynthetic: false,
+         }),
++        replayMeta,
++      );
++      const persisted = applyBeforeWriteHook(
++        persistedToolResult,
+       );
+       if (!persisted) {
+         return undefined;
+diff --git a/projects-ref/openclaw/src/agents/assistant-conclusion-freshness-gate.ts b/projects-ref/openclaw/src/agents/assistant-conclusion-freshness-gate.ts
+new file mode 100644
+index 0000000..274f1e7
+--- /dev/null
++++ b/projects-ref/openclaw/src/agents/assistant-conclusion-freshness-gate.ts
+@@ -0,0 +1,225 @@
++import type { AgentMessage } from "@mariozechner/pi-agent-core";
++import {
++  detectToolResultReplayPolicyMeta,
++  getToolResultReplayMetadata,
++  STALE_TOOL_RESULT_REPLAY_THRESHOLD_MS,
++} from "./tool-result-replay-metadata.js";
++
++export const ASSISTANT_FRESHNESS_GATE_TEMPLATE_A =
++  "Freshness check required for this question. Before answering, you must make a fresh tool call in this turn to verify the current environment state. Do not answer from prior assistant conclusions or prior tool results alone, even if similar results already appear in history.";
++
++export const ASSISTANT_FRESHNESS_GATE_HISTORY_WINDOW = 50;
++
++export type AssistantConclusionQuestionType =
++  | "plugin_install_state"
++  | "config_key_presence";
++
++export type AssistantFreshnessState = "not_high_risk" | "fresh" | "stale" | "missing";
++
++export type AssistantConclusionFreshnessGateResult = {
++  questionType?: AssistantConclusionQuestionType;
++  diagnosticType?: string;
++  freshnessState: AssistantFreshnessState;
++  prependSystemContext?: string;
++  templateId?: "A";
++  matchedTimestamp?: number;
++};
++
++function trimToDefinedString(value: unknown): string | undefined {
++  if (typeof value !== "string") {
++    return undefined;
++  }
++  const trimmed = value.trim();
++  return trimmed || undefined;
++}
++
++function normalizePrompt(prompt: string): string {
++  return prompt.toLowerCase();
++}
++
++function detectPluginInstallQuestion(prompt: string): boolean {
++  return (
++    /(plugin|plugins|插件)/iu.test(prompt) &&
++    /(installed|install|enabled|enable|loaded|status|what.*plugins|哪些插件|什么插件|装了|安装|启用|还在|状态)/iu.test(
++      prompt,
++    )
++  );
++}
++
++function detectConfigPresenceQuestion(prompt: string): boolean {
++  return (
++    /(config|配置|openclaw\.json)/iu.test(prompt) &&
++    /(exists|exist|present|value|key|有|有没有|存在|值|配置项|字段|参数)/iu.test(prompt)
++  );
++}
++
++export function detectAssistantConclusionQuestionType(
++  prompt: string,
++): { questionType: AssistantConclusionQuestionType; diagnosticType: string } | null {
++  const normalized = normalizePrompt(prompt);
++  if (detectConfigPresenceQuestion(normalized)) {
++    return {
++      questionType: "config_key_presence",
++      diagnosticType: "openclaw.config_snapshot",
++    };
++  }
++  if (detectPluginInstallQuestion(normalized)) {
++    return {
++      questionType: "plugin_install_state",
++      diagnosticType: "openclaw.plugins_list",
++    };
++  }
++  return null;
++}
++
++function isReplayOmitted(message: AgentMessage): boolean {
++  const meta = (message as { __openclaw?: unknown }).__openclaw;
++  return (
++    !!meta &&
++    typeof meta === "object" &&
++    (meta as { replayOmitted?: unknown }).replayOmitted === true
++  );
++}
++
++function getMessageTimestamp(message: AgentMessage, fallback: number): number {
++  const direct = (message as { timestamp?: unknown }).timestamp;
++  return typeof direct === "number" ? direct : fallback;
++}
++
++type AssistantToolCallBlock = {
++  type?: unknown;
++  id?: unknown;
++  name?: unknown;
++  arguments?: unknown;
++};
++
++function inferDiagnosticTypeFromHistoricalToolCall(params: {
++  messages: AgentMessage[];
++  toolResultIndex: number;
++  toolResult: AgentMessage;
++}): string | undefined {
++  const toolResult = params.toolResult as {
++    toolCallId?: unknown;
++    toolName?: unknown;
++    timestamp?: unknown;
++  };
++  const toolCallId = trimToDefinedString(toolResult.toolCallId);
++  const toolName =
++    trimToDefinedString(toolResult.toolName)?.toLowerCase() ?? "unknown";
++  if (!toolCallId) {
++    return undefined;
++  }
++
++  for (let index = params.toolResultIndex - 1; index >= 0; index -= 1) {
++    const message = params.messages[index] as {
++      role?: unknown;
++      content?: unknown;
++    };
++    if (message.role !== "assistant" || !Array.isArray(message.content)) {
++      continue;
++    }
++    for (const block of message.content as AssistantToolCallBlock[]) {
++      if (block?.type !== "toolCall") {
++        continue;
++      }
++      if (trimToDefinedString(block.id) !== toolCallId) {
++        continue;
++      }
++      const inferred = detectToolResultReplayPolicyMeta({
++        toolName: trimToDefinedString(block.name) ?? toolName,
++        args: block.arguments,
++        taggedAt: getMessageTimestamp(params.toolResult, Date.now()),
++      });
++      return inferred?.diagnosticType;
++    }
++  }
++  return undefined;
++}
++
++function inferReplayDiagnosticType(params: {
++  messages: AgentMessage[];
++  toolResultIndex: number;
++  toolResult: AgentMessage;
++}): string | undefined {
++  const replayMeta = getToolResultReplayMetadata(params.toolResult);
++  if (replayMeta?.diagnosticType) {
++    return replayMeta.diagnosticType;
++  }
++  return inferDiagnosticTypeFromHistoricalToolCall(params);
++}
++
++export function resolveAssistantConclusionFreshnessGate(params: {
++  prompt: string;
++  messages: unknown[];
++  now?: number;
++  historyWindow?: number;
++}): AssistantConclusionFreshnessGateResult {
++  const detected = detectAssistantConclusionQuestionType(params.prompt);
++  if (!detected) {
++    return { freshnessState: "not_high_risk" };
++  }
++
++  const now = params.now ?? Date.now();
++  const historyWindow = params.historyWindow ?? ASSISTANT_FRESHNESS_GATE_HISTORY_WINDOW;
++  const recentMessages = params.messages
++    .slice(Math.max(0, params.messages.length - historyWindow))
++    .filter((message): message is AgentMessage => !!message && typeof message === "object");
++
++  let sawMatchingEvidence = false;
++
++  for (let index = recentMessages.length - 1; index >= 0; index -= 1) {
++    const message = recentMessages[index];
++    if ((message as { role?: unknown }).role !== "toolResult") {
++      continue;
++    }
++    const diagnosticType = inferReplayDiagnosticType({
++      messages: recentMessages,
++      toolResultIndex: index,
++      toolResult: message,
++    });
++    if (diagnosticType !== detected.diagnosticType) {
++      continue;
++    }
++    sawMatchingEvidence = true;
++    if (isReplayOmitted(message)) {
++      continue;
++    }
++    const replayMeta = getToolResultReplayMetadata(message);
++    const messageTimestamp = getMessageTimestamp(
++      message,
++      replayMeta?.taggedAt ?? now,
++    );
++    if (now - messageTimestamp <= STALE_TOOL_RESULT_REPLAY_THRESHOLD_MS) {
++      return {
++        questionType: detected.questionType,
++        diagnosticType: detected.diagnosticType,
++        freshnessState: "fresh",
++        matchedTimestamp: messageTimestamp,
++      };
++    }
++  }
++
++  return {
++    questionType: detected.questionType,
++    diagnosticType: detected.diagnosticType,
++    freshnessState: sawMatchingEvidence ? "stale" : "missing",
++    prependSystemContext: ASSISTANT_FRESHNESS_GATE_TEMPLATE_A,
++    templateId: "A",
++  };
++}
++
++export function summarizeAssistantConclusionFreshnessGateLog(
++  result: AssistantConclusionFreshnessGateResult,
++): string {
++  if (result.freshnessState === "not_high_risk") {
++    return "assistant freshness gate: not_high_risk";
++  }
++  const parts = [
++    `assistant freshness gate: ${result.freshnessState}`,
++    result.questionType ? `questionType=${result.questionType}` : undefined,
++    result.diagnosticType ? `diagnosticType=${result.diagnosticType}` : undefined,
++    result.templateId ? `template=${result.templateId}` : undefined,
++    typeof result.matchedTimestamp === "number" ? `matchedTs=${result.matchedTimestamp}` : undefined,
++  ].filter((part): part is string => !!trimToDefinedString(part));
++  return parts.join(" ");
++}
+diff --git a/projects-ref/openclaw/src/agents/tool-result-replay-metadata.ts b/projects-ref/openclaw/src/agents/tool-result-replay-metadata.ts
+new file mode 100644
+index 0000000..ae712aa
+--- /dev/null
++++ b/projects-ref/openclaw/src/agents/tool-result-replay-metadata.ts
+@@ -0,0 +1,258 @@
++import type { AgentMessage } from "@mariozechner/pi-agent-core";
++
++export const STALE_TOOL_RESULT_REPLAY_THRESHOLD_MS = 60 * 60 * 1000;
++
++type ReplayDiagnosticType =
++  | "openclaw.plugins_list"
++  | "openclaw.status"
++  | "openclaw.config_snapshot"
++  | "openclaw.plugin_path_probe";
++
++type ToolResultReplayPolicyMeta = {
++  transient: true;
++  diagnosticType: ReplayDiagnosticType;
++  taggedAt: number;
++  sourceTool: string;
++};
++
++type OpenClawReplayMetaEnvelope = {
++  __openclaw?: Record<string, unknown> & {
++    transient?: boolean;
++    diagnosticType?: string;
++    taggedAt?: number;
++    sourceTool?: string;
++    replayOmitted?: boolean;
++  };
++};
++
++const pendingToolResultReplayMeta = new Map<string, ToolResultReplayPolicyMeta>();
++
++function buildPendingKey(sessionKey: string, toolCallId: string): string {
++  return `${sessionKey}:${toolCallId}`;
++}
++
++function trimString(value: unknown): string | undefined {
++  if (typeof value !== "string") {
++    return undefined;
++  }
++  const trimmed = value.trim();
++  return trimmed || undefined;
++}
++
++function matchExecDiagnosticType(command: string): ReplayDiagnosticType | null {
++  if (/^\s*openclaw\s+plugins\s+list(?:\s|$)/iu.test(command)) {
++    return "openclaw.plugins_list";
++  }
++  if (/^\s*openclaw\s+status(?:\s|$)/iu.test(command)) {
++    return "openclaw.status";
++  }
++  if (/^\s*openclaw\s+config\s+get(?:\s|$)/iu.test(command)) {
++    return "openclaw.config_snapshot";
++  }
++  if (
++    /\bcat\s+["']?[^"'`\s]*openclaw\.json["']?/iu.test(command) ||
++    /\bcat\s+["']?[^"'`\s]*extensions\/openclaw-[^/"'`\s]+\/package\.json["']?/iu.test(command)
++  ) {
++    return command.includes("openclaw.json")
++      ? "openclaw.config_snapshot"
++      : "openclaw.plugin_path_probe";
++  }
++  return null;
++}
++
++function matchReadDiagnosticType(filePath: string): ReplayDiagnosticType | null {
++  if (/openclaw\.json$/iu.test(filePath)) {
++    return "openclaw.config_snapshot";
++  }
++  if (/extensions\/openclaw-[^/]+\/package\.json$/iu.test(filePath)) {
++    return "openclaw.plugin_path_probe";
++  }
++  return null;
++}
++
++function matchGatewayDiagnosticType(args: Record<string, unknown>): ReplayDiagnosticType | null {
++  const action = trimString(args.action)?.toLowerCase();
++  if (action !== "config.get") {
++    return null;
++  }
++  const path = trimString(args.path)?.toLowerCase();
++  if (!path) {
++    return "openclaw.config_snapshot";
++  }
++  if (path === "plugins.entries" || path.startsWith("plugins.entries.")) {
++    return "openclaw.plugins_list";
++  }
++  if (
++    path === "plugins.installs" ||
++    path.startsWith("plugins.installs.") ||
++    path === "plugins.allow" ||
++    path.startsWith("plugins.allow.")
++  ) {
++    return "openclaw.config_snapshot";
++  }
++  return "openclaw.config_snapshot";
++}
++
++export function detectToolResultReplayPolicyMeta(params: {
++  toolName: string;
++  args: unknown;
++  taggedAt?: number;
++}): ToolResultReplayPolicyMeta | null {
++  const toolName = params.toolName.trim().toLowerCase();
++  const taggedAt = params.taggedAt ?? Date.now();
++  const record = params.args && typeof params.args === "object"
++    ? (params.args as Record<string, unknown>)
++    : undefined;
++
++  if (toolName === "exec" || toolName === "bash") {
++    const command = trimString(record?.command);
++    if (!command) {
++      return null;
++    }
++    const diagnosticType = matchExecDiagnosticType(command);
++    if (!diagnosticType) {
++      return null;
++    }
++    return {
++      transient: true,
++      diagnosticType,
++      taggedAt,
++      sourceTool: toolName,
++    };
++  }
++
++  if (toolName === "read") {
++    const filePath = trimString(record?.path) ?? trimString(record?.file_path);
++    if (!filePath) {
++      return null;
++    }
++    const diagnosticType = matchReadDiagnosticType(filePath);
++    if (!diagnosticType) {
++      return null;
++    }
++    return {
++      transient: true,
++      diagnosticType,
++      taggedAt,
++      sourceTool: toolName,
++    };
++  }
++
++  if (toolName === "gateway" && record) {
++    const diagnosticType = matchGatewayDiagnosticType(record);
++    if (!diagnosticType) {
++      return null;
++    }
++    return {
++      transient: true,
++      diagnosticType,
++      taggedAt,
++      sourceTool: toolName,
++    };
++  }
++
++  return null;
++}
++
++export function recordPendingToolResultReplayMetadata(params: {
++  sessionKey?: string;
++  toolCallId?: string;
++  toolName: string;
++  args: unknown;
++  taggedAt?: number;
++}): void {
++  const sessionKey = trimString(params.sessionKey);
++  const toolCallId = trimString(params.toolCallId);
++  if (!sessionKey || !toolCallId) {
++    return;
++  }
++  const meta = detectToolResultReplayPolicyMeta({
++    toolName: params.toolName,
++    args: params.args,
++    taggedAt: params.taggedAt,
++  });
++  if (!meta) {
++    return;
++  }
++  pendingToolResultReplayMeta.set(buildPendingKey(sessionKey, toolCallId), meta);
++}
++
++export function consumePendingToolResultReplayMetadata(params: {
++  sessionKey?: string;
++  toolCallId?: string;
++}): ToolResultReplayPolicyMeta | null {
++  const sessionKey = trimString(params.sessionKey);
++  const toolCallId = trimString(params.toolCallId);
++  if (!sessionKey || !toolCallId) {
++    return null;
++  }
++  const key = buildPendingKey(sessionKey, toolCallId);
++  const meta = pendingToolResultReplayMeta.get(key) ?? null;
++  pendingToolResultReplayMeta.delete(key);
++  return meta;
++}
++
++export function applyToolResultReplayMetadata(
++  message: AgentMessage,
++  meta: ToolResultReplayPolicyMeta | null,
++): AgentMessage {
++  if (!meta || (message as { role?: unknown }).role !== "toolResult") {
++    return message;
++  }
++  const next = message as AgentMessage & OpenClawReplayMetaEnvelope;
++  return {
++    ...next,
++    __openclaw: {
++      ...(next.__openclaw ?? {}),
++      transient: true,
++      diagnosticType: meta.diagnosticType,
++      taggedAt: meta.taggedAt,
++      sourceTool: meta.sourceTool,
++    },
++  } as AgentMessage;
++}
++
++export function getToolResultReplayMetadata(
++  message: AgentMessage,
++): ToolResultReplayPolicyMeta | null {
++  if ((message as { role?: unknown }).role !== "toolResult") {
++    return null;
++  }
++  const meta = (message as OpenClawReplayMetaEnvelope).__openclaw;
++  if (!meta || meta.transient !== true || typeof meta.diagnosticType !== "string") {
++    return null;
++  }
++  return {
++    transient: true,
++    diagnosticType: meta.diagnosticType as ReplayDiagnosticType,
++    taggedAt: typeof meta.taggedAt === "number" ? meta.taggedAt : 0,
++    sourceTool: typeof meta.sourceTool === "string" ? meta.sourceTool : "unknown",
++  };
++}
++
++export function replaceToolResultReplayContent(
++  message: AgentMessage,
++  replacementText: string,
++): AgentMessage {
++  if ((message as { role?: unknown }).role !== "toolResult") {
++    return message;
++  }
++  const next = message as AgentMessage &
++    OpenClawReplayMetaEnvelope & {
++      content?: unknown;
++    };
++  const replacement =
++    typeof next.content === "string"
++      ? replacementText
++      : Array.isArray(next.content)
++        ? [{ type: "text", text: replacementText }]
++        : next.content;
++  return {
++    ...next,
++    ...(replacement !== undefined ? { content: replacement } : {}),
++    __openclaw: {
++      ...(next.__openclaw ?? {}),
++      replayOmitted: true,
++    },
++  } as AgentMessage;
++}

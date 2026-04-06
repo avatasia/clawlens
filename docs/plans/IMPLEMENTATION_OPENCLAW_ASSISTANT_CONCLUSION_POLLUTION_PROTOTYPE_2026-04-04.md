@@ -1,8 +1,8 @@
 # OpenClaw Assistant Conclusion Pollution Prototype Plan
 
 > [!IMPORTANT]
-> Current Status: Prototype Planning
-> 本文不是 Phase 2 的正式实施稿，而是第一批最小代码原型的执行边界。
+> Current Status: Prototype Implemented and Current Scope Validated
+> 本文不是 Phase 2 的正式实施稿，而是第一批最小代码原型的执行边界与当前范围的已验证基线。
 
 ## 目标
 
@@ -12,6 +12,12 @@
   让模型在高风险环境问题上优先做 fresh check，而不是直接复用旧 assistant 结论。
 
 本原型不追求彻底解决 assistant 污染，只验证“最小 freshness gate”是否可行。
+
+当前范围内，这个目标已经完成：
+
+- `missing` 场景下会先 fresh check 再回答
+- `not_high_risk` 场景不会误触发 gate
+- 同 session 的中性追问，已经可以基于最近 fresh 证据跳过重复检查
 
 ## 第一批原型范围
 
@@ -26,7 +32,7 @@
    - `diagnosticType` 匹配
    - `1 hour` freshness 阈值
 3. 单一行为目标：
-   - 当缺少 fresh 证据时，要求模型本轮必须先核验
+   - 对高风险环境问题，要求模型本轮必须先核验
 
 ### 不做
 
@@ -40,7 +46,7 @@
 
 原型只覆盖以下 2 类问题：
 
-1. 当前插件安装/启用状态
+1. 当前插件状态问题
 2. 当前配置项是否存在
 
 对应原因：
@@ -54,6 +60,26 @@
 - 普通文件读取问题
 - 一般路径存在性问题
 - 广义版本/状态问题
+
+这里还需要额外说明：
+
+- “当前插件状态问题” 不能继续作为单一粗粒度类别使用
+- 它在真实对话里至少会分裂成以下 4 种语义：
+  1. `plugin_enabled_state`
+     - 是否在 `plugins.entries` 中启用
+  2. `plugin_install_registry_state`
+     - 是否在 `plugins.installs` 中登记
+  3. `plugin_external_extension_state`
+     - 是否作为外部扩展存在于 `extensions/` 目录
+  4. `plugin_builtin_state`
+     - 是否属于 OpenClaw 内置插件
+
+第一批原型继续只验证 freshness gate 的可行性，但从现在开始：
+
+- 验证与后续实现都必须按这些子类来设计问题
+- 不再使用单一的 `plugin_install_state` 粗粒度覆盖所有插件问题
+
+否则 gate 即使触发正确，模型仍可能沿着错误语义分支去查证。
 
 这里必须明确：
 
@@ -99,8 +125,10 @@
 
 ### 当前原型支持的映射
 
-- 插件安装/启用状态
+- `plugin_enabled_state`
   - `openclaw.plugins_list`
+- `plugin_install_registry_state`
+  - `openclaw.config_snapshot`
 - 配置项是否存在
   - `openclaw.config_snapshot`
 
@@ -108,26 +136,181 @@
 
 1. `openclaw` CLI 状态命令
 2. `cat/read/grep/rg/jq/find/ls` 对环境文件或插件目录的读取结果
+3. `gateway config.get ...` 这类网关配置读取结果
+
+### `openclaw ...` 命令接入原则
+
+当前补充一条明确约束：
+
+- 凡是 `openclaw ...` 开头
+- 且语义上属于“当前环境状态查询”
+
+的命令，都应接入结构化打标体系，而不是只覆盖其中个别子命令。
+
+这意味着后续不应只修：
+
+- `openclaw plugins list`
+- `openclaw config get`
+
+而应把同类 `openclaw` 状态查询统一纳入：
+
+- `__openclaw.transient`
+- `diagnosticType`
+
+的产生链。
+
+这里的判断标准不是命令名本身，而是它是否在回答以下问题：
+
+- 当前启用了什么
+- 当前安装了什么
+- 当前配置是什么
+- 当前状态如何
+
+如果属于这类环境状态查询，就应接入 Phase 1 的结构化证据体系。
+
+### 当前范围内已关闭的关键缺口
+
+本轮原型验证最终收敛出的关键问题是：
+
+- `plugin_enabled_state` 在 `missing` 场景下可以正常触发 gate 并完成 fresh check
+- 但同一 session 下再次追问 `plugins.entries` 启用状态时，最初仍然重新注入了 gate
+
+当前代码事实已经进一步确认：
+
+- `resolveAssistantConclusionFreshnessGate(...)` 只会把带有
+  - `__openclaw.transient = true`
+  - `diagnosticType`
+  的 `toolResult` 视为可复用 fresh 证据
+- 这些字段来自 `tool-result-replay-metadata.ts`
+- 当前原型后来补齐了两层能力：
+  1. `gateway config.get ...` 的 `diagnosticType` 接线：
+  - `plugins.entries` -> `openclaw.plugins_list`
+  - `plugins.installs / plugins.allow / 其他 config.get` -> `openclaw.config_snapshot`
+  2. 对未显式打标的历史 `toolResult`，通过关联上一条 `toolCall` 参数做 fallback 推断
+
+因此：
+
+- `gateway config.get plugins.entries`
+- `gateway config.get plugins.installs`
+
+现在在源码层面已经可以被判定为结构化 fresh 证据候选，且最近同 session 的中性追问已能稳定命中 `fresh`。
+
+这里需要明确两点：
+
+1. 这条能力的当前范围已经成立：
+   - `plugin_enabled_state`
+   - `plugin_install_registry_state`
+   - 配置项存在性
+2. 当前 remaining 不再是 blocker，而是未来扩展项：
+   - 更多 `openclaw ...` 环境状态命令族
+   - `stale` / 冲突 / 多模型验证
+   - 更广义的 assistant 结论治理
+
+### 当前范围的最新实现结论
+
+同 session 的 `fresh` 复用优化，现在通过以下链路闭环：
+
+1. 当前轮环境状态查询先产生 fresh 证据
+2. 下一轮 gate 扫描最近历史消息
+3. 优先使用显式 `__openclaw` 结构化 metadata
+4. 若历史 `toolResult` 未显式带 metadata，则通过关联上一条 `toolCall` 参数做 fallback 推断
+5. 命中 `fresh` 时，不再注入 `prependSystemContext`
+6. 模型直接基于最近 fresh 证据回答，不再重复查询
+
+当前范围内，已验证通过的最小优化结果是：
+
+- `plugin_install_registry_state` 的中性追问不再新增工具调用
+- `plugin_enabled_state` 的中性追问不再新增工具调用
+
+因此当前原型状态应更新为：
+
+- correctness 已验证
+- 当前范围的 fresh 复用优化已验证
+- 剩余工作属于后续扩展，而不是当前 blocker
+
+### 扩展原则
+
+从当前原型继续往后做时，仍需保持这条原则：
+
+不要再以“先碰到哪个命令就单独补哪个”这种方式零碎扩展。
+
+因此后续原型收口必须明确：
+
+1. `openclaw ...` 开头、且语义上回答当前环境状态的命令，应统一接入结构化打标体系
+2. 第一版已经证明 `gateway config.get ...` 这条家族可行
+3. 后续应继续扩到其他 `openclaw` 环境状态命令族，而不是保持零散例外
+
+当前这条原则已经收敛为明确约束：
+
+- 只要命令以 `openclaw` 开头，且结果语义属于“当前环境状态查询”，就应接入统一的结构化打标体系。
+- 第一版不再接受“只补某个单独命令”的零散接线方式。
+- `gateway config.get ...` 只是当前最先暴露缺口的一类入口，不是最终边界。
+- 后续实现应按“`openclaw` 环境状态命令族”设计接入策略，而不是继续按单条命令打补丁。
+- 在补齐打标之后，还必须再次验证：
+  - gate 注入后模型是否真的会 fresh check
+  - 不能把“已注入 gate”直接等同于“行为上已完成 fresh check”
 
 ### 第一批固定映射表
 
 | 问题类型 | 典型问法 | 首选 `diagnosticType` | 典型来源 |
 |---|---|---|---|
-| 插件安装/启用状态 | “当前装了什么插件”“某插件还在吗” | `openclaw.plugins_list` | `openclaw plugins list` |
+| `plugin_enabled_state` | “当前启用了哪些插件”“`qqbot` 在 `plugins.entries` 里启用了吗” | `openclaw.plugins_list` | `openclaw plugins list` / `gateway config.get plugins.entries` |
+| `plugin_install_registry_state` | “`openclaw-qqbot` 在 `plugins.installs` 里登记了吗” | `openclaw.config_snapshot` | `openclaw config get` / `gateway config.get plugins.installs` |
 | 配置项是否存在 | “配置里有没有某项”“当前配置值是什么” | `openclaw.config_snapshot` | `openclaw config get` / `cat|read|rg|jq openclaw.json` |
+
+补充约束：
+
+- 这里的“典型来源”只是第一批原型的主路径，不代表结构化打标只应覆盖这些单独命令。
+- 凡是以 `openclaw` 开头、并且回答当前环境状态的命令，都应映射到对应 `diagnosticType` 体系。
+- 若同一问题类型存在多个 `openclaw` 子命令入口，应优先统一到同一 `diagnosticType`，而不是为每条命令分裂出平行语义。
 
 第一批明确不支持：
 
 - 一条问题同时映射多个 `diagnosticType`
 - 无结构化证据时对 assistant 文本做开放式正则推断
+
+## 当前范围已验证通过
+
+### 已通过
+
+1. `plugin_enabled_state`
+   - `missing`
+   - 同 session 中性 `fresh` 复用
+2. `plugin_install_registry_state`
+   - `missing`
+   - 精确问法
+   - 同 session 中性 `fresh` 复用
+3. 配置项存在性
+   - `missing`
+4. `not_high_risk`
+   - 普通文件读取不误触发
+
+### 当前不再视为 blocker
+
+- `gateway config.get ...` 未接线
+- 同 session `fresh` 命中失败
+- “gate 已注入但模型仍直接复用上一轮结果” 作为当前范围通用问题
+
+这些问题在当前范围内已经收敛并解决。
+
+## 当前范围之外的后续扩展
+
+后续若继续推进，应视为新一轮扩展，而不是当前原型未完成：
+
+1. 扩展更多 `openclaw ...` 环境状态命令族
+2. 增补 `stale` 场景验证
+3. 增补旧 assistant 结论冲突场景
+4. 多模型遵循度回归
+5. 更广义的 assistant 结论治理
 - 基于旧 assistant 结论反推问题类型
 
 ### 判定结果
 
-- 若命中同类 fresh 证据：
-  - 不注入 freshness gate
-- 若未命中：
+- 若命中高风险问题：
   - 注入 freshness gate
+- `freshnessState`
+  - 当前继续保留用于日志与后续优化
+  - 但第一版不再用它决定“是否跳过本轮核验”
 
 ## Prompt 注入策略
 
@@ -136,9 +319,9 @@
 目标信息只保留：
 
 1. 当前问题属于高风险环境问题
-2. 当前没有 fresh 证据
-3. 本轮必须先调用相应工具核验
-4. 不得仅依据历史 assistant 结论回答
+2. 本轮必须先调用相应工具核验
+3. 不得仅依据历史 assistant 结论回答
+4. 即使历史里已有类似结果，也不能直接复用
 
 ### 示例形态
 
@@ -222,7 +405,8 @@ This is a current-environment question. If you do not already have fresh evidenc
 
 4. 问题边界不扩大
    - 第一批仍只允许：
-     - 插件安装/启用状态
+     - `plugin_enabled_state`
+     - `plugin_install_registry_state`
      - 配置项存在性
    - 不要在原型阶段扩到普通文件读取、广义路径状态或通用 repo 搜索
 
@@ -279,26 +463,24 @@ This is a current-environment question. If you do not already have fresh evidenc
 
 第一批原型至少要通过以下验证：
 
-1. 高风险问题 + 无 fresh 证据时
+1. 高风险问题时
    - 最终 prompt 中确实包含 freshness gate
-2. 高风险问题 + 有 fresh 证据时
+2. 低风险问题
    - 不注入 gate
-3. 低风险问题
-   - 不注入 gate
-4. 注入 gate 后
+3. 注入 gate 后
    - 模型本轮会优先发起对应工具调用
-5. 注入 gate 不会破坏原有 system prompt 结构
-6. 日志中可以明确区分：
+4. 注入 gate 不会破坏原有 system prompt 结构
+5. 日志中可以明确区分：
    - 未命中高风险问题
-   - 命中但已有 fresh 证据
-   - 命中且触发 gate
+   - 命中高风险问题
+   - 当前 `freshnessState`
 
 ## 失败判据
 
 出现以下任一情况，就说明第一批原型未通过：
 
 1. gate 注入后，模型仍频繁直接复述旧 assistant 结论
-2. 高风险问题误伤明显，导致大量不必要工具调用
+2. 高风险问题误伤明显，导致不可接受的大量额外工具调用
 3. prompt 注入被现有 system prompt / skills 明显稀释
 4. 实现必须引入新的控制层才能生效
 
