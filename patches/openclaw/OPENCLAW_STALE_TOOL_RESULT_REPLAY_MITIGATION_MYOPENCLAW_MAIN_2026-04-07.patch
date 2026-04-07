@@ -1,0 +1,653 @@
+From faa4bb57928ea5dee2ff4b0c233681c971d4db5c Mon Sep 17 00:00:00 2001
+From: avatasia <eric.tomcat@gmail.com>
+Date: Tue, 7 Apr 2026 00:04:37 +0800
+Subject: [PATCH] fix: mitigate stale toolResult replay pollution
+
+---
+ ...ed-runner.sanitize-session-history.test.ts | 114 +++++++++
+ .../pi-embedded-runner/replay-history.ts      |  51 +++-
+ .../pi-embedded-subscribe.handlers.tools.ts   |   8 +
+ src/agents/session-tool-result-guard.test.ts  |  86 +++++++
+ src/agents/session-tool-result-guard.ts       |  35 ++-
+ src/agents/tool-result-replay-metadata.ts     | 224 ++++++++++++++++++
+ 6 files changed, 510 insertions(+), 8 deletions(-)
+ create mode 100644 src/agents/tool-result-replay-metadata.ts
+
+diff --git a/src/agents/pi-embedded-runner.sanitize-session-history.test.ts b/src/agents/pi-embedded-runner.sanitize-session-history.test.ts
+index 262a070715..1da2d9323d 100644
+--- a/src/agents/pi-embedded-runner.sanitize-session-history.test.ts
++++ b/src/agents/pi-embedded-runner.sanitize-session-history.test.ts
+@@ -824,6 +824,120 @@ describe("sanitizeSessionHistory", () => {
+     ).toBe(false);
+   });
+ 
++  it("omits stale transient diagnostic tool results older than the replay threshold", async () => {
++    setNonGoogleModelApi();
++    const oldTimestamp = Date.now() - 2 * 60 * 60 * 1000;
++    const messages = castAgentMessages([
++      makeAssistantMessage([{ type: "toolCall", id: "call_old", name: "exec", arguments: {} }], {
++        stopReason: "toolUse",
++        timestamp: oldTimestamp - 1,
++      }),
++      {
++        role: "toolResult",
++        toolCallId: "call_old",
++        toolName: "exec",
++        content: [{ type: "text", text: "old plugin output" }],
++        isError: false,
++        timestamp: oldTimestamp,
++        __openclaw: {
++          transient: true,
++          diagnosticType: "openclaw.plugins_list",
++          taggedAt: oldTimestamp,
++          sourceTool: "exec",
++        },
++      },
++    ]);
++
++    const result = await sanitizeSessionHistory({
++      messages,
++      modelApi: "openai-responses",
++      provider: "openai",
++      sessionManager: mockSessionManager,
++      sessionId: TEST_SESSION_ID,
++    });
++
++    expect(result[1]).toMatchObject({
++      role: "toolResult",
++      content: [
++        {
++          type: "text",
++          text: "[Previous environment diagnostic output omitted from replay for accuracy.]",
++        },
++      ],
++      __openclaw: expect.objectContaining({
++        replayOmitted: true,
++        diagnosticType: "openclaw.plugins_list",
++      }),
++    });
++  });
++
++  it("omits older transient diagnostic tool results when a newer result of the same type exists", async () => {
++    setNonGoogleModelApi();
++    const older = Date.now() - 10 * 60 * 1000;
++    const newer = Date.now() - 30 * 1000;
++    const messages = castAgentMessages([
++      makeAssistantMessage([{ type: "toolCall", id: "call_old", name: "exec", arguments: {} }], {
++        stopReason: "toolUse",
++        timestamp: older - 1,
++      }),
++      {
++        role: "toolResult",
++        toolCallId: "call_old",
++        toolName: "exec",
++        content: "plugins list old output",
++        isError: false,
++        timestamp: older,
++        __openclaw: {
++          transient: true,
++          diagnosticType: "openclaw.plugins_list",
++          taggedAt: older,
++          sourceTool: "exec",
++        },
++      },
++      makeAssistantMessage([{ type: "toolCall", id: "call_new", name: "exec", arguments: {} }], {
++        stopReason: "toolUse",
++        timestamp: newer - 1,
++      }),
++      {
++        role: "toolResult",
++        toolCallId: "call_new",
++        toolName: "exec",
++        content: "(no output)",
++        isError: false,
++        timestamp: newer,
++        __openclaw: {
++          transient: true,
++          diagnosticType: "openclaw.plugins_list",
++          taggedAt: newer,
++          sourceTool: "exec",
++        },
++      },
++    ]);
++
++    const result = await sanitizeSessionHistory({
++      messages,
++      modelApi: "openai-responses",
++      provider: "openai",
++      sessionManager: mockSessionManager,
++      sessionId: TEST_SESSION_ID,
++    });
++
++    expect(result[1]).toMatchObject({
++      role: "toolResult",
++      content: "[Previous environment diagnostic output omitted from replay for accuracy.]",
++      __openclaw: expect.objectContaining({
++        replayOmitted: true,
++      }),
++    });
++    expect(result[3]).toMatchObject({
++      role: "toolResult",
++      content: "(no output)",
++    });
++    expect(
++      (result[3] as { __openclaw?: { replayOmitted?: boolean } }).__openclaw?.replayOmitted,
++    ).not.toBe(true);
++  });
++
+   it("preserves latest assistant thinking blocks for github-copilot models", async () => {
+     setNonGoogleModelApi();
+ 
+diff --git a/src/agents/pi-embedded-runner/replay-history.ts b/src/agents/pi-embedded-runner/replay-history.ts
+index 5afbeff6ba..73a62ff267 100644
+--- a/src/agents/pi-embedded-runner/replay-history.ts
++++ b/src/agents/pi-embedded-runner/replay-history.ts
+@@ -28,6 +28,11 @@ import {
+   sanitizeToolUseResultPairing,
+   stripToolResultDetails,
+ } from "../session-transcript-repair.js";
++import {
++  getToolResultReplayMetadata,
++  replaceToolResultReplayContent,
++  STALE_TOOL_RESULT_REPLAY_THRESHOLD_MS,
++} from "../tool-result-replay-metadata.js";
+ import type { TranscriptPolicy } from "../transcript-policy.js";
+ import { resolveTranscriptPolicy } from "../transcript-policy.js";
+ import {
+@@ -297,6 +302,48 @@ function ensureAssistantUsageSnapshots(messages: AgentMessage[]): AgentMessage[]
+   return touched ? out : messages;
+ }
+ 
++function omitStaleTransientDiagnosticToolResults(messages: AgentMessage[]): AgentMessage[] {
++  const latestByDiagnosticType = new Map<string, number>();
++  for (let i = 0; i < messages.length; i += 1) {
++    const meta = getToolResultReplayMetadata(messages[i]);
++    if (!meta) {
++      continue;
++    }
++    latestByDiagnosticType.set(meta.diagnosticType, i);
++  }
++
++  if (latestByDiagnosticType.size === 0) {
++    return messages;
++  }
++
++  const now = Date.now();
++  let touched = false;
++  const out = [...messages];
++  for (let i = 0; i < out.length; i += 1) {
++    const message = out[i];
++    const meta = getToolResultReplayMetadata(message);
++    if (!meta) {
++      continue;
++    }
++    const latestIndex = latestByDiagnosticType.get(meta.diagnosticType) ?? i;
++    const timestamp = parseMessageTimestamp(
++      (message as { timestamp?: unknown }).timestamp ?? meta.taggedAt ?? null,
++    );
++    const staleByNewerResult = latestIndex > i;
++    const staleByAge =
++      timestamp !== null && now - timestamp > STALE_TOOL_RESULT_REPLAY_THRESHOLD_MS;
++    if (!staleByNewerResult && !staleByAge) {
++      continue;
++    }
++    out[i] = replaceToolResultReplayContent(
++      message,
++      "[Previous environment diagnostic output omitted from replay for accuracy.]",
++    );
++    touched = true;
++  }
++  return touched ? out : messages;
++}
++
+ function createProviderReplaySessionState(
+   sessionManager: SessionManager,
+ ): ProviderReplaySessionState {
+@@ -425,8 +472,10 @@ export async function sanitizeSessionHistory(params: {
+       })
+     : sanitizedToolCalls;
+   const sanitizedToolResults = stripToolResultDetails(repairedTools);
++  const sanitizedTransientDiagnostics =
++    omitStaleTransientDiagnosticToolResults(sanitizedToolResults);
+   const sanitizedCompactionUsage = ensureAssistantUsageSnapshots(
+-    stripStaleAssistantUsageBeforeLatestCompaction(sanitizedToolResults),
++    stripStaleAssistantUsageBeforeLatestCompaction(sanitizedTransientDiagnostics),
+   );
+ 
+   const isOpenAIResponsesApi =
+diff --git a/src/agents/pi-embedded-subscribe.handlers.tools.ts b/src/agents/pi-embedded-subscribe.handlers.tools.ts
+index e2f95cd625..1971712beb 100644
+--- a/src/agents/pi-embedded-subscribe.handlers.tools.ts
++++ b/src/agents/pi-embedded-subscribe.handlers.tools.ts
+@@ -44,6 +44,7 @@ import { inferToolMetaFromArgs } from "./pi-embedded-utils.js";
+ import { consumeAdjustedParamsForToolCall } from "./pi-tools.before-tool-call.js";
+ import { buildToolMutationState, isSameToolMutationAction } from "./tool-mutation.js";
+ import { normalizeToolName } from "./tool-policy.js";
++import { recordPendingToolResultReplayMetadata } from "./tool-result-replay-metadata.js";
+ 
+ type ToolStartRecord = {
+   startTime: number;
+@@ -537,6 +538,13 @@ export function handleToolExecutionStart(
+     // Track start time and args for after_tool_call hook.
+     const startedAt = Date.now();
+     toolStartData.set(buildToolStartKey(runId, toolCallId), { startTime: startedAt, args });
++    recordPendingToolResultReplayMetadata({
++      sessionKey: ctx.params.sessionKey,
++      sessionId: ctx.params.sessionId,
++      toolCallId,
++      toolName,
++      args,
++    });
+ 
+     if (toolName === "read") {
+       const record = args && typeof args === "object" ? (args as Record<string, unknown>) : {};
+diff --git a/src/agents/session-tool-result-guard.test.ts b/src/agents/session-tool-result-guard.test.ts
+index 36e06d52de..dd0c4106d0 100644
+--- a/src/agents/session-tool-result-guard.test.ts
++++ b/src/agents/session-tool-result-guard.test.ts
+@@ -3,6 +3,7 @@ import { SessionManager } from "@mariozechner/pi-coding-agent";
+ import { describe, expect, it } from "vitest";
+ import { installSessionToolResultGuard } from "./session-tool-result-guard.js";
+ import { castAgentMessage } from "./test-helpers/agent-message-fixtures.js";
++import { recordPendingToolResultReplayMetadata } from "./tool-result-replay-metadata.js";
+ 
+ type AppendMessage = Parameters<SessionManager["appendMessage"]>[0];
+ 
+@@ -180,6 +181,91 @@ describe("installSessionToolResultGuard", () => {
+     expect(messages[1]?.toolName).toBe("read");
+   });
+ 
++  it("tags persisted diagnostic exec tool results for replay policy", () => {
++    const sm = SessionManager.inMemory();
++    installSessionToolResultGuard(sm, { sessionKey: "agent:main:main" });
++
++    sm.appendMessage(
++      asAppendMessage({
++        role: "assistant",
++        content: [{ type: "toolCall", id: "call_1", name: "exec", arguments: {} }],
++      }),
++    );
++    recordPendingToolResultReplayMetadata({
++      sessionKey: "agent:main:main",
++      toolCallId: "call_1",
++      toolName: "exec",
++      args: { command: "openclaw plugins list" },
++    });
++    sm.appendMessage(
++      asAppendMessage({
++        role: "toolResult",
++        toolCallId: "call_1",
++        toolName: "exec",
++        content: [{ type: "text", text: "plugin output" }],
++        isError: false,
++        timestamp: Date.now(),
++      }),
++    );
++
++    const messages = expectPersistedRoles(sm, ["assistant", "toolResult"]) as Array<
++      AgentMessage & { __openclaw?: Record<string, unknown> }
++    >;
++    expect(messages[1]?.__openclaw?.transient).toBe(true);
++    expect(messages[1]?.__openclaw?.diagnosticType).toBe("openclaw.plugins_list");
++    expect(messages[1]?.__openclaw?.sourceTool).toBe("exec");
++  });
++
++  it("re-applies replay metadata after tool_result_persist transformations", () => {
++    const sm = SessionManager.inMemory();
++    installSessionToolResultGuard(sm, {
++      sessionKey: "agent:main:main",
++      transformToolResultForPersistence: (message) => {
++        if (message.role !== "toolResult") {
++          return message;
++        }
++        return {
++          role: "toolResult",
++          toolCallId: message.toolCallId,
++          toolName: message.toolName,
++          content: message.content,
++          isError: message.isError,
++          timestamp: message.timestamp,
++        } as AgentMessage;
++      },
++    });
++
++    sm.appendMessage(
++      asAppendMessage({
++        role: "assistant",
++        content: [{ type: "toolCall", id: "call_1", name: "read", arguments: {} }],
++      }),
++    );
++    recordPendingToolResultReplayMetadata({
++      sessionKey: "agent:main:main",
++      toolCallId: "call_1",
++      toolName: "read",
++      args: { path: "/tmp/openclaw.json" },
++    });
++    sm.appendMessage(
++      asAppendMessage({
++        role: "toolResult",
++        toolCallId: "call_1",
++        toolName: "read",
++        content: [{ type: "text", text: '{"ok":true}' }],
++        isError: false,
++        timestamp: Date.now(),
++      }),
++    );
++
++    const messages = expectPersistedRoles(sm, ["assistant", "toolResult"]) as Array<
++      AgentMessage & { __openclaw?: Record<string, unknown> }
++    >;
++    expect(messages[1]?.__openclaw?.transient).toBe(true);
++    expect(messages[1]?.__openclaw?.diagnosticType).toBe("openclaw.config_snapshot");
++    expect(messages[1]?.__openclaw?.sourceTool).toBe("read");
++  });
++
+   it("preserves ordering with multiple tool calls and partial results", () => {
+     const sm = SessionManager.inMemory();
+     const guard = installSessionToolResultGuard(sm);
+diff --git a/src/agents/session-tool-result-guard.ts b/src/agents/session-tool-result-guard.ts
+index b2a90b6df6..b31cd541bb 100644
+--- a/src/agents/session-tool-result-guard.ts
++++ b/src/agents/session-tool-result-guard.ts
+@@ -12,6 +12,10 @@ import {
+ import { createPendingToolCallState } from "./session-tool-result-state.js";
+ import { makeMissingToolResult, sanitizeToolCallInputs } from "./session-transcript-repair.js";
+ import { extractToolCallsFromAssistant, extractToolResultId } from "./tool-call-id.js";
++import {
++  applyToolResultReplayMetadata,
++  consumePendingToolResultReplayMetadata,
++} from "./tool-result-replay-metadata.js";
+ 
+ const GUARD_TRUNCATION_SUFFIX =
+   "\n\n⚠️ [Content truncated during persistence — original exceeded size limit. " +
+@@ -168,12 +172,22 @@ export function installSessionToolResultGuard(
+     if (allowSyntheticToolResults) {
+       for (const [id, name] of pendingState.entries()) {
+         const synthetic = makeMissingToolResult({ toolCallId: id, toolName: name });
++        const replayMeta = consumePendingToolResultReplayMetadata({
++          sessionKey: opts?.sessionKey,
++          toolCallId: id,
++        });
+         const flushed = applyBeforeWriteHook(
+-          persistToolResult(persistMessage(synthetic), {
+-            toolCallId: id,
+-            toolName: name,
+-            isSynthetic: true,
+-          }),
++          applyToolResultReplayMetadata(
++            persistToolResult(
++              applyToolResultReplayMetadata(persistMessage(synthetic), replayMeta),
++              {
++                toolCallId: id,
++                toolName: name,
++                isSynthetic: true,
++              },
++            ),
++            replayMeta,
++          ),
+         );
+         if (flushed) {
+           originalAppend(flushed as never);
+@@ -207,20 +221,27 @@ export function installSessionToolResultGuard(
+     if (nextRole === "toolResult") {
+       const id = extractToolResultId(nextMessage as Extract<AgentMessage, { role: "toolResult" }>);
+       const toolName = id ? pendingState.getToolName(id) : undefined;
++      const replayMeta = consumePendingToolResultReplayMetadata({
++        sessionKey: opts?.sessionKey,
++        toolCallId: id ?? undefined,
++      });
+       if (id) {
+         pendingState.delete(id);
+       }
+       const normalizedToolResult = normalizePersistedToolResultName(nextMessage, toolName);
++      const taggedToolResult = applyToolResultReplayMetadata(normalizedToolResult, replayMeta);
+       // Apply hard size cap before persistence to prevent oversized tool results
+       // from consuming the entire context window on subsequent LLM calls.
+-      const capped = capToolResultSize(persistMessage(normalizedToolResult));
+-      const persisted = applyBeforeWriteHook(
++      const capped = capToolResultSize(persistMessage(taggedToolResult));
++      const persistedToolResult = applyToolResultReplayMetadata(
+         persistToolResult(capped, {
+           toolCallId: id ?? undefined,
+           toolName,
+           isSynthetic: false,
+         }),
++        replayMeta,
+       );
++      const persisted = applyBeforeWriteHook(persistedToolResult);
+       if (!persisted) {
+         return undefined;
+       }
+diff --git a/src/agents/tool-result-replay-metadata.ts b/src/agents/tool-result-replay-metadata.ts
+new file mode 100644
+index 0000000000..668c607994
+--- /dev/null
++++ b/src/agents/tool-result-replay-metadata.ts
+@@ -0,0 +1,224 @@
++import type { AgentMessage } from "@mariozechner/pi-agent-core";
++
++export const STALE_TOOL_RESULT_REPLAY_THRESHOLD_MS = 60 * 60 * 1000;
++
++type ReplayDiagnosticType =
++  | "openclaw.plugins_list"
++  | "openclaw.status"
++  | "openclaw.config_snapshot"
++  | "openclaw.plugin_path_probe";
++
++type ToolResultReplayPolicyMeta = {
++  transient: true;
++  diagnosticType: ReplayDiagnosticType;
++  taggedAt: number;
++  sourceTool: string;
++};
++
++type OpenClawReplayMetaEnvelope = {
++  __openclaw?: Record<string, unknown> & {
++    transient?: boolean;
++    diagnosticType?: string;
++    taggedAt?: number;
++    sourceTool?: string;
++    replayOmitted?: boolean;
++  };
++};
++
++const pendingToolResultReplayMeta = new Map<string, ToolResultReplayPolicyMeta>();
++
++function buildPendingKey(sessionKey: string, toolCallId: string): string {
++  return `${sessionKey}:${toolCallId}`;
++}
++
++function trimString(value: unknown): string | undefined {
++  if (typeof value !== "string") {
++    return undefined;
++  }
++  const trimmed = value.trim();
++  return trimmed || undefined;
++}
++
++function matchExecDiagnosticType(command: string): ReplayDiagnosticType | null {
++  if (/^\s*openclaw\s+plugins\s+list(?:\s|$)/iu.test(command)) {
++    return "openclaw.plugins_list";
++  }
++  if (/^\s*openclaw\s+status(?:\s|$)/iu.test(command)) {
++    return "openclaw.status";
++  }
++  if (/^\s*openclaw\s+config\s+get(?:\s|$)/iu.test(command)) {
++    return "openclaw.config_snapshot";
++  }
++  if (
++    /\bcat\s+["']?[^"'`\s]*openclaw\.json["']?/iu.test(command) ||
++    /\bcat\s+["']?[^"'`\s]*extensions\/openclaw-[^/"'`\s]+\/package\.json["']?/iu.test(command)
++  ) {
++    return command.includes("openclaw.json")
++      ? "openclaw.config_snapshot"
++      : "openclaw.plugin_path_probe";
++  }
++  return null;
++}
++
++function matchReadDiagnosticType(filePath: string): ReplayDiagnosticType | null {
++  if (/openclaw\.json$/iu.test(filePath)) {
++    return "openclaw.config_snapshot";
++  }
++  if (/extensions\/openclaw-[^/]+\/package\.json$/iu.test(filePath)) {
++    return "openclaw.plugin_path_probe";
++  }
++  return null;
++}
++
++export function detectToolResultReplayPolicyMeta(params: {
++  toolName: string;
++  args: unknown;
++  taggedAt?: number;
++}): ToolResultReplayPolicyMeta | null {
++  const toolName = params.toolName.trim().toLowerCase();
++  const taggedAt = params.taggedAt ?? Date.now();
++  const record =
++    params.args && typeof params.args === "object"
++      ? (params.args as Record<string, unknown>)
++      : undefined;
++
++  if (toolName === "exec" || toolName === "bash") {
++    const command = trimString(record?.command);
++    if (!command) {
++      return null;
++    }
++    const diagnosticType = matchExecDiagnosticType(command);
++    if (!diagnosticType) {
++      return null;
++    }
++    return {
++      transient: true,
++      diagnosticType,
++      taggedAt,
++      sourceTool: toolName,
++    };
++  }
++
++  if (toolName === "read") {
++    const filePath = trimString(record?.path) ?? trimString(record?.file_path);
++    if (!filePath) {
++      return null;
++    }
++    const diagnosticType = matchReadDiagnosticType(filePath);
++    if (!diagnosticType) {
++      return null;
++    }
++    return {
++      transient: true,
++      diagnosticType,
++      taggedAt,
++      sourceTool: toolName,
++    };
++  }
++
++  return null;
++}
++
++export function recordPendingToolResultReplayMetadata(params: {
++  sessionKey?: string;
++  sessionId?: string;
++  toolCallId?: string;
++  toolName: string;
++  args: unknown;
++  taggedAt?: number;
++}): void {
++  const sessionKey = trimString(params.sessionKey) ?? trimString(params.sessionId);
++  const toolCallId = trimString(params.toolCallId);
++  if (!sessionKey || !toolCallId) {
++    return;
++  }
++  const meta = detectToolResultReplayPolicyMeta({
++    toolName: params.toolName,
++    args: params.args,
++    taggedAt: params.taggedAt,
++  });
++  if (!meta) {
++    return;
++  }
++  pendingToolResultReplayMeta.set(buildPendingKey(sessionKey, toolCallId), meta);
++}
++
++export function consumePendingToolResultReplayMetadata(params: {
++  sessionKey?: string;
++  toolCallId?: string;
++}): ToolResultReplayPolicyMeta | null {
++  const sessionKey = trimString(params.sessionKey);
++  const toolCallId = trimString(params.toolCallId);
++  if (!sessionKey || !toolCallId) {
++    return null;
++  }
++  const key = buildPendingKey(sessionKey, toolCallId);
++  const meta = pendingToolResultReplayMeta.get(key) ?? null;
++  pendingToolResultReplayMeta.delete(key);
++  return meta;
++}
++
++export function applyToolResultReplayMetadata(
++  message: AgentMessage,
++  meta: ToolResultReplayPolicyMeta | null,
++): AgentMessage {
++  if (!meta || (message as { role?: unknown }).role !== "toolResult") {
++    return message;
++  }
++  const next = message as AgentMessage & OpenClawReplayMetaEnvelope;
++  return {
++    ...next,
++    __openclaw: {
++      ...next.__openclaw,
++      transient: true,
++      diagnosticType: meta.diagnosticType,
++      taggedAt: meta.taggedAt,
++      sourceTool: meta.sourceTool,
++    },
++  } as unknown as AgentMessage;
++}
++
++export function getToolResultReplayMetadata(
++  message: AgentMessage,
++): ToolResultReplayPolicyMeta | null {
++  if ((message as { role?: unknown }).role !== "toolResult") {
++    return null;
++  }
++  const meta = (message as OpenClawReplayMetaEnvelope).__openclaw;
++  if (!meta || meta.transient !== true || typeof meta.diagnosticType !== "string") {
++    return null;
++  }
++  return {
++    transient: true,
++    diagnosticType: meta.diagnosticType as ReplayDiagnosticType,
++    taggedAt: typeof meta.taggedAt === "number" ? meta.taggedAt : 0,
++    sourceTool: typeof meta.sourceTool === "string" ? meta.sourceTool : "unknown",
++  };
++}
++
++export function replaceToolResultReplayContent(
++  message: AgentMessage,
++  replacementText: string,
++): AgentMessage {
++  if ((message as { role?: unknown }).role !== "toolResult") {
++    return message;
++  }
++  const next = message as AgentMessage &
++    OpenClawReplayMetaEnvelope & {
++      content?: unknown;
++    };
++  const replacement =
++    typeof next.content === "string"
++      ? replacementText
++      : Array.isArray(next.content)
++        ? [{ type: "text", text: replacementText }]
++        : next.content;
++  return {
++    ...next,
++    ...(replacement !== undefined ? { content: replacement } : {}),
++    __openclaw: {
++      ...next.__openclaw,
++      replayOmitted: true,
++    },
++  } as unknown as AgentMessage;
++}
+-- 
+2.39.5
+
