@@ -6,6 +6,10 @@ const API = "/plugins/clawlens/api";
 const OVERVIEW_INTERVAL = 30_000;
 const DEBUG_PREFIX = "[ClawLens Audit]";
 const DEBUG_STORAGE_KEYS = ["clawlens.debug", "clawlens.audit.debug"];
+const LIVE_LLM_STREAM_BY_RUN = new Map();
+const TIMELINE_SCALE_BY_RUN = new Map();
+const USER_MARKER_WIDTH_PCT = 3.2;
+const LIVE_LLM_STALE_MS = 600_000;
 
 // ── State ─────────────────────────────────────────────────────────────────
 
@@ -133,6 +137,152 @@ function formatDuration(ms) {
   return Math.floor(ms / 60000) + "m " + Math.floor((ms % 60000) / 1000) + "s";
 }
 
+function getNiceTickStepMs(spanMs, targetTicks = 6) {
+  const safeSpan = Math.max(1, spanMs);
+  const rawStep = safeSpan / Math.max(2, targetTicks);
+  const magnitude = 10 ** Math.floor(Math.log10(rawStep));
+  const normalized = rawStep / magnitude;
+  let nice = 1;
+  if (normalized <= 1) nice = 1;
+  else if (normalized <= 2) nice = 2;
+  else if (normalized <= 5) nice = 5;
+  else nice = 10;
+  return nice * magnitude;
+}
+
+function formatTimelineTick(ms) {
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)}s`;
+  const minutes = Math.floor(ms / 60_000);
+  const seconds = Math.floor((ms % 60_000) / 1000);
+  return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
+}
+
+function buildTimelineTicks(scaleDuration) {
+  const stepMs = getNiceTickStepMs(scaleDuration, 6);
+  const ticks = [];
+  for (let t = 0; t <= scaleDuration + stepMs * 0.3; t += stepMs) {
+    ticks.push(Math.min(t, scaleDuration));
+  }
+  if (!ticks.length || ticks[0] !== 0) ticks.unshift(0);
+  if (ticks[ticks.length - 1] < scaleDuration) ticks.push(scaleDuration);
+
+  const dedup = [];
+  for (const t of ticks) {
+    if (!dedup.length || Math.abs(dedup[dedup.length - 1] - t) > 1e-6) dedup.push(t);
+  }
+  return dedup.map((ms) => ({
+    ms,
+    leftPct: Math.max(0, Math.min((ms / scaleDuration) * 100, 100)),
+    label: formatTimelineTick(ms),
+  }));
+}
+
+function selectVisibleTickLabels(ticks, scaleDuration) {
+  if (!ticks.length) return [];
+  const minLabelGapPct = scaleDuration >= 60_000 ? 16 : 12;
+  const selected = ticks.map((tick, idx) => ({ ...tick, showLabel: idx === 0 || idx === ticks.length - 1 }));
+
+  let lastShownPct = selected[0].leftPct;
+  for (let i = 1; i < selected.length - 1; i++) {
+    const tick = selected[i];
+    if (tick.leftPct - lastShownPct >= minLabelGapPct) {
+      tick.showLabel = true;
+      lastShownPct = tick.leftPct;
+    }
+  }
+
+  const lastIdx = selected.length - 1;
+  let prevShown = -1;
+  for (let i = lastIdx - 1; i >= 0; i--) {
+    if (selected[i].showLabel) {
+      prevShown = i;
+      break;
+    }
+  }
+  if (prevShown >= 0 && selected[lastIdx].leftPct - selected[prevShown].leftPct < minLabelGapPct * 0.9) {
+    selected[prevShown].showLabel = false;
+  }
+  return selected;
+}
+
+function getRunRenderDuration(run, now = Date.now()) {
+  const base = typeof run?.duration === "number" ? run.duration : 0;
+  if (run?.status !== "running") return Math.max(base, 0);
+  const startedAt = typeof run?.startedAt === "number" ? run.startedAt : null;
+  if (!startedAt) return Math.max(base, 0);
+  const runId = run?.runId;
+  if (runId) {
+    const live = LIVE_LLM_STREAM_BY_RUN.get(runId);
+    if (live?.finalized) {
+      const lastAt = Number(live.lastAt ?? live.startedAt ?? startedAt);
+      const frozen = Math.max(0, lastAt - startedAt);
+      return Math.max(base, frozen);
+    }
+  }
+  return Math.max(base, now - startedAt);
+}
+
+function getLiveLlmSegment(run, now = Date.now()) {
+  const runId = run?.runId;
+  const runStartedAt = typeof run?.startedAt === "number" ? run.startedAt : null;
+  if (!runId || !runStartedAt) return null;
+  const live = LIVE_LLM_STREAM_BY_RUN.get(runId);
+  if (!live) return null;
+  const lastAt = Number(live.lastAt ?? live.startedAt);
+  if (now - lastAt > LIVE_LLM_STALE_MS) {
+    LIVE_LLM_STREAM_BY_RUN.delete(runId);
+    return null;
+  }
+  const startRel = Math.max(0, live.startedAt - runStartedAt);
+  const endAbs = live.finalized ? lastAt : Math.max(now, lastAt);
+  const duration = Math.max(0, endAbs - live.startedAt);
+  return {
+    type: "llm_call",
+    startedAt: startRel,
+    duration,
+    live: true,
+  };
+}
+
+function getPersistedLlmStreamSegment(run) {
+  const runStartedAt = typeof run?.startedAt === "number" ? run.startedAt : null;
+  const firstAt = Number(run?.llmStream?.firstAt ?? 0) || 0;
+  const lastAt = Number(run?.llmStream?.lastAt ?? 0) || 0;
+  if (!runStartedAt || !firstAt || !lastAt) return null;
+  if (lastAt < firstAt) return null;
+  const startRel = Math.max(0, firstAt - runStartedAt);
+  const duration = Math.max(0, lastAt - firstAt);
+  return {
+    type: "llm_call",
+    startedAt: startRel,
+    duration,
+    live: true,
+  };
+}
+
+function getTimelineScaleDuration(elapsedMs) {
+  const elapsed = Math.max(0, elapsedMs);
+  if (elapsed < 30_000) return 30_000;
+  const steps = Math.floor((elapsed - 30_000) / 15_000);
+  return 50_000 + steps * 15_000;
+}
+
+function getTimelineScaleDurationForRun(runId, elapsedMs, runStatus) {
+  const computed = getTimelineScaleDuration(elapsedMs);
+  if (!runId) return computed;
+  if (runStatus === "running") {
+    TIMELINE_SCALE_BY_RUN.set(runId, computed);
+    return computed;
+  }
+  const locked = TIMELINE_SCALE_BY_RUN.get(runId);
+  if (typeof locked === "number" && Number.isFinite(locked) && locked > 0) {
+    return locked;
+  }
+  TIMELINE_SCALE_BY_RUN.set(runId, computed);
+  return computed;
+}
+
 // ── Data fetch ────────────────────────────────────────────────────────────
 
 async function fetchOverview() {
@@ -174,6 +324,29 @@ function connectSSE() {
   es.onmessage = (e) => {
     try {
       const ev = JSON.parse(e.data);
+      if (ev.type === "llm_stream_progress" && ev.runId) {
+        LIVE_LLM_STREAM_BY_RUN.set(ev.runId, {
+          startedAt: Number(ev.startedAt ?? Date.now()),
+          lastAt: Number(ev.lastAt ?? Date.now()),
+          chunkCount: Number(ev.chunkCount ?? 0),
+          finalized: false,
+        });
+        if (CHAT_STATE.visible) updateAuditSidebarContent(true);
+        if (S.selSession && ev.sessionKey === S.selSession) renderDetail();
+        return;
+      }
+      if (ev.type === "llm_stream_end" && ev.runId) {
+        const current = LIVE_LLM_STREAM_BY_RUN.get(ev.runId);
+        LIVE_LLM_STREAM_BY_RUN.set(ev.runId, {
+          startedAt: Number(current?.startedAt ?? ev.startedAt ?? Date.now()),
+          lastAt: Number(ev.lastAt ?? current?.lastAt ?? Date.now()),
+          chunkCount: Number(ev.chunkCount ?? current?.chunkCount ?? 0),
+          finalized: true,
+        });
+        if (CHAT_STATE.visible) updateAuditSidebarContent(true);
+        if (S.drawerOpen) renderDetail();
+        return;
+      }
       if (["run_started", "run_ended", "llm_call", "tool_executed", "transcript_turn"].includes(ev.type)) {
         fetchOverview();
         if (S.drawerOpen) fetchAuditSessions();
@@ -388,12 +561,18 @@ function renderAuditPanel(data) {
   if (!data || !data.runs?.length) {
     return '<div style="color:var(--muted,#838387);padding:20px;text-align:center">No audit data for this session</div>';
   }
-  return data.runs.map((run, i) => `
+  const now = Date.now();
+  return data.runs.map((run, i) => {
+    const runDuration = getRunRenderDuration(run, now);
+    const liveLlmSegment = getLiveLlmSegment(run, now)
+      ?? (run?.status === "running" ? null : getPersistedLlmStreamSegment(run));
+    const hasUserMarker = run?.runKind !== "heartbeat";
+    return `
     <div class="clawlens-audit-run${isRunExpanded(run.runId, i, expandedRunIds, defaultExpandFirst) ? " expanded" : ""}" data-run-id="${esc(run.runId)}">
       <div class="clawlens-audit-run-hdr" data-run-id="${esc(run.runId)}">
         <div class="clawlens-audit-run-top">
           <span class="clawlens-audit-run-num">#${i + 1} Run</span>
-          <span class="clawlens-audit-run-time">${formatDuration(run.duration)}</span>
+          <span class="clawlens-audit-run-time">${formatDuration(runDuration)}</span>
         </div>
         <div class="clawlens-audit-run-prompt">${esc(run.userPrompt || "(no prompt)")}</div>
         <div class="clawlens-audit-run-stats">
@@ -408,15 +587,17 @@ function renderAuditPanel(data) {
         ${renderRunDetailStatus(run, loadingRunIds)}
         <div class="clawlens-section-label">Timeline</div>
         <div class="clawlens-tl-legend">
+          <span><span class="clawlens-tl-legend-dot" style="background:#f59e0b"></span>User</span>
           <span><span class="clawlens-tl-legend-dot" style="background:var(--info,#3b82f6)"></span>LLM</span>
           <span><span class="clawlens-tl-legend-dot" style="background:var(--ok,#22c55e)"></span>Tool</span>
         </div>
-        ${needsRunDetailFetch(run) ? renderDeferredTimelineHint() : renderTimeline(run.timeline, run.duration)}
+        ${needsRunDetailFetch(run) ? renderDeferredTimelineHint() : renderTimeline(run.timeline, runDuration, run.status, liveLlmSegment, run.runId, hasUserMarker)}
         <div class="clawlens-section-label" style="margin-top:8px">Turns</div>
         <div class="clawlens-turns">${needsRunDetailFetch(run) ? renderDeferredTurnsHint(loadingRunIds?.has(run.runId)) : renderTurns(run.turns)}</div>
       </div>
     </div>
-  `).join("");
+  `;
+  }).join("");
 }
 
 function isRunExpanded(runId, idx, expandedRunIds, defaultExpandFirst) {
@@ -460,19 +641,158 @@ function renderDeferredTurnsHint(isLoading) {
   return '<div style="color:var(--muted,#838387);font-size:11px;padding:4px 0">Expand this run to load turns.</div>';
 }
 
-function renderTimeline(timeline, totalDuration) {
-  if (!timeline?.length || !totalDuration) {
-    return '<div style="color:var(--muted,#838387);font-size:11px;padding:4px 0 8px">No timeline captured for this run.</div>';
+function renderTimeline(timeline, totalDuration, runStatus, liveLlmSegment, runId, hasUserMarker) {
+  const minWidthPct = 1.8;
+  const minGapPct = 1.0;
+  const sourceTimeline = Array.isArray(timeline) ? [...timeline] : [];
+  if (liveLlmSegment && runStatus === "running") {
+    sourceTimeline.push(liveLlmSegment);
   }
-  return '<div class="clawlens-timeline-bar">' + timeline.map(entry => {
-    const left = Math.max(0, (entry.startedAt / totalDuration * 100)).toFixed(1);
-    const width = Math.max(entry.duration / totalDuration * 100, 2).toFixed(1);
-    const cls = entry.type === "llm_call" ? "clawlens-tl-llm" : "clawlens-tl-tool";
-    const label = entry.type === "llm_call"
-      ? `LLM ${formatDuration(entry.duration)}`
-      : `${entry.toolName || "tool"} ${formatDuration(entry.duration)}`;
-    return `<div class="${cls}" style="left:${left}%;width:${width}%" title="${esc(label)}">${formatDuration(entry.duration)}</div>`;
-  }).join("") + "</div>";
+  if (liveLlmSegment && runStatus !== "running") {
+    sourceTimeline.push({ ...liveLlmSegment, live: true });
+  }
+  const hasAnyEvent = sourceTimeline.length > 0;
+  const parsed = sourceTimeline.map((entry, idx) => {
+    const startMs = Math.max(0, Number(entry.startedAt ?? 0) || 0);
+    const durationMs = Math.max(0, Number(entry.duration ?? 0) || 0);
+    const endMs = Math.max(startMs + durationMs, startMs);
+    return { entry, idx, startMs, durationMs, endMs, isTool: entry.type === "tool_execution" };
+  });
+  const toolEntries = parsed.filter((item) => item.isTool);
+  const hasToolEvent = toolEntries.length > 0;
+  const firstToolStart = hasToolEvent ? Math.min(...toolEntries.map((item) => item.startMs)) : 0;
+  const lastToolEnd = hasToolEvent ? Math.max(...toolEntries.map((item) => item.endMs)) : 0;
+
+  // Detect "envelope" LLM calls that only represent whole-turn aggregation.
+  // These should be rendered as endpoint markers instead of full-width bars.
+  const summaryLlmIds = new Set(
+    parsed
+      .filter((item) => item.entry.type === "llm_call")
+      .filter((item) => {
+        if (liveLlmSegment && item.entry?.live !== true) return true;
+        if (!hasToolEvent) return false;
+        if (item.entry?.live === true) return false;
+        const nearRunStart = item.startMs <= Math.max(1000, totalDuration * 0.06);
+        const longEnough = item.durationMs >= totalDuration * 0.45;
+        const coversTools = item.startMs <= firstToolStart && item.endMs >= lastToolEnd;
+        return nearRunStart && longEnough && coversTools;
+      })
+      .map((item) => item.idx),
+  );
+
+  const effectiveEntries = parsed.filter((item) => !summaryLlmIds.has(item.idx));
+  const maxEndMs = parsed.reduce((max, item) => Math.max(max, item.endMs), 0);
+  const activeSpanMs = runStatus === "running"
+    ? Math.max(totalDuration ?? 0, maxEndMs, 1)
+    : Math.max(maxEndMs, totalDuration ?? 0, 1);
+  const scaleDuration = getTimelineScaleDurationForRun(runId, activeSpanMs, runStatus);
+
+  const rawSegments = effectiveEntries
+    .map((item) => {
+      const left = Math.max(0, Math.min((item.startMs / scaleDuration) * 100, 100));
+      const fixedWidthPct = Number(item.entry.fixedWidthPct ?? 0) || 0;
+      const width = Math.max((item.durationMs / scaleDuration) * 100, minWidthPct, fixedWidthPct);
+      return {
+        entry: item.entry,
+        startMs: item.startMs,
+        endMs: item.endMs,
+        rawLeft: left,
+        left,
+        width: Math.min(width, 100),
+      };
+    })
+    .sort((a, b) => a.left - b.left);
+
+  const markerSegments = liveLlmSegment ? [] : parsed
+    .filter((item) => summaryLlmIds.has(item.idx))
+    .map((item) => {
+      const markerWidth = 4.2;
+      const endPct = Math.max(0, Math.min((item.endMs / scaleDuration) * 100, 100));
+      return {
+        entry: item.entry,
+        startMs: item.startMs,
+        endMs: item.endMs,
+        rawLeft: endPct - markerWidth,
+        left: Math.max(0, endPct - markerWidth),
+        width: markerWidth,
+        marker: true,
+      };
+    })
+    .sort((a, b) => a.left - b.left);
+
+  const ticks = selectVisibleTickLabels(buildTimelineTicks(scaleDuration), scaleDuration);
+  const rulerHtml =
+    '<div class="clawlens-timeline-ruler">' +
+    ticks.map(({ leftPct, label, showLabel }) => {
+      const edgeClass = leftPct >= 96 ? " end" : "";
+      const labelHtml = showLabel ? `<span>${esc(label)}</span>` : "";
+      return `<div class="clawlens-tl-tick${edgeClass}${showLabel ? "" : " no-label"}" style="left:${leftPct.toFixed(2)}%">${labelHtml}</div>`;
+    }).join("") +
+    "</div>";
+  const gridHtml = ticks
+    .map(({ leftPct }) => `<div class="clawlens-tl-gridline" style="left:${leftPct.toFixed(2)}%"></div>`)
+    .join("");
+
+  const segments = [...rawSegments, ...markerSegments].sort((a, b) => a.left - b.left);
+  const maxShiftPct = runStatus === "running" ? 6 : 3.2;
+  const minSegWidth = 1.1;
+
+  for (let i = 0; i < segments.length; i++) {
+    const segment = segments[i];
+    if (segment.left + segment.width > 100) {
+      segment.left = Math.max(0, 100 - segment.width);
+    }
+    if (i === 0) continue;
+    const prev = segments[i - 1];
+    let overlap = prev.left + prev.width + minGapPct - segment.left;
+    if (overlap <= 0) continue;
+
+    // First try right-shift current segment with a bounded drift from raw position.
+    const maxRight = Math.min(100 - segment.width, segment.rawLeft + maxShiftPct);
+    if (segment.left < maxRight) {
+      const shift = Math.min(overlap, maxRight - segment.left);
+      segment.left += shift;
+      overlap -= shift;
+    }
+
+    if (overlap > 0) {
+      // Fallback: shrink neighboring widths to preserve a visible gap.
+      const prevMin = prev.marker ? 2.8 : minSegWidth;
+      const curMin = segment.marker ? 2.8 : minSegWidth;
+      const prevReducible = Math.max(0, prev.width - prevMin);
+      const prevTake = Math.min(prevReducible, overlap);
+      prev.width -= prevTake;
+      overlap -= prevTake;
+    }
+    if (overlap > 0) {
+      const curMin = segment.marker ? 2.8 : minSegWidth;
+      const curReducible = Math.max(0, segment.width - curMin);
+      const curTake = Math.min(curReducible, overlap);
+      segment.width -= curTake;
+      overlap -= curTake;
+      if (segment.left + segment.width > 100) {
+        segment.left = Math.max(0, 100 - segment.width);
+      }
+    }
+  }
+
+  const emptyHint = !hasAnyEvent ? '<div class="clawlens-tl-empty-hint">waiting for first event…</div>' : "";
+  const userMarkerHtml = hasUserMarker
+    ? `<div class="clawlens-tl-user" style="left:0%;width:${USER_MARKER_WIDTH_PCT.toFixed(2)}%" title="User message"></div>`
+    : "";
+  return '<div class="clawlens-timeline-wrap">' + rulerHtml + '<div class="clawlens-timeline-bar">' +
+    gridHtml + userMarkerHtml + segments.map(({ entry, left, width, marker }) => {
+      const rawDuration = Math.max(0, Number(entry.duration ?? 0) || 0);
+      const durationText = formatDuration(rawDuration);
+      const cls = entry.type === "llm_call"
+        ? `clawlens-tl-llm${marker ? " clawlens-tl-llm-marker" : ""}`
+        : "clawlens-tl-tool";
+      const label = entry.type === "llm_call"
+        ? `LLM ${durationText}`
+        : `${entry.toolName || "tool"} ${durationText}`;
+      const text = marker ? "" : (width >= 12 ? durationText : "");
+      return `<div class="${cls}" style="left:${left.toFixed(2)}%;width:${width.toFixed(2)}%" title="${esc(label)}">${text}</div>`;
+    }).join("") + emptyHint + "</div></div>";
 }
 
 function renderTurns(turns) {
@@ -560,6 +880,7 @@ const CHAT_STATE = {
   sourceSessionKey: null,
   data: null,
   pollTimer: null,
+  liveRenderTimer: null,
   loading: false,
   loadingMore: false,
   refreshing: false,
@@ -590,6 +911,7 @@ const CHAT_STATE = {
 const SIDEBAR_RENDER_SUPPRESS_MS = 800;
 const CHAT_AUDIT_REFRESH_MIN_GAP_MS = 1200;
 const CHAT_AUDIT_DETAIL_REFRESH_MIN_GAP_MS = 2500;
+const CHAT_AUDIT_LIVE_RENDER_INTERVAL_MS = 1000;
 
 function getCurrentSessionSelection() {
   const url = new URL(location.href);
@@ -877,6 +1199,10 @@ function hideChatAuditSidebar() {
   if (CHAT_STATE.pollTimer) {
     clearInterval(CHAT_STATE.pollTimer);
     CHAT_STATE.pollTimer = null;
+  }
+  if (CHAT_STATE.liveRenderTimer) {
+    clearInterval(CHAT_STATE.liveRenderTimer);
+    CHAT_STATE.liveRenderTimer = null;
   }
 }
 
@@ -1240,6 +1566,15 @@ function startChatPolling() {
     if (!isInChatView() || !CHAT_STATE.visible || CHAT_STATE.loading || CHAT_STATE.refreshing || !CHAT_STATE.latestStartedAt) return;
     requestChatAuditRefresh("poll", { withDetails: true });
   }, 10000);
+
+  if (CHAT_STATE.liveRenderTimer) return;
+  CHAT_STATE.liveRenderTimer = setInterval(() => {
+    if (document.hidden) return;
+    if (!isInChatView() || !CHAT_STATE.visible || !CHAT_STATE.data?.runs?.length) return;
+    const hasRunningRun = CHAT_STATE.data.runs.some((run) => run?.status === "running");
+    if (!hasRunningRun) return;
+    updateAuditSidebarContent(true);
+  }, CHAT_AUDIT_LIVE_RENDER_INTERVAL_MS);
 }
 
 async function refreshExpandedChatRunDetails() {

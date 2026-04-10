@@ -46,6 +46,13 @@ type PendingTranscriptTurn = {
   };
 };
 
+type LiveLlmStream = {
+  startedAt: number;
+  lastAt: number;
+  chunkCount: number;
+  lastEmitAt: number;
+};
+
 function classifyPromptRunKind(prompt?: string): "heartbeat" | "chat" {
   const text = prompt ?? "";
   if (
@@ -83,6 +90,7 @@ export class Collector {
   private flushInterval: ReturnType<typeof setInterval> | null = null;
   private costMap = new Map<string, { input: number; output: number; cacheRead: number; cacheWrite: number }>();
   private debugEnabled = false;
+  private liveLlmByRunId = new Map<string, LiveLlmStream>();
 
   constructor(
     private store: Store,
@@ -119,6 +127,7 @@ export class Collector {
     }
     this.pendingCompletes.clear();
     this.llmStartQueueByRunId.clear();
+    this.liveLlmByRunId.clear();
     this.sessionIdToRunId.clear();
     this.flush();
   }
@@ -164,6 +173,10 @@ export class Collector {
     ts: number;
     // Note: AgentEventPayload does NOT include agentId/channelId
   }): void {
+    if (evt.stream === "assistant") {
+      this.recordAssistantChunk(evt);
+      return;
+    }
     if (evt.stream !== "lifecycle") return;
     const data = evt.data ?? {};
     const phase = data.phase as string | undefined;
@@ -195,6 +208,7 @@ export class Collector {
       if (!runId) return;
       this.debug("lifecycle:end", { runId, ts: evt.ts });
       this.activeRuns.delete(runId);
+      this.endLiveLlmStream(runId, (data.endedAt as number | undefined) ?? evt.ts ?? Date.now());
       const endedAt = (data.endedAt as number | undefined) ?? evt.ts ?? Date.now();
       this.scheduleComplete(runId, endedAt, "completed");
     } else if (phase === "error") {
@@ -202,10 +216,87 @@ export class Collector {
       if (!runId) return;
       this.debug("lifecycle:error", { runId, ts: evt.ts, error: data.error });
       this.activeRuns.delete(runId);
+      this.endLiveLlmStream(runId, evt.ts ?? Date.now());
       const endedAt = evt.ts ?? Date.now();
       const errorMessage = (data.error as string | undefined) ?? "unknown error";
       this.scheduleComplete(runId, endedAt, "error", errorMessage);
     }
+  }
+
+  private recordAssistantChunk(evt: {
+    runId: string;
+    sessionKey?: string;
+    data: Record<string, unknown>;
+    ts: number;
+  }): void {
+    const runId = evt.runId;
+    if (!runId) return;
+    const text = extractAssistantDeltaText(evt.data);
+    if (!text) return;
+
+    const now = evt.ts ?? Date.now();
+    const existing = this.liveLlmByRunId.get(runId);
+    const stream: LiveLlmStream = existing
+      ? {
+          ...existing,
+          lastAt: now,
+          chunkCount: existing.chunkCount + 1,
+        }
+      : {
+          startedAt: now,
+          lastAt: now,
+          chunkCount: 1,
+          lastEmitAt: 0,
+        };
+    this.liveLlmByRunId.set(runId, stream);
+
+    this.persistLiveLlmMetrics(runId, stream);
+
+    const shouldEmit = stream.chunkCount === 1 || now - stream.lastEmitAt >= 250;
+    if (!shouldEmit) return;
+    stream.lastEmitAt = now;
+
+    this.sseManager.broadcast({
+      type: "llm_stream_progress",
+      runId,
+      sessionKey: evt.sessionKey ?? this.activeRuns.get(runId)?.sessionKey,
+      startedAt: stream.startedAt,
+      lastAt: stream.lastAt,
+      chunkCount: stream.chunkCount,
+      elapsedMs: Math.max(0, stream.lastAt - stream.startedAt),
+    });
+  }
+
+  private endLiveLlmStream(runId: string, endedAt: number): void {
+    const live = this.liveLlmByRunId.get(runId);
+    if (!live) return;
+    this.liveLlmByRunId.delete(runId);
+    this.persistLiveLlmMetrics(runId, {
+      ...live,
+      lastAt: Math.max(live.lastAt, endedAt),
+    });
+    this.sseManager.broadcast({
+      type: "llm_stream_end",
+      runId,
+      startedAt: live.startedAt,
+      endedAt,
+      elapsedMs: Math.max(0, endedAt - live.startedAt),
+      chunkCount: live.chunkCount,
+    });
+  }
+
+  private persistLiveLlmMetrics(runId: string, stream: LiveLlmStream): void {
+    this.enqueue(() => {
+      try {
+        (this.store as any).updateRunLlmStreamMetrics?.(runId, {
+          chunkCount: stream.chunkCount,
+          firstAt: stream.startedAt,
+          lastAt: stream.lastAt,
+        });
+      } catch (err) {
+        console.error("[clawlens] persistLiveLlmMetrics: store write failed:", err);
+      }
+    });
   }
 
   private scheduleComplete(runId: string, endedAt: number, status: string, errorMessage?: string): void {
@@ -250,6 +341,7 @@ export class Collector {
   ): void {
     const runId = event.runId;
     if (!runId) return;
+    this.endLiveLlmStream(runId, Date.now());
     this.debug("llm_output", {
       runId,
       sessionId: event.sessionId,
@@ -581,6 +673,21 @@ export class Collector {
       messageId: turn.messageId,
     });
   }
+}
+
+function extractAssistantDeltaText(data?: Record<string, unknown>): string {
+  if (!data) return "";
+  const directDelta = typeof data.delta === "string" ? data.delta : "";
+  if (directDelta.trim()) return directDelta;
+  const directText = typeof data.text === "string" ? data.text : "";
+  if (directText.trim()) return directText;
+  const message = data.message;
+  if (message && typeof message === "object") {
+    const payload = message as Record<string, unknown>;
+    const content = payload.content;
+    if (typeof content === "string" && content.trim()) return content;
+  }
+  return "";
 }
 
 function normalizeTranscriptMessage(message: unknown): {

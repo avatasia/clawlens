@@ -19,6 +19,15 @@ export type ClawLensConfig = {
 };
 
 export type ClawLensEvent = {
-  type: "run_started" | "run_ended" | "llm_call" | "tool_executed" | "transcript_turn" | "compare_completed" | "connected";
+  type:
+    | "run_started"
+    | "run_ended"
+    | "llm_call"
+    | "llm_stream_progress"
+    | "llm_stream_end"
+    | "tool_executed"
+    | "transcript_turn"
+    | "compare_completed"
+    | "connected";
   [key: string]: unknown;
 };

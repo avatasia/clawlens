@@ -107,6 +107,7 @@ export class Store {
   private stmtUpdateConvTurnByMessageId: ReturnType<DatabaseSync["prepare"]>;
   private stmtFindConvTurnByMessageId: ReturnType<DatabaseSync["prepare"]>;
   private stmtNextTurnIndex: ReturnType<DatabaseSync["prepare"]>;
+  private stmtUpdateRunLlmStreamMetrics: ReturnType<DatabaseSync["prepare"]>;
 
   private static readonly SOURCE_PRIORITY = {
     transcript_explicit: 3,
@@ -164,6 +165,9 @@ export class Store {
         total_cache_write INTEGER DEFAULT 0,
         total_cost_usd REAL DEFAULT 0,
         total_tool_calls INTEGER DEFAULT 0,
+        llm_stream_chunk_count INTEGER DEFAULT 0,
+        llm_stream_first_at INTEGER,
+        llm_stream_last_at INTEGER,
         compare_group_id TEXT,
         is_primary INTEGER
       );
@@ -261,6 +265,9 @@ export class Store {
       "ALTER TABLE runs ADD COLUMN total_official_cost REAL",
       "ALTER TABLE runs ADD COLUMN total_calculated_cost REAL",
       "ALTER TABLE runs ADD COLUMN run_kind TEXT",
+      "ALTER TABLE runs ADD COLUMN llm_stream_chunk_count INTEGER DEFAULT 0",
+      "ALTER TABLE runs ADD COLUMN llm_stream_first_at INTEGER",
+      "ALTER TABLE runs ADD COLUMN llm_stream_last_at INTEGER",
       "ALTER TABLE conversation_turns ADD COLUMN message_id TEXT",
       "ALTER TABLE conversation_turns ADD COLUMN session_file TEXT",
       "ALTER TABLE conversation_turns ADD COLUMN source_kind TEXT",
@@ -346,6 +353,22 @@ export class Store {
     `);
     this.stmtNextTurnIndex = this.db.prepare(`
       SELECT COALESCE(MAX(turn_index), -1) + 1 AS next_turn_index FROM conversation_turns WHERE run_id = ?
+    `);
+    this.stmtUpdateRunLlmStreamMetrics = this.db.prepare(`
+      UPDATE runs SET
+        llm_stream_chunk_count = CASE
+          WHEN COALESCE(llm_stream_chunk_count, 0) > ? THEN llm_stream_chunk_count
+          ELSE ?
+        END,
+        llm_stream_first_at = CASE
+          WHEN llm_stream_first_at IS NULL OR llm_stream_first_at > ? THEN ?
+          ELSE llm_stream_first_at
+        END,
+        llm_stream_last_at = CASE
+          WHEN llm_stream_last_at IS NULL OR llm_stream_last_at < ? THEN ?
+          ELSE llm_stream_last_at
+        END
+      WHERE run_id = ?
     `);
   }
 
@@ -479,6 +502,25 @@ export class Store {
       opts.isError ? 1 : 0,
       opts.argsSummary ?? null,
       opts.resultSummary ?? null,
+    );
+  }
+
+  updateRunLlmStreamMetrics(runId: string, metrics: {
+    chunkCount: number;
+    firstAt: number;
+    lastAt: number;
+  }): void {
+    const chunkCount = Math.max(0, Math.floor(metrics.chunkCount));
+    const firstAt = Math.max(0, Math.floor(metrics.firstAt));
+    const lastAt = Math.max(firstAt, Math.floor(metrics.lastAt));
+    this.stmtUpdateRunLlmStreamMetrics.run(
+      chunkCount,
+      chunkCount,
+      firstAt,
+      firstAt,
+      lastAt,
+      lastAt,
+      runId,
     );
   }
 
@@ -964,6 +1006,11 @@ export class Store {
         calculatedCost: mergedCalculatedCost,
         costMatch: mergedCostMatch.costMatch,
         costDiffReason: mergedCostMatch.costDiffReason,
+      },
+      llmStream: {
+        chunkCount: Math.max(0, run.llm_stream_chunk_count ?? 0),
+        firstAt: run.llm_stream_first_at ?? null,
+        lastAt: run.llm_stream_last_at ?? null,
       },
       timeline: includeDetails ? timeline : [],
       turns: filteredTurns.map((t: any) => ({
