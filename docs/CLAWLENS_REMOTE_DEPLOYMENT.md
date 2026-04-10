@@ -104,6 +104,25 @@ vi ~/.openclaw/openclaw.yaml
 ssh szhdy 'export PATH="/home/openclaw/.nvm/versions/node/v24.14.0/bin:/home/openclaw/.local/share/pnpm:$PATH" && openclaw gateway restart'
 ```
 
+重启后必须做“两阶段验收”，不可只依赖 `restart` 的返回文本：
+
+1. 服务重启验收（systemd 时间戳）
+2. UI/API 就绪验收（等待 dashboard + 插件 API 可访问，支持慢启动场景）
+
+推荐直接使用仓库脚本：
+
+```bash
+bash scripts/remote-gateway-restart-verify.sh szhdy 120 600
+```
+
+验收规则：
+
+- `SubState=running`
+- `ActiveEnterTimestamp` 距当前时间不超过 120 秒（可按需调整阈值）
+- 建议额外核对 `MainPID` 是否变化（若未变化，脚本会告警）
+- 就绪阶段默认最多等待 600 秒，每 5 秒轮询，连续 3 次成功才判定 ready
+- 若超时，脚本会自动输出 `gateway status`、最近日志和 HTTP 端点诊断
+
 若 `openclaw gateway restart` 不可用，可使用进程管理方式：
 
 ```bash
