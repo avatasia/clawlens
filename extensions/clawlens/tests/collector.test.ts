@@ -122,6 +122,56 @@ describe("Collector — 正常值", () => {
     assert.equal(llmBroadcasts.length, 1);
   });
 
+  test("llm duration 由 llm_input 到 llm_output 的时间差计算", () => {
+    const { collector, store } = makeCollector();
+    const originalNow = Date.now;
+    let now = 1_000;
+    Date.now = () => now;
+    try {
+      collector.handleAgentEvent(lifecycleEvent("start"));
+      now = 2_000;
+      collector.recordLlmInput({ runId: "run-001", prompt: "hello" }, {});
+      now = 2_650;
+      collector.recordLlmOutput({ runId: "run-001", usage: { input: 1, output: 1 } }, {});
+      collector.stop();
+    } finally {
+      Date.now = originalNow;
+    }
+
+    const calls = store.callsOf("insertLlmCall");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].args[2], 2_000);
+    const opts = calls[0].args[3] as { endedAt?: number; durationMs?: number };
+    assert.equal(opts.endedAt, 2_650);
+    assert.equal(opts.durationMs, 650);
+  });
+
+  test("lifecycle end 先到时仍可用 llm_input 时间计算 llm duration", () => {
+    const { collector, store } = makeCollector();
+    const originalNow = Date.now;
+    let now = 10_000;
+    Date.now = () => now;
+    try {
+      collector.handleAgentEvent(lifecycleEvent("start"));
+      now = 11_000;
+      collector.recordLlmInput({ runId: "run-001", prompt: "hello" }, {});
+      now = 11_100;
+      collector.handleAgentEvent(lifecycleEvent("end", { endedAt: now }));
+      now = 11_450;
+      collector.recordLlmOutput({ runId: "run-001", usage: { input: 3, output: 5 } }, {});
+      collector.stop();
+    } finally {
+      Date.now = originalNow;
+    }
+
+    const calls = store.callsOf("insertLlmCall");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].args[2], 11_000);
+    const opts = calls[0].args[3] as { endedAt?: number; durationMs?: number };
+    assert.equal(opts.endedAt, 11_450);
+    assert.equal(opts.durationMs, 450);
+  });
+
   test("recordToolCall → insertToolExecution + broadcast tool_executed", () => {
     const { collector, store, sse } = makeCollector();
     collector.handleAgentEvent(lifecycleEvent("start"));

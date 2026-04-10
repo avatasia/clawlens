@@ -75,6 +75,7 @@ function classifyTranscriptTurnKind(normalized: {
 
 export class Collector {
   private activeRuns = new Map<string, ActiveRun>();
+  private llmStartQueueByRunId = new Map<string, number[]>();
   private pendingCompletes = new Map<string, PendingComplete>();
   private sessionIdToRunId = new Map<string, string>();
   private pendingTranscriptTurns = new Map<string, PendingTranscriptTurn[]>();
@@ -117,8 +118,23 @@ export class Collector {
       });
     }
     this.pendingCompletes.clear();
+    this.llmStartQueueByRunId.clear();
     this.sessionIdToRunId.clear();
     this.flush();
+  }
+
+  private enqueueLlmStart(runId: string, ts: number): void {
+    const queue = this.llmStartQueueByRunId.get(runId) ?? [];
+    queue.push(ts);
+    this.llmStartQueueByRunId.set(runId, queue);
+  }
+
+  private consumeLlmStart(runId: string): number | undefined {
+    const queue = this.llmStartQueueByRunId.get(runId);
+    if (!queue?.length) return undefined;
+    const startedAt = queue.shift();
+    if (!queue.length) this.llmStartQueueByRunId.delete(runId);
+    return startedAt;
   }
 
   private debug(message: string, details: Record<string, unknown>): void {
@@ -200,6 +216,7 @@ export class Collector {
     // Delay by 800ms to let any trailing llm_output / after_tool_call events flush first
     const timer = setTimeout(() => {
       this.pendingCompletes.delete(runId);
+      this.llmStartQueueByRunId.delete(runId);
       this.enqueue(() => {
         this.store.completeRun(runId, endedAt, status, errorMessage);
         this.sseManager.broadcast({ type: "run_ended", runId, endedAt, status });
@@ -246,6 +263,8 @@ export class Collector {
     const active = this.activeRuns.get(runId);
     const callIndex = active ? active.llmCallIndex++ : 0;
     const now = Date.now();
+    const startedAt = this.consumeLlmStart(runId) ?? now;
+    const durationMs = Math.max(0, now - startedAt);
 
     const costKey = `${event.provider}:${event.model}`;
     const calculatedCost = calculateCost(
@@ -269,8 +288,9 @@ export class Collector {
     const systemPromptHash = active?.systemPromptHash ?? event.systemPromptHash;
 
     try {
-      this.store.insertLlmCall(runId, callIndex, now, {
+      this.store.insertLlmCall(runId, callIndex, startedAt, {
         endedAt: now,
+        durationMs,
         inputTokens: event.usage?.input,
         outputTokens: event.usage?.output,
         cacheRead: event.usage?.cacheRead,
@@ -323,6 +343,7 @@ export class Collector {
     }
 
     const active = this.activeRuns.get(runId);
+    this.enqueueLlmStart(runId, Date.now());
     if (active) {
       if (event.prompt) active.lastUserPrompt = event.prompt.slice(0, 200);
       if (event.systemPrompt) active.systemPromptHash = simpleHash(event.systemPrompt);
