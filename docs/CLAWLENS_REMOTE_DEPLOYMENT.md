@@ -1,0 +1,208 @@
+# ClawLens Remote Deployment
+
+> [!IMPORTANT]
+> Current Authority: This is the active remote deployment SOP.
+
+本文档描述将 ClawLens 插件部署到远端 OpenClaw 服务器的完整步骤。
+
+## 前提条件
+
+- 远端服务器可通过 SSH 密钥登录（示例：`ssh szhdy`）。
+- 远端已安装 OpenClaw 并有运行中的 gateway。
+- 本地已完成 `pnpm install` 和 `pnpm build`（在 `extensions/clawlens/` 下）。
+
+## 1. 远端环境 PATH 调整
+
+远端的 `pnpm` 和 `openclaw` 均不在默认非交互式 SSH PATH 中。通过 `ssh szhdy <command>` 执行命令时，必须显式设置 PATH。
+
+已知路径：
+
+| 工具 | 远端路径 |
+|---|---|
+| `pnpm` | `/home/openclaw/.local/share/pnpm/pnpm` |
+| `openclaw` | `/home/openclaw/.nvm/versions/node/v24.14.0/bin/openclaw` |
+
+在所有远端命令前加入 PATH 导出：
+
+```bash
+export PATH="/home/openclaw/.nvm/versions/node/v24.14.0/bin:/home/openclaw/.local/share/pnpm:$PATH"
+```
+
+或对单条 SSH 命令内联使用：
+
+```bash
+ssh szhdy 'export PATH="/home/openclaw/.nvm/versions/node/v24.14.0/bin:/home/openclaw/.local/share/pnpm:$PATH" && <command>'
+```
+
+## 2. 复制插件文件到远端
+
+使用 `rsync`（推荐，支持增量同步）或 `scp`。
+
+### rsync 方式
+
+```bash
+rsync -avz --delete \
+  extensions/clawlens/ \
+  szhdy:~/.openclaw/extensions/clawlens/
+```
+
+说明：
+
+- `--delete` 确保远端不残留本地已删除的文件。
+- 首次部署时远端目录 `~/.openclaw/extensions/clawlens` 不存在，rsync 会自动创建。
+- 注意源路径末尾的 `/`，表示同步目录内容而非目录本身。
+
+### scp 方式（备选）
+
+```bash
+ssh szhdy 'mkdir -p ~/.openclaw/extensions/clawlens'
+scp -r extensions/clawlens/* szhdy:~/.openclaw/extensions/clawlens/
+```
+
+## 3. 远端安装依赖
+
+若插件有 npm 依赖需要安装：
+
+```bash
+ssh szhdy 'export PATH="/home/openclaw/.nvm/versions/node/v24.14.0/bin:/home/openclaw/.local/share/pnpm:$PATH" && cd ~/.openclaw/extensions/clawlens && pnpm install --frozen-lockfile'
+```
+
+## 4. 注册插件到 openclaw.yaml
+
+远端 OpenClaw 配置文件通常位于 `~/.openclaw/openclaw.yaml`。
+
+需要在 `plugins.entries` 中添加 clawlens 条目：
+
+```yaml
+plugins:
+  entries:
+    clawlens:
+      enabled: true
+      source: local
+      path: ~/.openclaw/extensions/clawlens
+```
+
+通过 SSH 编辑：
+
+```bash
+ssh szhdy 'vi ~/.openclaw/openclaw.yaml'
+```
+
+或使用交互式 SSH 会话：
+
+```bash
+ssh szhdy
+# 然后在远端编辑
+vi ~/.openclaw/openclaw.yaml
+```
+
+## 5. 重启 Gateway
+
+重启 OpenClaw gateway 以加载新插件：
+
+```bash
+ssh szhdy 'export PATH="/home/openclaw/.nvm/versions/node/v24.14.0/bin:/home/openclaw/.local/share/pnpm:$PATH" && openclaw gateway restart'
+```
+
+若 `openclaw gateway restart` 不可用，可使用进程管理方式：
+
+```bash
+# 查找现有 gateway 进程
+ssh szhdy 'ps aux | grep openclaw'
+
+# 按实际情况停止并重新启动
+ssh szhdy 'export PATH="/home/openclaw/.nvm/versions/node/v24.14.0/bin:/home/openclaw/.local/share/pnpm:$PATH" && openclaw gateway start'
+```
+
+## 6. 验证插件加载
+
+### 6.1 检查 gateway 日志
+
+```bash
+ssh szhdy 'export PATH="/home/openclaw/.nvm/versions/node/v24.14.0/bin:/home/openclaw/.local/share/pnpm:$PATH" && openclaw gateway logs --tail 50'
+```
+
+预期看到类似输出：
+
+```
+[plugin:clawlens] ClawLens plugin started
+```
+
+### 6.2 检查插件状态
+
+```bash
+ssh szhdy 'export PATH="/home/openclaw/.nvm/versions/node/v24.14.0/bin:/home/openclaw/.local/share/pnpm:$PATH" && openclaw plugins inspect clawlens'
+```
+
+### 6.3 测试 API 端点
+
+通过 SSH 在远端本地测试：
+
+```bash
+ssh szhdy 'curl -s http://localhost:18789/plugins/clawlens/api/overview'
+```
+
+预期返回 JSON 数据而非 404。
+
+## 7. SSH Tunnel（本地浏览器访问）
+
+远端 gateway 绑定在 `localhost:18789`，需通过 SSH tunnel 从本地浏览器访问。
+
+```bash
+ssh -L 18789:127.0.0.1:18789 szhdy
+```
+
+然后在本地浏览器访问：
+
+```
+http://localhost:18789
+```
+
+ClawLens 的 Control UI 可通过以下路径访问：
+
+```
+http://localhost:18789/plugins/clawlens/ui/
+```
+
+保持 SSH 会话打开以维持 tunnel。如需后台运行：
+
+```bash
+ssh -fN -L 18789:127.0.0.1:18789 szhdy
+```
+
+## 8. 更新部署（后续迭代）
+
+后续更新只需重复以下步骤：
+
+1. 本地完成修改与构建。
+2. rsync 同步到远端（步骤 2）。
+3. 如有依赖变更，远端重新安装（步骤 3）。
+4. 重启 gateway（步骤 5）。
+5. 验证加载（步骤 6）。
+
+无需重复 openclaw.yaml 注册（步骤 4），除非插件 ID 或路径发生变化。
+
+## 故障排查
+
+### 插件未加载
+
+1. 检查 `~/.openclaw/openclaw.yaml` 中 clawlens 条目的 `enabled` 是否为 `true`。
+2. 检查 `path` 是否指向正确目录。
+3. 检查远端 `~/.openclaw/extensions/clawlens/openclaw.plugin.json` 是否存在且 `id` 为 `"clawlens"`。
+4. 检查 gateway 日志中是否有报错信息。
+
+### API 返回 404
+
+1. 确认 gateway 已重启且插件已加载。
+2. 确认请求路径正确：`/plugins/clawlens/api/overview`。
+3. 检查 SSH tunnel 是否连通（本地访问时）。
+
+### PATH 相关报错
+
+远端通过非交互式 SSH 执行命令时，`~/.bashrc` 和 `~/.profile` 中的 PATH 设置通常不会生效。始终在命令中显式 export PATH。
+
+## 参考
+
+- [clawlens-usage.md](clawlens-usage.md) -- 插件使用指南与 API 参考
+- [architecture.md](architecture.md) -- 插件架构文档
+- [CLAWLENS_PLUGIN_DEV_WORKFLOW.md](CLAWLENS_PLUGIN_DEV_WORKFLOW.md) -- 插件开发工作流

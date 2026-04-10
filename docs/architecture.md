@@ -11,7 +11,7 @@
 ClawLens 的上游参考代码不再通过 Git submodule 绑定。
 
 - 本地参考位置：`projects-ref/openclaw/`
-- 当前参考版本：`OpenClaw v2026.4.2 (d74a12264a)`
+- 当前参考版本：`OpenClaw 2026.4.10 (65b781f9ae)`
 
 该目录仅作为本地研究、对照和审计输入源，不构成 ClawLens 运行时依赖，也不要求主仓库对其提交指针进行硬绑定。
 
@@ -60,6 +60,7 @@ llm-api-logger files
 Reference hardening in upstream OpenClaw:
   diagnostic toolResult tagging
   -> stale replay omission before model input
+  -> experimental assistant freshness gate before answer generation
 ```
 
 主要模块：
@@ -138,6 +139,36 @@ Reference hardening in upstream OpenClaw:
 - `llm_output` / `after_tool_call` 必须稳定落库，否则 run detail 会只剩 turns
 - logger 导入不是基础链路，而是后续增强链路
 - 若上游 OpenClaw 不约束旧诊断结果 replay，模型后续轮次仍可能在脏历史里做错误延续
+
+### 4.2 上游当前轮结论污染原型
+
+在 `Phase 1` 之后，当前还完成了一条更窄范围的上游原型：
+
+- experimental assistant conclusion freshness gate
+
+它的目标不是重写 assistant 历史，而是减少以下场景：
+
+- 当前问题实际上在问“现在的环境状态”
+- 但模型试图直接复用旧 assistant 结论
+
+当前原型的最小形态是：
+
+1. 在 prompt-build 阶段识别少量高风险问题
+2. 回看最近的结构化 fresh evidence
+3. 若缺少足够新的证据，则注入最小 system instruction
+4. 由模型在当前轮自己先执行工具查询，再回答
+
+当前已验证通过的第一批问题类型包括：
+
+- `plugin_enabled_state`
+- `config_key_presence`
+
+当前约束包括：
+
+- 该机制默认关闭，必须显式 feature flag 开启
+- 不在模型外静默执行工具
+- 不改写 assistant 历史落盘
+- 仍然优先依赖结构化诊断证据，而不是自然语言 assistant 文本
 
 ## 5. 核心数据模型
 
