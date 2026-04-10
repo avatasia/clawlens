@@ -258,11 +258,14 @@ function getPersistedLlmStreamSegment(run) {
     startedAt: startRel,
     duration,
     live: true,
+    persisted: true,
   };
 }
 
 function getTimelineScaleDuration(elapsedMs) {
   const elapsed = Math.max(0, elapsedMs);
+  // Intentional stepped scale (requested UX):
+  // 0-30s fixed 30s window, then 50s/65s/80s...
   if (elapsed < 30_000) return 30_000;
   const steps = Math.floor((elapsed - 30_000) / 15_000);
   return 50_000 + steps * 15_000;
@@ -562,6 +565,13 @@ function renderAuditPanel(data) {
     return '<div style="color:var(--muted,#838387);padding:20px;text-align:center">No audit data for this session</div>';
   }
   const now = Date.now();
+  const visibleRunIds = new Set(data.runs.map((run) => run?.runId).filter(Boolean));
+  for (const runId of TIMELINE_SCALE_BY_RUN.keys()) {
+    if (!visibleRunIds.has(runId)) TIMELINE_SCALE_BY_RUN.delete(runId);
+  }
+  for (const runId of LIVE_LLM_STREAM_BY_RUN.keys()) {
+    if (!visibleRunIds.has(runId)) LIVE_LLM_STREAM_BY_RUN.delete(runId);
+  }
   return data.runs.map((run, i) => {
     const runDuration = getRunRenderDuration(run, now);
     const liveLlmSegment = getLiveLlmSegment(run, now)
@@ -645,10 +655,13 @@ function renderTimeline(timeline, totalDuration, runStatus, liveLlmSegment, runI
   const minWidthPct = 1.8;
   const minGapPct = 1.0;
   const sourceTimeline = Array.isArray(timeline) ? [...timeline] : [];
-  if (liveLlmSegment && runStatus === "running") {
+  const nonLiveLlmCalls = sourceTimeline.filter((entry) => entry?.type === "llm_call" && entry?.live !== true);
+  const hasDetailedLlmCalls = nonLiveLlmCalls.length > 1;
+  const shouldOverlayLlmSegment = !!liveLlmSegment && (!liveLlmSegment.persisted || !hasDetailedLlmCalls);
+  if (shouldOverlayLlmSegment && runStatus === "running") {
     sourceTimeline.push(liveLlmSegment);
   }
-  if (liveLlmSegment && runStatus !== "running") {
+  if (shouldOverlayLlmSegment && runStatus !== "running") {
     sourceTimeline.push({ ...liveLlmSegment, live: true });
   }
   const hasAnyEvent = sourceTimeline.length > 0;
@@ -665,11 +678,12 @@ function renderTimeline(timeline, totalDuration, runStatus, liveLlmSegment, runI
 
   // Detect "envelope" LLM calls that only represent whole-turn aggregation.
   // These should be rendered as endpoint markers instead of full-width bars.
+  const preferLiveEnvelope = shouldOverlayLlmSegment;
   const summaryLlmIds = new Set(
     parsed
       .filter((item) => item.entry.type === "llm_call")
       .filter((item) => {
-        if (liveLlmSegment && item.entry?.live !== true) return true;
+        if (preferLiveEnvelope && item.entry?.live !== true) return true;
         if (!hasToolEvent) return false;
         if (item.entry?.live === true) return false;
         const nearRunStart = item.startMs <= Math.max(1000, totalDuration * 0.06);
@@ -703,22 +717,7 @@ function renderTimeline(timeline, totalDuration, runStatus, liveLlmSegment, runI
     })
     .sort((a, b) => a.left - b.left);
 
-  const markerSegments = liveLlmSegment ? [] : parsed
-    .filter((item) => summaryLlmIds.has(item.idx))
-    .map((item) => {
-      const markerWidth = 4.2;
-      const endPct = Math.max(0, Math.min((item.endMs / scaleDuration) * 100, 100));
-      return {
-        entry: item.entry,
-        startMs: item.startMs,
-        endMs: item.endMs,
-        rawLeft: endPct - markerWidth,
-        left: Math.max(0, endPct - markerWidth),
-        width: markerWidth,
-        marker: true,
-      };
-    })
-    .sort((a, b) => a.left - b.left);
+  const markerSegments = [];
 
   const ticks = selectVisibleTickLabels(buildTimelineTicks(scaleDuration), scaleDuration);
   const rulerHtml =

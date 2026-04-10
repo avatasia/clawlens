@@ -207,7 +207,6 @@ export class Collector {
       const runId = evt.runId;
       if (!runId) return;
       this.debug("lifecycle:end", { runId, ts: evt.ts });
-      this.activeRuns.delete(runId);
       this.endLiveLlmStream(runId, (data.endedAt as number | undefined) ?? evt.ts ?? Date.now());
       const endedAt = (data.endedAt as number | undefined) ?? evt.ts ?? Date.now();
       this.scheduleComplete(runId, endedAt, "completed");
@@ -215,7 +214,6 @@ export class Collector {
       const runId = evt.runId;
       if (!runId) return;
       this.debug("lifecycle:error", { runId, ts: evt.ts, error: data.error });
-      this.activeRuns.delete(runId);
       this.endLiveLlmStream(runId, evt.ts ?? Date.now());
       const endedAt = evt.ts ?? Date.now();
       const errorMessage = (data.error as string | undefined) ?? "unknown error";
@@ -288,7 +286,7 @@ export class Collector {
   private persistLiveLlmMetrics(runId: string, stream: LiveLlmStream): void {
     this.enqueue(() => {
       try {
-        (this.store as any).updateRunLlmStreamMetrics?.(runId, {
+        this.store.updateRunLlmStreamMetrics(runId, {
           chunkCount: stream.chunkCount,
           firstAt: stream.startedAt,
           lastAt: stream.lastAt,
@@ -308,6 +306,7 @@ export class Collector {
     const timer = setTimeout(() => {
       this.pendingCompletes.delete(runId);
       this.llmStartQueueByRunId.delete(runId);
+      this.activeRuns.delete(runId);
       this.enqueue(() => {
         this.store.completeRun(runId, endedAt, status, errorMessage);
         this.sseManager.broadcast({ type: "run_ended", runId, endedAt, status });
