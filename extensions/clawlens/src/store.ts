@@ -1087,6 +1087,56 @@ export class Store {
     ).run(sessionKey, runId);
   }
 
+  updateRunSessionKeyIfUnknown(runId: string, sessionKey: string): boolean {
+    const result = this.db.prepare(
+      "UPDATE runs SET session_key = ? WHERE run_id = ? AND session_key = 'unknown'",
+    ).run(sessionKey, runId);
+    return (result as any)?.changes > 0;
+  }
+
+  findRunIdByMessageId(messageId: string): string | null {
+    const row = this.db.prepare(
+      "SELECT run_id FROM conversation_turns WHERE message_id = ? ORDER BY id DESC LIMIT 1",
+    ).get(messageId) as { run_id?: string | null } | undefined;
+    return row?.run_id ?? null;
+  }
+
+  findUnknownRunIdByPromptMessageId(
+    messageId: string,
+    opts?: { timestamp?: number; windowBeforeMs?: number; windowAfterMs?: number },
+  ): string | null {
+    // DOC_INDEX: CLAWLENS_TRANSCRIPT_BINDING_PLAYBOOK -> docs/CLAWLENS_TRANSCRIPT_BINDING_ROLLBACK_PLAYBOOK.md
+    const id = (messageId ?? "").trim();
+    if (!id) return null;
+    const ts = opts?.timestamp;
+    const hasTs = typeof ts === "number" && Number.isFinite(ts);
+    if (!hasTs) return null;
+
+    const before = Math.max(0, Math.floor(opts?.windowBeforeMs ?? 120_000));
+    const after = Math.max(0, Math.floor(opts?.windowAfterMs ?? 180_000));
+    const lower = Math.floor(ts - before);
+    const upper = Math.floor(ts + after);
+    const quoted = id.replace(/"/g, '\\"');
+    const patternCompact = `%"message_id":"${quoted}"%`;
+    const patternSpaced = `%"message_id": "${quoted}"%`;
+    const rows = this.db.prepare(`
+      SELECT r.run_id, r.started_at
+      FROM llm_calls l
+      JOIN runs r ON r.run_id = l.run_id
+      WHERE r.session_key = 'unknown'
+        AND r.started_at >= ?
+        AND r.started_at <= ?
+        AND (l.user_prompt_preview LIKE ? OR l.user_prompt_preview LIKE ?)
+      ORDER BY ABS(r.started_at - ?) ASC, r.started_at DESC
+      LIMIT 5
+    `).all(lower, upper, patternCompact, patternSpaced, Math.floor(ts)) as Array<{
+      run_id: string;
+      started_at: number;
+    }>;
+    if (rows.length > 0) return rows[0].run_id;
+    return null;
+  }
+
   updateRunKind(runId: string, runKind: "heartbeat" | "chat"): void {
     this.db.prepare(
       "UPDATE runs SET run_kind = ? WHERE run_id = ?",
@@ -1169,7 +1219,7 @@ export class Store {
     sessionKey: string,
     opts?: { timestamp?: number; kind?: "heartbeat" | "chat"; windowMs?: number; bindGraceMs?: number },
   ): string | null {
-    // ROLLBACK_INDEX: CLAWLENS_TRANSCRIPT_BINDING_STRATEGY
+    // ROLLBACK_INDEX: CLAWLENS_TRANSCRIPT_BINDING_STRATEGY -> docs/CLAWLENS_TRANSCRIPT_BINDING_ROLLBACK_PLAYBOOK.md
     const ts = opts?.timestamp ?? Date.now();
     // Default remains the historical behavior unless caller opts into stricter guards.
     const windowMs = opts?.windowMs ?? 5 * 60 * 1000;

@@ -44,6 +44,8 @@ type PendingTranscriptTurn = {
     tokensUsed?: number;
     explicitRunId?: string;
   };
+  sessionIdFromFile?: string;
+  queuedSourceMessageIds?: string[];
 };
 
 type LiveLlmStream = {
@@ -91,7 +93,8 @@ export class Collector {
   private costMap = new Map<string, { input: number; output: number; cacheRead: number; cacheWrite: number }>();
   private debugEnabled = false;
   private liveLlmByRunId = new Map<string, LiveLlmStream>();
-  // ROLLBACK_INDEX: CLAWLENS_TRANSCRIPT_BINDING_STRATEGY
+  // ROLLBACK_INDEX: CLAWLENS_TRANSCRIPT_BINDING_STRATEGY -> docs/CLAWLENS_TRANSCRIPT_BINDING_ROLLBACK_PLAYBOOK.md
+  // DOC_INDEX: CLAWLENS_TRANSCRIPT_BINDING_PLAYBOOK -> docs/CLAWLENS_TRANSCRIPT_BINDING_ROLLBACK_PLAYBOOK.md
   // Keep legacy as default. Switch explicitly via collector.transcriptBindingStrategy.
   private transcriptBindingStrategy: "legacy_recent_window" | "safe_message_anchor" = "legacy_recent_window";
 
@@ -103,7 +106,9 @@ export class Collector {
   start(runtime: unknown, globalConfig: unknown, pluginConfig: ClawLensConfig): void {
     this.costMap = loadCostConfig(globalConfig);
     this.debugEnabled = isClawLensDebugEnabled(pluginConfig.collector?.debugLogs);
-    this.transcriptBindingStrategy = pluginConfig.collector?.transcriptBindingStrategy ?? "legacy_recent_window";
+    this.transcriptBindingStrategy = resolveTranscriptBindingStrategy(
+      pluginConfig.collector?.transcriptBindingStrategy,
+    );
 
     // NOTE: snapshotIntervalMs is not yet wired up.
     // This interval drives the write-queue flush at 100ms cadence, which is intentional.
@@ -575,8 +580,20 @@ export class Collector {
 
     const normalized = normalizeTranscriptMessage(update.message);
     if (!normalized) return;
+    const queuedTimestamp = extractQueuedConversationTimestampMs(update.message);
+    const anchorTimestamp = normalized.timestamp ?? queuedTimestamp;
+    const normalizedWithAnchorTs = anchorTimestamp == null
+      ? normalized
+      : { ...normalized, timestamp: anchorTimestamp };
     const turnKind = classifyTranscriptTurnKind(normalized);
-    const runId = this.resolveTranscriptRunId(sessionKey, turnKind, normalized);
+    const sessionIdFromFile = extractSessionIdFromSessionFile(update.sessionFile);
+    const queuedSourceMessageIds = extractQueuedSourceMessageIds(update.message);
+    const runId = this.resolveTranscriptRunId(sessionKey, turnKind, normalizedWithAnchorTs, {
+      messageId: update.messageId,
+      sessionIdFromFile,
+      queuedSourceMessageIds,
+      anchorTimestamp,
+    });
     this.debug("transcript_update", {
       sessionKey,
       messageId: update.messageId,
@@ -585,20 +602,32 @@ export class Collector {
       resolvedRunId: runId,
       turnKind,
       role: normalized.role,
-      timestamp: normalized.timestamp,
+      timestamp: normalizedWithAnchorTs.timestamp,
+      anchorTimestamp,
+      sessionIdFromFile,
+      queuedSourceMessageIds,
     });
     const pendingTurn: PendingTranscriptTurn = {
       sessionFile: update.sessionFile,
       sessionKey,
       messageId: update.messageId,
       kind: turnKind,
-      normalized,
+      normalized: normalizedWithAnchorTs,
+      sessionIdFromFile,
+      queuedSourceMessageIds,
     };
 
     this.enqueue(() => {
       if (!runId) {
         this.queuePendingTranscriptTurn(pendingTurn);
         return;
+      }
+      if (this.transcriptBindingStrategy === "safe_message_anchor") {
+        this.backfillRunSessionKeyIfNeeded(runId, sessionKey);
+        const drained = this.drainPendingTranscriptTurns(sessionKey, turnKind);
+        for (const turn of drained) {
+          this.persistTranscriptTurn(runId, turn);
+        }
       }
       this.persistTranscriptTurn(runId, pendingTurn);
     });
@@ -613,9 +642,42 @@ export class Collector {
       role: string;
       preview: string;
     },
+    opts: {
+      messageId: string;
+      sessionIdFromFile?: string;
+      queuedSourceMessageIds?: string[];
+      anchorTimestamp?: number;
+    },
   ): string | null {
     const explicit = normalized.explicitRunId;
     if (explicit) return explicit;
+
+    // 1) queued embedded source message IDs (if already mapped in this run graph)
+    for (const sourceId of opts.queuedSourceMessageIds ?? []) {
+      const mapped = this.store.findRunIdByMessageId(sourceId);
+      if (mapped) return mapped;
+      const mappedUnknown = this.store.findUnknownRunIdByPromptMessageId(sourceId, {
+        timestamp: opts.anchorTimestamp,
+      });
+      if (mappedUnknown) return mappedUnknown;
+    }
+    // 2) wrapper message ID mapping
+    const mappedByWrapper = this.store.findRunIdByMessageId(opts.messageId);
+    if (mappedByWrapper) return mappedByWrapper;
+    // 3) session-id inferred run (helps when lifecycle arrived with session_key=unknown)
+    if (opts.sessionIdFromFile) {
+      const mappedBySession = this.sessionIdToRunId.get(opts.sessionIdFromFile) ?? null;
+      if (mappedBySession) return mappedBySession;
+    }
+    if ((opts.queuedSourceMessageIds?.length ?? 0) > 0) {
+      this.debug("transcript_binding: queued deferred", {
+        sessionKey,
+        messageId: opts.messageId,
+        queuedSourceMessageIds: opts.queuedSourceMessageIds,
+      });
+      return null;
+    }
+
     const active = this.findActiveRunIdForSessionKind(sessionKey, turnKind);
     if (active) return active;
 
@@ -623,7 +685,7 @@ export class Collector {
       // Stricter fallback: narrow window and only bind to running / just-ended runs.
       // This reduces cross-turn merge when queued messages arrive after completion.
       return this.store.findRecentRunIdForSession(sessionKey, {
-        timestamp: normalized.timestamp,
+        timestamp: opts.anchorTimestamp ?? normalized.timestamp,
         kind: turnKind,
         windowMs: 90 * 1000,
         bindGraceMs: 20 * 1000,
@@ -632,9 +694,22 @@ export class Collector {
 
     // Legacy behavior (default): broader window, no ended-run guard.
     return this.store.findRecentRunIdForSession(sessionKey, {
-      timestamp: normalized.timestamp,
+      timestamp: opts.anchorTimestamp ?? normalized.timestamp,
       kind: turnKind,
     });
+  }
+
+  private backfillRunSessionKeyIfNeeded(runId: string, sessionKey: string): void {
+    if (!runId || !sessionKey || sessionKey === "unknown") return;
+    try {
+      this.store.updateRunSessionKeyIfUnknown(runId, sessionKey);
+    } catch (err) {
+      console.error("[clawlens] backfillRunSessionKeyIfNeeded: store write failed:", err);
+    }
+    const active = this.activeRuns.get(runId);
+    if (active && active.sessionKey === "unknown") {
+      active.sessionKey = sessionKey;
+    }
   }
 
   private findActiveRunIdForSessionKind(sessionKey: string | undefined, kind: "heartbeat" | "chat"): string | null {
@@ -643,7 +718,6 @@ export class Collector {
     for (const active of this.activeRuns.values()) {
       const sameSession =
         active.sessionKey === sessionKey
-        || sessionKey.startsWith(active.sessionKey + ":")
         || active.sessionKey.startsWith(sessionKey + ":");
       if (!sameSession) continue;
       if (active.runKind && active.runKind !== kind) continue;
@@ -777,4 +851,69 @@ function extractExplicitRunId(message: Record<string, unknown>): string | undefi
   }
 
   return undefined;
+}
+
+function extractSessionIdFromSessionFile(sessionFile?: string): string | undefined {
+  if (!sessionFile) return undefined;
+  const m = sessionFile.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i);
+  return m?.[1];
+}
+
+function resolveTranscriptBindingStrategy(
+  configured?: "legacy_recent_window" | "safe_message_anchor",
+): "legacy_recent_window" | "safe_message_anchor" {
+  const raw = (process.env.CLAWLENS_TRANSCRIPT_BINDING_STRATEGY ?? "").trim().toLowerCase();
+  if (raw === "safe_message_anchor" || raw === "safe") return "safe_message_anchor";
+  if (raw === "legacy_recent_window" || raw === "legacy") return "legacy_recent_window";
+  return configured ?? "legacy_recent_window";
+}
+
+function extractQueuedSourceMessageIds(message: unknown): string[] {
+  const raw = getTranscriptRawText(message);
+  if (!raw.includes("[Queued messages while agent was busy]")) return [];
+  const ids = new Set<string>();
+  const regex = /"message_id"\s*:\s*"([^"]+)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = regex.exec(raw)) !== null) {
+    const id = m[1]?.trim();
+    if (id) ids.add(id);
+  }
+  return [...ids];
+}
+
+function extractQueuedConversationTimestampMs(message: unknown): number | undefined {
+  const raw = getTranscriptRawText(message);
+  if (!raw.includes("[Queued messages while agent was busy]")) return undefined;
+  const m = raw.match(/"timestamp"\s*:\s*"([^"]+)"/);
+  const tsText = m?.[1]?.trim();
+  if (!tsText) return undefined;
+  const ms = Date.parse(tsText);
+  return Number.isFinite(ms) ? ms : undefined;
+}
+
+function getTranscriptRawText(message: unknown): string {
+  if (!message || typeof message !== "object") return "";
+  const msg = message as Record<string, unknown>;
+  const content = msg.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (part && typeof part === "object" && typeof (part as any).text === "string") {
+          return (part as any).text as string;
+        }
+        try {
+          return JSON.stringify(part);
+        } catch {
+          return "";
+        }
+      })
+      .join("\n");
+  }
+  try {
+    return JSON.stringify(content ?? "");
+  } catch {
+    return "";
+  }
 }

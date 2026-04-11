@@ -8,7 +8,9 @@
    默认模式。检查当前 `git staged` 的 `docs/**/*.md` 改动。
 2. `node scripts/check-docs-governance.mjs --all`
    全量模式。扫描整个 `docs/` 目录（适合周期性治理清理）。
-3. `bash scripts/install-git-hooks.sh`
+3. `node scripts/check-docs-governance.mjs --all --strict`
+   全量严格模式。双向索引一致性检查始终执行；`--strict` 将不一致项从警告提升为失败。
+4. `bash scripts/install-git-hooks.sh`
    安装本地 `pre-commit` / `pre-push` 自动检查钩子。
 
 ## 命令清单（Development Gates）
@@ -28,6 +30,8 @@
 - `docs/archive/history/README.md` 必须覆盖所有 `*_HISTORY.md`。
 - 目标 markdown 文件中的相对链接必须可解析。
 - 目标 markdown 文件中不得出现仓库绝对路径。
+- `DOC_INDEX/ROLLBACK_INDEX/CODE_INDEX` 双向索引一致性（默认 warn，`--strict` fail）。
+- 若配置 `entry_points:`，执行 warn 级别符号存在性提示（不阻断）。
 - 默认模式只检查 `staged` 文档改动；全量治理请使用 `--all`。
 
 ## 默认检查项（Development Gates）

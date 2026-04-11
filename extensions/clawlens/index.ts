@@ -104,7 +104,7 @@ const defaultConfig: ClawLensConfig = {
     loggerImportMaxFileSizeMb: 100,
     backfillRunKindsOnStart: true,
     backfillRunKindsLimit: 200,
-    // ROLLBACK_INDEX: CLAWLENS_TRANSCRIPT_BINDING_STRATEGY
+    // ROLLBACK_INDEX: CLAWLENS_TRANSCRIPT_BINDING_STRATEGY -> docs/CLAWLENS_TRANSCRIPT_BINDING_ROLLBACK_PLAYBOOK.md
     transcriptBindingStrategy: "legacy_recent_window",
   },
   compare: { enabled: false, models: [], channels: [], timeoutMs: 300_000, maxConcurrent: 3 },
