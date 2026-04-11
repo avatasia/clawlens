@@ -3,6 +3,7 @@
 > **Date:** 2026-04-10
 > **Scope:** Analysis-only. No code changes performed.
 > **Baseline:** `projects-ref/openclaw` `main` at commit `65b781f9ae`, version `2026.4.10`
+> **Note:** Document and file status descriptions below are snapshots as of 2026-04-10 and may no longer reflect current working tree state.
 
 ---
 

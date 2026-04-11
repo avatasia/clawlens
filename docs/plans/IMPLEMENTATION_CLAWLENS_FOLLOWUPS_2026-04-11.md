@@ -7,9 +7,9 @@
 ## Open Items
 
 1. Push pending commits to remote
-- Current status: local `main` is ahead of `origin/main` by 2 commits.
-- Action:
+- Action: verify ahead count then push.
 ```bash
+git rev-list --left-right --count @{upstream}...HEAD
 git push
 ```
 

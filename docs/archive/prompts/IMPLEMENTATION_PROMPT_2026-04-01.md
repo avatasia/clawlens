@@ -1,6 +1,6 @@
 # ClawLens — 代码实现提示词（修订版）
 
-> 基于四份复核文档（2026-04-01）与对 `docs/IMPLEMENTATION_PROMPT.md` 的审查生成。
+> 基于四份复核文档（2026-04-01）与对 `docs/IMPLEMENTATION_PROMPT.md`（现为 `docs/PROMPT_IMPLEMENTATION.md`）的审查生成。
 > 输出策略：基于原文另存为新文件；原文件未修改。
 
 ## 本轮修改原因

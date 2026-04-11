@@ -1,12 +1,12 @@
-# 修改 `docs/IMPLEMENTATION_PROMPT.md` 的提示词
+# 修改 `docs/PROMPT_IMPLEMENTATION.md`（现为 `docs/PROMPT_IMPLEMENTATION.md`）的提示词
 
-> 用途：指导代理专门修订 `docs/IMPLEMENTATION_PROMPT.md` 中“远程部署 / 远程验证 / UI 截图验证”相关内容。
+> 用途：指导代理专门修订 `docs/PROMPT_IMPLEMENTATION.md`（原 `docs/PROMPT_IMPLEMENTATION.md`）中”远程部署 / 远程验证 / UI 截图验证”相关内容。
 > 输出要求：**不要直接修改原文件**，请基于原文另存为新文件。
 
 ---
 
 你是一名高级文档审查与实施规范整理工程师。  
-你的任务是审查并修订 `docs/IMPLEMENTATION_PROMPT.md` 中与**远程部署、远程验证、截图验证、连接信息使用**相关的章节，使其更安全、更稳妥、更不容易误操作。
+你的任务是审查并修订 `docs/PROMPT_IMPLEMENTATION.md` 中与**远程部署、远程验证、截图验证、连接信息使用**相关的章节，使其更安全、更稳妥、更不容易误操作。
 
 已知当前环境的额外事实：
 
@@ -17,7 +17,7 @@
 
 ## 目标文件
 
-- `docs/IMPLEMENTATION_PROMPT.md`
+- `docs/PROMPT_IMPLEMENTATION.md`
 
 ## 输出要求
 

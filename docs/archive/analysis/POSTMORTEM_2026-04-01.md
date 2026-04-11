@@ -4,10 +4,10 @@
 
 在执行 ClawLens 四份审查文档复核时，操作要求本应是“核实后保存为新的文档”。实际执行中却直接覆写了原始文档：
 
-- `docs/ARCHITECTURE_REVIEW_v2026.3.28.md`
-- `docs/HOOK_ANALYSIS_v2026.3.28.md`
-- `docs/PLUGIN_GUIDELINES_REVIEW.md`
-- `docs/REF_ANALYSIS_llm-api-logger.md`
+- `docs/ARCHITECTURE_REVIEW_v2026.3.28.md`（现归档于 `docs/archive/reviews/`）
+- `docs/HOOK_ANALYSIS_v2026.3.28.md`（现归档于 `docs/archive/reviews/`）
+- `docs/PLUGIN_GUIDELINES_REVIEW.md`（现归档于 `docs/archive/reviews/`）
+- `docs/REF_ANALYSIS_llm-api-logger.md`（现归档于 `docs/archive/reviews/`）
 
 这些文件在操作前没有 git 提交，因此覆写行为直接损害了用户未提交的工作副本。
 

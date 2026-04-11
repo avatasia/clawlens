@@ -2,7 +2,7 @@
 
 > **本轮修改说明**
 >
-> - 原文件：`docs/IMPLEMENTATION_PROMPT.md`（**未修改**）
+> - 原文件：`docs/IMPLEMENTATION_PROMPT.md`（现为 `docs/PROMPT_IMPLEMENTATION.md`，**未修改**）
 > - 本文件：仅修订 §6-C、§6-D 及其相关前提说明
 > - 修订原因：原文远程部署章节存在以下具体误操作风险，逐一列于下方；实现修复类章节（§0–§5、§7–§8）原文照搬，不做改动
 >
