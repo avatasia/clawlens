@@ -1,7 +1,7 @@
 # Analysis: Session History Replay Pollution Fix Proposal
 
 > [!IMPORTANT]
-> Current Authority: This is the proposed architectural fix for the session history pollution problem identified in `RESEARCH_OPENCLAW_SESSION_HISTORY_REPLAY_POLLUTION_2026-04-03.md`.
+> Current Authority: This is the proposed architectural fix for the session history pollution problem identified in [RESEARCH_OPENCLAW_SESSION_HISTORY_REPLAY_POLLUTION_2026-04-03.md](../archive/analysis/RESEARCH_OPENCLAW_SESSION_HISTORY_REPLAY_POLLUTION_2026-04-03.md).
 
 ## 1. 问题根源再确认
 
