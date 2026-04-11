@@ -4,7 +4,13 @@
   "description": "OpenClaw session monitor + multi-model comparator",
   "type": "module",
   "openclaw": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ],
+    "install": {
+      "minHostVersion": ">=2026.4.8",
+      "npmSpec": "clawlens@0.1.0"
+    }
   },
   "scripts": {
     "test": "npx tsx --test tests/*.test.ts"

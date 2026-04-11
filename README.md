@@ -172,6 +172,7 @@ Recommended current-entry documents:
 - [ANALYSIS_LLM_API_LOGGER_MESSAGE_MAPPING.md](docs/ANALYSIS_LLM_API_LOGGER_MESSAGE_MAPPING.md)
 - [PLAYBOOK_ENGINEERING_LESSONS.md](docs/PLAYBOOK_ENGINEERING_LESSONS.md)
 - [GOVERNANCE_DOCS_PLAN.md](docs/GOVERNANCE_DOCS_PLAN.md)
+- [DOCS_GOVERNANCE_AUTOMATION.md](docs/DOCS_GOVERNANCE_AUTOMATION.md)
 - [archive/history/README.md](docs/archive/history/README.md)
 
 Prompt / analysis playbooks:
@@ -205,6 +206,11 @@ Maintenance helper:
 
 - `bash scripts/update-openclaw-reference-version.sh`
   updates the OpenClaw reference version line in `docs/architecture.md` from the local `projects-ref/openclaw/` checkout
+
+Docs governance automation (local-first, no PR required):
+
+- Entry point: [DOCS_GOVERNANCE_AUTOMATION.md](docs/DOCS_GOVERNANCE_AUTOMATION.md)
+- Summary: use local checkers and git hooks for docs governance plus clawlens development gates.
 
 ## Current Status
 
