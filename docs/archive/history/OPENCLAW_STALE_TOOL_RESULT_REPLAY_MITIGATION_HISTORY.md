@@ -63,6 +63,6 @@
 - 当前对外分支为：
   - `fix/stale-tool-result-replay`
 - 当前可复用 patch 为：
-  - [OPENCLAW_STALE_TOOL_RESULT_REPLAY_MITIGATION_MYOPENCLAW_MAIN_2026-04-07.patch](../../../patches/openclaw/OPENCLAW_STALE_TOOL_RESULT_REPLAY_MITIGATION_MYOPENCLAW_MAIN_2026-04-07.patch)
+  - 已迁移，不再在本仓库 `docs/` 体系保留 patch 文件链接。
 - 远端完整包部署验证已通过。
 - 该主题当前已完成，不再占用 `docs/plans/`。

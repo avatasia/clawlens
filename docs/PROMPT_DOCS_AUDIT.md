@@ -62,7 +62,7 @@
    - 顶层主文档应为无日期文件
    - 带日期文档应采用 `TYPE_TOPIC[_DETAIL]_YYYY-MM-DD.md`
 12. 是否仍存在本项目文件的绝对路径引用
-    - 如 `/home/.../github/clawlens/...`
+    - 如 `/path/to/repo/...`
 
 ---
 

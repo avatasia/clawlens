@@ -210,6 +210,6 @@ padding-bottom: max(56px, env(safe-area-inset-bottom));
 
 ## 本文与前一份分析的关系
 
-前一份文档 [CHAT_AUDIT_UI_ANALYSIS_2026-04-02.md](../../CHAT_AUDIT_UI_ANALYSIS_2026-04-02.md) 解决的是整体交互问题：可拖拽、长消息查看、整体滚动和 overlay 布局。
+前一份文档 [CHAT_AUDIT_UI_ANALYSIS_2026-04-02.md](./CHAT_AUDIT_UI_ANALYSIS_2026-04-02.md) 解决的是整体交互问题：可拖拽、长消息查看、整体滚动和 overlay 布局。
 
 本文聚焦的是该问题的剩余细节：右下角底部区域为什么在修完前面几项后，视觉上仍然“不干净”。

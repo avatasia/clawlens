@@ -40,7 +40,7 @@
 
 ## 当前可复用 patch
 
-- [OPENCLAW_ASSISTANT_CONCLUSION_POLLUTION_PHASE2_MYOPENCLAW_MAIN_2026-04-07.patch](../../../patches/openclaw/OPENCLAW_ASSISTANT_CONCLUSION_POLLUTION_PHASE2_MYOPENCLAW_MAIN_2026-04-07.patch)
+- 已迁移，不再在本仓库 `docs/` 体系保留 patch 文件链接。
 
 ## 2026-04-07 收口说明
 
