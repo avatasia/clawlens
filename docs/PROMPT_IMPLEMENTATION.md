@@ -50,7 +50,7 @@ cat extensions/clawlens/ui/styles.css
 | `llm_input`/`llm_output`/`agent_end`/`after_tool_call` 是 void hook，框架 `Promise.all` 并行等待 | `hooks.ts:270-291` |
 | `before_agent_start` 是 modifying hook，框架逐个 `await`（顺序执行） | `hooks.ts:494-513` |
 | `tool_result_persist`/`before_message_write` 是同步 hook；handler 返回 Promise 会被警告并忽略 | `hooks.ts:745-878` |
-| `openclaw.plugin.json` 的 `configSchema` 为空对象 + `additionalProperties: false`，会拒绝所有用户配置 | `openclaw.plugin.json:1-7` |
+| ~~`openclaw.plugin.json` 的 `configSchema` 为空对象~~（**已修复**：configSchema 现已包含 `collector` 和 `compare` 完整属性定义） | `openclaw.plugin.json:1-45` |
 | Comparator 对 `runEmbeddedPiAgent()` 的调用缺少必填参数 `sessionId`、`prompt`、`runId`；`before_agent_start` 的 `ctx` 类型本身允许带 `sessionId` | `comparator.ts:72-96`, `params.ts:27-105`, `types.ts:1878-1887` |
 | `loadCostConfig()` 只检查 `cost.input` 是否为 number，`output`/`cacheRead`/`cacheWrite` 缺失时 `calculateCost()` 返回 `NaN` | `cost-calculator.ts:17-26` |
 | `Store.getSessions({ limit: NaN })` 会触发 SQLite `datatype mismatch`（已本地复现） | `api-routes.ts:83`, `store.ts:401` |

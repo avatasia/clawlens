@@ -26,13 +26,40 @@
 
 ## 默认检查项（Docs）
 
+始终执行（所有模式）：
+
 - `docs/` 顶层 markdown 文件名不得带日期。
 - `docs/archive/history/README.md` 必须覆盖所有 `*_HISTORY.md`。
-- 目标 markdown 文件中的相对链接必须可解析。
-- 目标 markdown 文件中不得出现仓库绝对路径。
+- `docs/plans/README.md`、`docs/research/README.md`、`docs/prompts/README.md` 必须覆盖各自目录下所有 `.md` 文件。
 - `DOC_INDEX/ROLLBACK_INDEX/CODE_INDEX` 双向索引一致性（默认 warn，`--strict` fail）。
 - 若配置 `entry_points:`，执行 warn 级别符号存在性提示（不阻断）。
-- 默认模式只检查 `staged` 文档改动；全量治理请使用 `--all`。
+
+仅对目标文件执行（默认 staged，`--all` 全量）：
+
+- 目标 markdown 文件中的相对链接必须可解析（自动跳过 fenced code block 内容）。
+- 目标 markdown 文件中不得出现仓库绝对路径。
+
+仅 `--all` 模式额外执行：
+
+- `README.md` 完整性：所有 `docs/` 顶层 `.md` 应被根 `README.md` 列出（warn 级别）。
+- 带日期文件 TYPE 前缀合规：首单词必须属于治理规则允许列表（warn 级别）。
+
+## 已知未自动化的治理规则
+
+以下规则依赖人工纪律或审计提示词覆盖，脚本无法自动检查：
+
+- 归档分类正确性（文件是否在正确的 archive 子目录）。
+- 每主题仅保留一个顶层主文档。
+- 归档操作原子性（移动 + 链接修复 + history 登记应在同一提交）。
+- 文档内容与代码的技术一致性。
+- 跨文档口径冲突。
+
+以下规则已实现自动 warn 级别检查（2026-04-11 起）：
+
+- Backtick 路径引用时效性：inline code 中匹配已知目录前缀的文件路径存在性检查。
+- Link text/target basename mismatch：当链接文本看起来像文件名时，校验其 basename 与 target 的 basename 是否一致。
+
+定期执行 `docs/PROMPT_DOCS_AUDIT.md` 或全局验证提示词可覆盖上述维度。
 
 ## 默认检查项（Development Gates）
 

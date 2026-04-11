@@ -76,6 +76,8 @@ Constraints:
 - Distinguish pre-existing baseline debt vs newly introduced regressions.
 ```
 
+For full technical content validation (9 dimensions including code accuracy, cross-doc consistency, per-topic completeness), see [PROMPT_DOCS_GLOBAL_VALIDATION.md](PROMPT_DOCS_GLOBAL_VALIDATION.md).
+
 历史日期版：
 
 - [PROMPT_DOCS_AUDIT_2026-04-03.md (旧版中文)](archive/history/DOCS_AUDIT_PROMPT_HISTORY.md)

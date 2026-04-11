@@ -9,30 +9,28 @@
 
 - 远端服务器可通过 SSH 密钥登录（示例：`ssh szhdy`）。
 - 远端已安装 OpenClaw 并有运行中的 gateway。
-- 本地已完成 `pnpm install` 和 `pnpm build`（在 `extensions/clawlens/` 下）。
+- 本地已完成 `pnpm install`（在 `extensions/clawlens/` 下）。插件为源码直接部署，无需 build 步骤。
 
-## 1. 远端环境 PATH 调整
+## 1. SSH 执行约束（必须加载 `~/.bashrc`）
 
-远端的 `pnpm` 和 `openclaw` 均不在默认非交互式 SSH PATH 中。通过 `ssh szhdy <command>` 执行命令时，必须显式设置 PATH。
+通过 `ssh szhdy '<command>'` 执行非交互命令时，远端默认不会加载 `~/.bashrc`，容易命中错误 PATH。
 
-已知路径：
+本 SOP 统一要求：**所有 SSH 命令都通过 `bash -lc` 并显式 `source ~/.bashrc` 执行。**
+
+统一模板：
+
+```bash
+ssh szhdy 'bash -lc "source ~/.bashrc && <command>"'
+```
+
+远端当前绝对路径（用于排障与兜底）：
 
 | 工具 | 远端路径 |
 |---|---|
-| `pnpm` | `/home/openclaw/.local/share/pnpm/pnpm` |
+| `node` | `/home/openclaw/.nvm/versions/node/v24.14.0/bin/node` |
+| `npm` | `/home/openclaw/.nvm/versions/node/v24.14.0/bin/npm` |
+| `pnpm` | `/home/openclaw/.nvm/versions/node/v24.14.0/bin/pnpm` |
 | `openclaw` | `/home/openclaw/.nvm/versions/node/v24.14.0/bin/openclaw` |
-
-在所有远端命令前加入 PATH 导出：
-
-```bash
-export PATH="/home/openclaw/.nvm/versions/node/v24.14.0/bin:/home/openclaw/.local/share/pnpm:$PATH"
-```
-
-或对单条 SSH 命令内联使用：
-
-```bash
-ssh szhdy 'export PATH="/home/openclaw/.nvm/versions/node/v24.14.0/bin:/home/openclaw/.local/share/pnpm:$PATH" && <command>'
-```
 
 ## 2. 复制插件文件到远端
 
@@ -55,7 +53,7 @@ rsync -avz --delete \
 ### scp 方式（备选）
 
 ```bash
-ssh szhdy 'mkdir -p ~/.openclaw/extensions/clawlens'
+ssh szhdy 'bash -lc "source ~/.bashrc && mkdir -p ~/.openclaw/extensions/clawlens"'
 scp -r extensions/clawlens/* szhdy:~/.openclaw/extensions/clawlens/
 ```
 
@@ -64,7 +62,7 @@ scp -r extensions/clawlens/* szhdy:~/.openclaw/extensions/clawlens/
 若插件有 npm 依赖需要安装：
 
 ```bash
-ssh szhdy 'export PATH="/home/openclaw/.nvm/versions/node/v24.14.0/bin:/home/openclaw/.local/share/pnpm:$PATH" && cd ~/.openclaw/extensions/clawlens && pnpm install --frozen-lockfile'
+ssh szhdy 'bash -lc "source ~/.bashrc && cd ~/.openclaw/extensions/clawlens && pnpm install --frozen-lockfile"'
 ```
 
 ## 4. 注册插件到 openclaw.yaml
@@ -85,7 +83,7 @@ plugins:
 通过 SSH 编辑：
 
 ```bash
-ssh szhdy 'vi ~/.openclaw/openclaw.yaml'
+ssh szhdy 'bash -lc "source ~/.bashrc && vi ~/.openclaw/openclaw.yaml"'
 ```
 
 或使用交互式 SSH 会话：
@@ -101,7 +99,7 @@ vi ~/.openclaw/openclaw.yaml
 重启 OpenClaw gateway 以加载新插件：
 
 ```bash
-ssh szhdy 'export PATH="/home/openclaw/.nvm/versions/node/v24.14.0/bin:/home/openclaw/.local/share/pnpm:$PATH" && openclaw gateway restart'
+ssh szhdy 'bash -lc "source ~/.bashrc && openclaw gateway restart"'
 ```
 
 重启后必须做“两阶段验收”，不可只依赖 `restart` 的返回文本：
@@ -127,10 +125,10 @@ bash scripts/remote-gateway-restart-verify.sh szhdy 120 600
 
 ```bash
 # 查找现有 gateway 进程
-ssh szhdy 'ps aux | grep openclaw'
+ssh szhdy 'bash -lc "source ~/.bashrc && ps aux | grep openclaw"'
 
 # 按实际情况停止并重新启动
-ssh szhdy 'export PATH="/home/openclaw/.nvm/versions/node/v24.14.0/bin:/home/openclaw/.local/share/pnpm:$PATH" && openclaw gateway start'
+ssh szhdy 'bash -lc "source ~/.bashrc && openclaw gateway start"'
 ```
 
 ## 6. 验证插件加载
@@ -138,7 +136,7 @@ ssh szhdy 'export PATH="/home/openclaw/.nvm/versions/node/v24.14.0/bin:/home/ope
 ### 6.1 检查 gateway 日志
 
 ```bash
-ssh szhdy 'export PATH="/home/openclaw/.nvm/versions/node/v24.14.0/bin:/home/openclaw/.local/share/pnpm:$PATH" && openclaw gateway logs --tail 50'
+ssh szhdy 'bash -lc "source ~/.bashrc && openclaw gateway logs --tail 50"'
 ```
 
 预期看到类似输出：
@@ -150,7 +148,7 @@ ssh szhdy 'export PATH="/home/openclaw/.nvm/versions/node/v24.14.0/bin:/home/ope
 ### 6.2 检查插件状态
 
 ```bash
-ssh szhdy 'export PATH="/home/openclaw/.nvm/versions/node/v24.14.0/bin:/home/openclaw/.local/share/pnpm:$PATH" && openclaw plugins inspect clawlens'
+ssh szhdy 'bash -lc "source ~/.bashrc && openclaw plugins inspect clawlens"'
 ```
 
 ### 6.3 测试 API 端点
@@ -158,7 +156,7 @@ ssh szhdy 'export PATH="/home/openclaw/.nvm/versions/node/v24.14.0/bin:/home/ope
 通过 SSH 在远端本地测试：
 
 ```bash
-ssh szhdy 'curl -s http://localhost:18789/plugins/clawlens/api/overview'
+ssh szhdy 'bash -lc "source ~/.bashrc && curl -s http://localhost:18789/plugins/clawlens/api/overview"'
 ```
 
 预期返回 JSON 数据而非 404。
@@ -218,7 +216,11 @@ ssh -fN -L 18789:127.0.0.1:18789 szhdy
 
 ### PATH 相关报错
 
-远端通过非交互式 SSH 执行命令时，`~/.bashrc` 和 `~/.profile` 中的 PATH 设置通常不会生效。始终在命令中显式 export PATH。
+远端通过非交互式 SSH 执行命令时，若不显式加载 `~/.bashrc`，PATH 往往与交互会话不一致。统一使用：
+
+```bash
+ssh szhdy 'bash -lc "source ~/.bashrc && <command>"'
+```
 
 ## 参考
 

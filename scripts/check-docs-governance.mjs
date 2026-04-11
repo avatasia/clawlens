@@ -81,6 +81,63 @@ function checkHistoryReadmeCoverage() {
   }
 }
 
+function checkSubdirReadmeCoverage() {
+  const subdirs = [
+    { dir: path.join(docsDir, "plans"), label: "docs/plans" },
+    { dir: path.join(docsDir, "research"), label: "docs/research" },
+    { dir: path.join(docsDir, "prompts"), label: "docs/prompts" },
+  ];
+  for (const { dir, label } of subdirs) {
+    if (!fs.existsSync(dir)) continue;
+    const readme = path.join(dir, "README.md");
+    if (!fs.existsSync(readme)) {
+      pushError(`Missing index: ${label}/README.md`);
+      continue;
+    }
+    const content = fs.readFileSync(readme, "utf8");
+    const files = fs.readdirSync(dir)
+      .filter((name) => name.endsWith(".md") && name !== "README.md");
+    for (const file of files) {
+      const targetRe = new RegExp(`\\[[^\\]]+\\]\\(${escapeRegExp(file)}\\)`);
+      if (!targetRe.test(content)) {
+        pushError(`File is not indexed in ${label}/README.md: ${file}`);
+      }
+    }
+  }
+}
+
+function checkRootReadmeCompleteness() {
+  const rootReadme = path.join(repoRoot, "README.md");
+  if (!fs.existsSync(rootReadme)) return;
+  const content = fs.readFileSync(rootReadme, "utf8");
+  const topLevelDocs = fs.readdirSync(docsDir, { withFileTypes: true })
+    .filter((e) => e.isFile() && e.name.endsWith(".md"))
+    .map((e) => e.name);
+  for (const file of topLevelDocs) {
+    const linkRe = new RegExp(`\\[[^\\]]+\\]\\(docs/${escapeRegExp(file)}\\)`);
+    if (!linkRe.test(content)) {
+      pushWarning(`Top-level doc not listed in README.md: docs/${file}`);
+    }
+  }
+}
+
+const validTypePrefixes = new Set([
+  "ANALYSIS", "RESEARCH", "IMPLEMENTATION", "PROMPT", "REVIEW",
+  "FIX", "CHANGELOG", "POSTMORTEM", "GOVERNANCE", "PLAYBOOK", "HISTORY",
+]);
+
+function checkDatedFileNamingConvention() {
+  const allDocs = walk(docsDir).filter((f) => f.endsWith(".md"));
+  for (const file of allDocs) {
+    const name = path.basename(file, ".md");
+    if (!topLevelDateRe.test(name)) continue;
+    const prefix = name.split("_")[0];
+    if (!validTypePrefixes.has(prefix)) {
+      pushWarning(`Dated file has non-standard TYPE prefix "${prefix}": ${rel(file)}`);
+    }
+  }
+}
+
 function isSkippableLink(target) {
   return (
     target.startsWith("http://")
@@ -117,9 +174,18 @@ function listTargetDocsFiles() {
   return listStagedDocsFiles().filter((file) => fs.existsSync(file));
 }
 
+function stripFencedCodeBlocks(text) {
+  return text.replace(/^```[\s\S]*?^```/gm, "");
+}
+
+function stripInlineCode(text) {
+  // Strip double backtick spans first, then single
+  return text.replace(/``[^`]+``/g, "").replace(/`[^`]+`/g, "");
+}
+
 function checkRelativeLinksResolve(files) {
   for (const file of files) {
-    const content = fs.readFileSync(file, "utf8");
+    const content = stripInlineCode(stripFencedCodeBlocks(fs.readFileSync(file, "utf8")));
     let match;
     while ((match = markdownLinkRe.exec(content)) !== null) {
       const rawTarget = match[2];
@@ -334,6 +400,58 @@ function checkDocCodeBidirectionalIndexes() {
   }
 }
 
+// ── New automated checks ──────────────────────────────────────────────────
+
+const backtickPathPrefixes = [
+  "docs/", "archive/", "plans/", "research/", "prompts/",
+  "patches/", "extensions/", "scripts/", "projects-ref/",
+];
+const backtickPathRe = new RegExp(
+  "`(" + backtickPathPrefixes.map(escapeRegExp).join("|") + ")[^`]*\\.\\w+`",
+  "g",
+);
+
+function checkBacktickPathValidity(files) {
+  for (const file of files) {
+    const raw = fs.readFileSync(file, "utf8");
+    const content = stripFencedCodeBlocks(raw);
+    let match;
+    while ((match = backtickPathRe.exec(content)) !== null) {
+      const refPath = match[0].slice(1, -1); // strip backticks
+      // Skip glob patterns — they aren't literal file references
+      if (refPath.includes("*")) continue;
+      const resolved = path.resolve(repoRoot, refPath);
+      if (!fs.existsSync(resolved)) {
+        pushWarning(`Stale backtick path in ${rel(file)}: \`${refPath}\` (file not found)`);
+      }
+    }
+  }
+}
+
+function checkLinkTextTargetMismatch(files) {
+  const filenameLikeRe = /\.\w{1,5}$/;
+  for (const file of files) {
+    const raw = fs.readFileSync(file, "utf8");
+    const content = stripFencedCodeBlocks(raw);
+    let match;
+    while ((match = markdownLinkRe.exec(content)) !== null) {
+      const text = match[1];
+      const rawTarget = match[2];
+      if (isSkippableLink(rawTarget)) continue;
+      if (!filenameLikeRe.test(text)) continue;
+      const target = cleanLinkTarget(rawTarget);
+      if (!target) continue;
+      const textBase = path.basename(text);
+      const targetBase = path.basename(target);
+      if (textBase !== targetBase) {
+        pushWarning(
+          `Link text/target basename mismatch in ${rel(file)}: text="${text}" target="${target}"`,
+        );
+      }
+    }
+  }
+}
+
 function main() {
   if (!fs.existsSync(docsDir)) {
     console.error("docs/ not found");
@@ -344,13 +462,21 @@ function main() {
 
   checkTopLevelNoDateFile();
   checkHistoryReadmeCoverage();
+  checkSubdirReadmeCoverage();
   checkDocCodeBidirectionalIndexes();
+
+  if (runAll) {
+    checkRootReadmeCompleteness();
+    checkDatedFileNamingConvention();
+  }
 
   if (targetFiles.length === 0) {
     console.log("No staged docs markdown changes found. Running structural checks only.");
   } else {
     checkRelativeLinksResolve(targetFiles);
     checkNoAbsoluteProjectPath(targetFiles);
+    checkBacktickPathValidity(targetFiles);
+    checkLinkTextTargetMismatch(targetFiles);
   }
 
   if (warnings.length > 0) {
