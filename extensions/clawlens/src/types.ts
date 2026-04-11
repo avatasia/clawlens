@@ -8,6 +8,9 @@ export type ClawLensConfig = {
     loggerImportMaxFileSizeMb?: number;
     backfillRunKindsOnStart?: boolean;
     backfillRunKindsLimit?: number;
+    // ROLLBACK_INDEX: CLAWLENS_TRANSCRIPT_BINDING_STRATEGY
+    // Default remains legacy behavior for safe rollout and easy rollback.
+    transcriptBindingStrategy?: "legacy_recent_window" | "safe_message_anchor";
   };
   compare?: {
     enabled?: boolean;

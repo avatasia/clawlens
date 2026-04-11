@@ -1167,10 +1167,13 @@ export class Store {
 
   findRecentRunIdForSession(
     sessionKey: string,
-    opts?: { timestamp?: number; kind?: "heartbeat" | "chat"; windowMs?: number },
+    opts?: { timestamp?: number; kind?: "heartbeat" | "chat"; windowMs?: number; bindGraceMs?: number },
   ): string | null {
+    // ROLLBACK_INDEX: CLAWLENS_TRANSCRIPT_BINDING_STRATEGY
     const ts = opts?.timestamp ?? Date.now();
+    // Default remains the historical behavior unless caller opts into stricter guards.
     const windowMs = opts?.windowMs ?? 5 * 60 * 1000;
+    const bindGraceMs = opts?.bindGraceMs;
     const rows = this.db.prepare(`
       SELECT run_id, started_at, ended_at, run_kind
       FROM runs
@@ -1186,13 +1189,19 @@ export class Store {
       run_kind?: string | null;
     }>;
     const desiredKind = opts?.kind ?? "chat";
+    const bindable = (row: { ended_at?: number | null }) => {
+      if (typeof bindGraceMs !== "number" || !Number.isFinite(bindGraceMs)) return true;
+      return row.ended_at == null || row.ended_at >= ts - bindGraceMs;
+    };
+
     for (const row of rows) {
       const rowKind = row.run_kind ?? "chat";
       if (rowKind !== desiredKind) continue;
+      if (!bindable(row)) continue;
       return row.run_id;
     }
     for (const row of rows) {
-      if (!row.run_kind) return row.run_id;
+      if (!row.run_kind && bindable(row)) return row.run_id;
     }
     return null;
   }

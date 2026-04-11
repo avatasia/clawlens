@@ -91,6 +91,9 @@ export class Collector {
   private costMap = new Map<string, { input: number; output: number; cacheRead: number; cacheWrite: number }>();
   private debugEnabled = false;
   private liveLlmByRunId = new Map<string, LiveLlmStream>();
+  // ROLLBACK_INDEX: CLAWLENS_TRANSCRIPT_BINDING_STRATEGY
+  // Keep legacy as default. Switch explicitly via collector.transcriptBindingStrategy.
+  private transcriptBindingStrategy: "legacy_recent_window" | "safe_message_anchor" = "legacy_recent_window";
 
   constructor(
     private store: Store,
@@ -100,6 +103,7 @@ export class Collector {
   start(runtime: unknown, globalConfig: unknown, pluginConfig: ClawLensConfig): void {
     this.costMap = loadCostConfig(globalConfig);
     this.debugEnabled = isClawLensDebugEnabled(pluginConfig.collector?.debugLogs);
+    this.transcriptBindingStrategy = pluginConfig.collector?.transcriptBindingStrategy ?? "legacy_recent_window";
 
     // NOTE: snapshotIntervalMs is not yet wired up.
     // This interval drives the write-queue flush at 100ms cadence, which is intentional.
@@ -572,17 +576,12 @@ export class Collector {
     const normalized = normalizeTranscriptMessage(update.message);
     if (!normalized) return;
     const turnKind = classifyTranscriptTurnKind(normalized);
-    const runId =
-      normalized.explicitRunId
-      ?? this.findActiveRunIdForSessionKind(sessionKey, turnKind)
-      ?? this.store.findRecentRunIdForSession(sessionKey, {
-        timestamp: normalized.timestamp,
-        kind: turnKind,
-      });
+    const runId = this.resolveTranscriptRunId(sessionKey, turnKind, normalized);
     this.debug("transcript_update", {
       sessionKey,
       messageId: update.messageId,
       explicitRunId: normalized.explicitRunId,
+      strategy: this.transcriptBindingStrategy,
       resolvedRunId: runId,
       turnKind,
       role: normalized.role,
@@ -605,8 +604,37 @@ export class Collector {
     });
   }
 
-  private findActiveRunIdForSession(sessionKey?: string): string | null {
-    return this.findActiveRunIdForSessionKind(sessionKey, "chat");
+  private resolveTranscriptRunId(
+    sessionKey: string,
+    turnKind: "heartbeat" | "chat",
+    normalized: {
+      explicitRunId?: string;
+      timestamp?: number;
+      role: string;
+      preview: string;
+    },
+  ): string | null {
+    const explicit = normalized.explicitRunId;
+    if (explicit) return explicit;
+    const active = this.findActiveRunIdForSessionKind(sessionKey, turnKind);
+    if (active) return active;
+
+    if (this.transcriptBindingStrategy === "safe_message_anchor") {
+      // Stricter fallback: narrow window and only bind to running / just-ended runs.
+      // This reduces cross-turn merge when queued messages arrive after completion.
+      return this.store.findRecentRunIdForSession(sessionKey, {
+        timestamp: normalized.timestamp,
+        kind: turnKind,
+        windowMs: 90 * 1000,
+        bindGraceMs: 20 * 1000,
+      });
+    }
+
+    // Legacy behavior (default): broader window, no ended-run guard.
+    return this.store.findRecentRunIdForSession(sessionKey, {
+      timestamp: normalized.timestamp,
+      kind: turnKind,
+    });
   }
 
   private findActiveRunIdForSessionKind(sessionKey: string | undefined, kind: "heartbeat" | "chat"): string | null {
