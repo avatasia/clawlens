@@ -15,6 +15,22 @@ ClawLens 的上游参考代码不再通过 Git submodule 绑定。
 
 该目录仅作为本地研究、对照和审计输入源，不构成 ClawLens 运行时依赖，也不要求主仓库对其提交指针进行硬绑定。
 
+## QA/Lab 状态说明（2026-04-11）
+
+OpenClaw 的 `qa`/`qa-lab` 当前可视为 ClawLens 的外部测试编排面，而不是审计面替代：
+
+- `qa` 负责场景驱动的 E2E 执行与报告导出。
+- ClawLens 负责 run-level 审计采集、持久化与 chat 侧可观测性。
+
+远程环境（`szhdy`）在 `v2026.4.10` 的一次核验中发现：
+
+1. 默认安装态下缺失 `qa/` 场景包目录，导致 `openclaw qa --help` 直接失败。
+2. 将 `qa/scenarios` 部署到安装目录后，`qa` 子命令恢复，`qa run` 自检通过。
+
+详情见研究记录：
+
+- `docs/research/RESEARCH_OPENCLAW_QA_LAB_REMOTE_STATUS_2026-04-11.md`
+
 ## 1. 定位
 
 ClawLens 是一个 OpenClaw 插件，当前主要承担两类能力：
@@ -403,6 +419,15 @@ pending queue 仍然存在，但已从“按纯 sessionKey 出队”改成“按
 - 当前可用的最佳后端回查结果
 - heartbeat 已排除在 chat-facing 路径之外
 
+### `unknown` 起步恢复口径
+
+在 channel 入站链路中，`lifecycle:start` 出现 `sessionKey="unknown"` 后再由 transcript 绑定到正确 session/run，是当前可接受的常态恢复路径。
+
+建议将其拆分为两类：
+
+- `unknown_start_recovered`：可接受，不按故障处理
+- `unknown_persisted`：需要排查（仍停留在 `unknown` 会话桶，或 `current-message-run` 只能 fallback）
+
 ### logger import
 
 `POST /audit/logger/import` 当前已经是正式接口，不再只是计划项。
@@ -458,6 +483,10 @@ pending queue 仍然存在，但已从“按纯 sessionKey 出队”改成“按
 - 新 run 到达时自动展开最新 run
 - 背景刷新与用户点击/hover 尽量隔离
 - chat shell 打开 sidebar 时整体让位，而不是覆盖消息流内部布局
+- 绑定异常徽标仅针对“当前未恢复状态”触发：
+  - `UNKNOWN SESSION`
+  - `FALLBACK BIND`
+  - `UNRESOLVED`
 
 ### 稳定性原则
 

@@ -1299,6 +1299,18 @@ export class Store {
   }
 
   getCurrentMessageRun(sessionKey: string): unknown {
+    const latestRun = this.db.prepare(`
+      SELECT run_id, status, started_at
+      FROM runs
+      WHERE session_key = ? AND COALESCE(run_kind, 'chat') != 'heartbeat'
+      ORDER BY started_at DESC
+      LIMIT 1
+    `).get(sessionKey) as {
+      run_id?: string | null;
+      status?: string | null;
+      started_at?: number | null;
+    } | undefined;
+
     const row = this.db.prepare(`
       SELECT
         t.message_id,
@@ -1318,6 +1330,19 @@ export class Store {
       LIMIT 1
     `).get(sessionKey) as any;
     if (!row) {
+      if (latestRun?.run_id) {
+        return {
+          sessionKey,
+          status: "fallback",
+          lookupBasis: "latest-run",
+          matchedTurn: null,
+          run: {
+            runId: latestRun.run_id,
+            status: latestRun.status ?? null,
+            startedAt: latestRun.started_at ?? null,
+          },
+        };
+      }
       return {
         sessionKey,
         status: "none",
@@ -1326,6 +1351,37 @@ export class Store {
         run: null,
       };
     }
+
+    const latestRunId = typeof latestRun?.run_id === "string" ? latestRun.run_id : null;
+    const latestRunStartedAt = typeof latestRun?.started_at === "number" ? latestRun.started_at : null;
+    const matchedRunId = typeof row.run_id === "string" ? row.run_id : null;
+    const matchedTurnTs = typeof row.timestamp === "number" ? row.timestamp : null;
+    const isStaleUserTurn = Boolean(
+      latestRunId
+      && latestRunStartedAt != null
+      && matchedRunId !== latestRunId
+      && (matchedTurnTs == null || latestRunStartedAt - matchedTurnTs > 120_000),
+    );
+    if (isStaleUserTurn) {
+      return {
+        sessionKey,
+        status: "fallback",
+        lookupBasis: "latest-run",
+        matchedTurn: {
+          role: row.role,
+          messageId: row.message_id ?? null,
+          sourceKind: row.source_kind ?? "session_fallback",
+          textPreview: row.content_preview ?? "",
+          timestamp: row.timestamp ?? null,
+        },
+        run: {
+          runId: latestRunId,
+          status: latestRun?.status ?? null,
+          startedAt: latestRunStartedAt,
+        },
+      };
+    }
+
     const sourceKind = row.source_kind ?? "session_fallback";
     const status = row.run_id
       ? (sourceKind === "session_fallback" ? "fallback" : "resolved")

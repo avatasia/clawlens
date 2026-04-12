@@ -891,6 +891,8 @@ const CHAT_STATE = {
   loadingRunIds: new Set(),
   currentMessageRunId: null,
   currentMessageStatus: null,
+  currentMessageLookupBasis: null,
+  currentMessageSourceKind: null,
   lastDomMessageFingerprint: null,
   domRefreshTimer: null,
   autoExpandDone: false,
@@ -1022,6 +1024,7 @@ function requestChatAuditRefresh(reason, opts = {}) {
 }
 
 function updateAuditSidebarContent(forceImmediate = false) {
+  updateAuditHeaderBindHealth();
   const body = document.getElementById("clawlens-audit-sidebar-body");
   if (!body) return;
   const now = Date.now();
@@ -1079,6 +1082,52 @@ function updateAuditSidebarContent(forceImmediate = false) {
     }
   };
   document.getElementById("clawlens-audit-load-more")?.addEventListener("click", loadOlderChatAudit);
+}
+
+function resolveAuditBindHealth() {
+  const rawKey = CHAT_STATE.sourceSessionKey ?? CHAT_STATE.sessionKey ?? "";
+  const resolvedKey = CHAT_STATE.sessionKey ?? "";
+  const status = CHAT_STATE.currentMessageStatus ?? "";
+  const lookupBasis = CHAT_STATE.currentMessageLookupBasis ?? "";
+  const sourceKind = CHAT_STATE.currentMessageSourceKind ?? "";
+
+  if (rawKey === "unknown" || resolvedKey === "unknown") {
+    return {
+      level: "error",
+      label: "UNKNOWN SESSION",
+      title: "Session key is unknown. Binding may rely on fallback mapping.",
+    };
+  }
+  if (status === "fallback" || lookupBasis === "latest-run" || sourceKind === "session_fallback") {
+    return {
+      level: "warn",
+      label: "FALLBACK BIND",
+      title: `Current-message binding uses fallback (${lookupBasis || "unknown basis"}).`,
+    };
+  }
+  if (status === "pending" || status === "none") {
+    return {
+      level: "warn",
+      label: "UNRESOLVED",
+      title: "Current message run is not resolved yet.",
+    };
+  }
+  return null;
+}
+
+function updateAuditHeaderBindHealth() {
+  const badge = document.getElementById("clawlens-audit-bind-health");
+  if (!badge) return;
+  const health = resolveAuditBindHealth();
+  if (!health) {
+    badge.className = "clawlens-audit-bind-health hidden";
+    badge.textContent = "";
+    badge.removeAttribute("title");
+    return;
+  }
+  badge.className = `clawlens-audit-bind-health ${health.level}`;
+  badge.textContent = health.label;
+  badge.title = health.title;
 }
 
 function scheduleDeferredSidebarRender() {
@@ -1139,7 +1188,10 @@ function mountChatAuditSidebar() {
   sidebar.innerHTML = `
     <div class="clawlens-resize-handle" title="拖拽调整宽度"></div>
     <div class="clawlens-audit-header">
-      <span class="clawlens-audit-title">ClawLens Audit</span>
+      <div class="clawlens-audit-header-left">
+        <span class="clawlens-audit-title">ClawLens Audit</span>
+        <span id="clawlens-audit-bind-health" class="clawlens-audit-bind-health hidden"></span>
+      </div>
       <button class="clawlens-audit-close" id="clawlens-audit-close-btn" title="Close">✕</button>
     </div>
     <div id="clawlens-audit-sidebar-body" class="clawlens-audit-body">
@@ -1312,11 +1364,16 @@ async function refreshCurrentMessageRunHint() {
   if (!hint) return;
   CHAT_STATE.currentMessageStatus = hint.status ?? null;
   CHAT_STATE.currentMessageRunId = hint.run?.runId ?? null;
+  CHAT_STATE.currentMessageLookupBasis = hint.lookupBasis ?? null;
+  CHAT_STATE.currentMessageSourceKind = hint.matchedTurn?.sourceKind ?? null;
   const runId = hint.run?.runId;
   debugLog("refreshCurrentMessageRunHint:loaded", {
     status: hint.status ?? null,
+    lookupBasis: hint.lookupBasis ?? null,
+    sourceKind: hint.matchedTurn?.sourceKind ?? null,
     runId: runId ?? null,
   });
+  if (CHAT_STATE.visible) updateAuditHeaderBindHealth();
   if (!runId) return;
   const hasRun = CHAT_STATE.data.runs.some((run) => run.runId === runId);
   if (!hasRun) return;
@@ -1431,6 +1488,10 @@ async function refreshChatAudit() {
     CHAT_STATE.hasMore = false;
     CHAT_STATE.expandedRunIds.clear();
     CHAT_STATE.loadingRunIds.clear();
+    CHAT_STATE.currentMessageRunId = null;
+    CHAT_STATE.currentMessageStatus = null;
+    CHAT_STATE.currentMessageLookupBasis = null;
+    CHAT_STATE.currentMessageSourceKind = null;
     CHAT_STATE.lastDetailRefreshAt.clear();
     CHAT_STATE.autoExpandDone = false;
     CHAT_STATE.loading = true;

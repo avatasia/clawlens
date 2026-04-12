@@ -200,9 +200,13 @@ export class Collector {
         ?? (agentId ? `agent:${agentId}` : undefined)
         ?? "unknown";
       const startedAt = (data.startedAt as number | undefined) ?? evt.ts ?? Date.now();
+      const sessionId = typeof data.sessionId === "string" ? data.sessionId : undefined;
 
       const active: ActiveRun = { runId, sessionKey, startedAt, llmCallIndex: 0 };
       this.activeRuns.set(runId, active);
+      if (sessionId) {
+        this.sessionIdToRunId.set(sessionId, runId);
+      }
       this.debug("lifecycle:start", { runId, sessionKey, startedAt });
 
       this.enqueue(() => {
@@ -622,8 +626,8 @@ export class Collector {
         this.queuePendingTranscriptTurn(pendingTurn);
         return;
       }
+      this.backfillRunSessionKeyIfNeeded(runId, sessionKey);
       if (this.transcriptBindingStrategy === "safe_message_anchor") {
-        this.backfillRunSessionKeyIfNeeded(runId, sessionKey);
         const drained = this.drainPendingTranscriptTurns(sessionKey, turnKind);
         for (const turn of drained) {
           this.persistTranscriptTurn(runId, turn);
@@ -669,6 +673,14 @@ export class Collector {
       const mappedBySession = this.sessionIdToRunId.get(opts.sessionIdFromFile) ?? null;
       if (mappedBySession) return mappedBySession;
     }
+    // 4) unknown active run fallback: when lifecycle start lacks session context,
+    // bind transcript turns to the most recent unknown active run in a short window.
+    if (sessionKey !== "unknown") {
+      const mappedUnknownActive = this.findUnknownActiveRunIdForTurnKind(turnKind, {
+        timestamp: opts.anchorTimestamp ?? normalized.timestamp,
+      });
+      if (mappedUnknownActive) return mappedUnknownActive;
+    }
     if ((opts.queuedSourceMessageIds?.length ?? 0) > 0) {
       this.debug("transcript_binding: queued deferred", {
         sessionKey,
@@ -697,6 +709,25 @@ export class Collector {
       timestamp: opts.anchorTimestamp ?? normalized.timestamp,
       kind: turnKind,
     });
+  }
+
+  private findUnknownActiveRunIdForTurnKind(
+    kind: "heartbeat" | "chat",
+    opts?: { timestamp?: number },
+  ): string | null {
+    const anchorTs = typeof opts?.timestamp === "number" && Number.isFinite(opts.timestamp)
+      ? opts.timestamp
+      : Date.now();
+    const candidates: ActiveRun[] = [];
+    for (const active of this.activeRuns.values()) {
+      if (active.sessionKey !== "unknown") continue;
+      if (active.runKind && active.runKind !== kind) continue;
+      // Keep the window tight to avoid cross-session misbinding.
+      if (Math.abs(active.startedAt - anchorTs) > 120_000) continue;
+      candidates.push(active);
+    }
+    if (candidates.length !== 1) return null;
+    return candidates[0]?.runId ?? null;
   }
 
   private backfillRunSessionKeyIfNeeded(runId: string, sessionKey: string): void {
