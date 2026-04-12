@@ -67,64 +67,25 @@
 - `openclaw@main`（`projects-ref/openclaw`）：持续验证，必过。
 - `openclaw@latest-stable-tag`：tag 发布时做回归验证。
 
-## `forward-compat` 门禁改进提案
+## `forward-compat` 门禁改进
 
-> **注意：以下是提案，不是已实施的变更。实施需修改 `scripts/forward-compat.sh`，属于后续代码变更阶段。**
+`forward-compat.sh` 现已支持方案 A（`--openclaw-bin`）和方案 B（`--use-local-ref`），解决了在无 `openclaw` CLI 环境下的验证空白问题。
 
-### 问题分析
+### 实施详情
 
-`forward-compat.sh` 当前依赖 `command -v openclaw` 来寻找 CLI。由于：
+1. **方案 A：接受 `--openclaw-bin` 参数**
+   - 允许显式指定远端或本地特定路径下的 `openclaw` 二进制文件。
+   - 解决了非交互式 SSH PATH 缺失问题。
 
-1. 本地未安装 `openclaw` CLI（或未在 PATH 中）。
-2. 远端 `openclaw` 在 `/home/openclaw/.nvm/versions/node/v24.14.0/bin/openclaw`，不在默认非交互式 SSH PATH 中。
+2. **方案 B：使用 `projects-ref/openclaw` 做本地 import 验证**
+   - 新增 `--use-local-ref` 标志。
+   - 通过 `scripts/verify-local-imports.mjs` 静态验证插件代码中的 `openclaw/plugin-sdk/*` 导出是否在参考源中存在。
+   - 提供了完全不依赖运行时的基线兼容性检查。
 
-因此门禁在 `soft` 模式下始终跳过，从未产生过实际验证结果。
+### 验证模式
 
-### 方案 A：接受 `--openclaw-bin` 参数
-
-```bash
-# 示例用法
-bash scripts/forward-compat.sh soft --openclaw-bin /path/to/openclaw
-```
-
-修改要点：
-
-- 新增 `--openclaw-bin <path>` 可选参数。
-- 若提供，则直接使用该路径执行 `plugins inspect`，跳过 `command -v` 检测。
-- 若未提供，回退到当前的 PATH 检测逻辑。
-
-优势：不改变默认行为，向后兼容。
-劣势：仍需要一个可运行的 `openclaw` 实例。
-
-### 方案 B：使用 `projects-ref/openclaw` 做 import 验证
-
-```bash
-# 无需 openclaw CLI，直接用本地参考源
-bash scripts/forward-compat.sh soft --use-local-ref
-```
-
-修改要点：
-
-- 新增 `--use-local-ref` 模式。
-- 使用 Node.js 解析 `extensions/clawlens/index.ts` 中的 `openclaw/plugin-sdk/*` 导入。
-- 在 `projects-ref/openclaw/src/` 中验证对应导出是否存在。
-- 不需要 `openclaw` CLI 运行时。
-
-优势：完全本地化，可在任何环境执行。
-劣势：仅验证 import 解析，不验证运行时行为（如 hook 注册、API route 可用性）。
-
-### 方案 C：结合 A + B
-
-- 默认使用方案 B（本地 import 验证）作为基线检查。
-- 可选使用方案 A（`--openclaw-bin`）做更深层的 `plugins inspect` 验证。
-- 两者结果都记录到门禁输出。
-
-### 建议
-
-推荐 **方案 C**，分阶段实施：
-
-1. 先实现方案 B，使 `forward-compat` 在无 CLI 环境下也能产生有意义的验证结果。
-2. 再补充方案 A，为有 CLI 的环境提供更深层验证。
+- **Soft 模式**（默认）：警告但不阻断，适合本地开发。
+- **Strict 模式**：任何验证失败均导致非零退出码，适合 CI 发布门禁。
 
 ### `stable-gate` 补充说明
 

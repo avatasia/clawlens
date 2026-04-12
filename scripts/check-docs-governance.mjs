@@ -10,6 +10,10 @@ const docsDir = path.join(repoRoot, "docs");
 const historyDir = path.join(docsDir, "archive", "history");
 const historyReadme = path.join(historyDir, "README.md");
 const topLevelDateRe = /\d{4}-\d{2}-\d{2}/;
+const validTypes = new Set([
+  "ANALYSIS", "RESEARCH", "IMPLEMENTATION", "PROMPT", "REVIEW", "FIX",
+  "CHANGELOG", "POSTMORTEM", "GOVERNANCE", "PLAYBOOK", "HISTORY",
+]);
 const markdownLinkRe = /\[([^\]]+)\]\(([^)]+)\)/g;
 const runAll = process.argv.includes("--all");
 const strictMode = process.argv.includes("--strict");
@@ -65,46 +69,7 @@ function checkTopLevelNoDateFile() {
   }
 }
 
-function checkHistoryReadmeCoverage() {
-  if (!fs.existsSync(historyReadme)) {
-    pushError("Missing history index: docs/archive/history/README.md");
-    return;
-  }
-  const content = fs.readFileSync(historyReadme, "utf8");
-  const files = fs.readdirSync(historyDir)
-    .filter((name) => name.endsWith("_HISTORY.md"));
-  for (const file of files) {
-    const targetRe = new RegExp(`\\[[^\\]]+\\]\\(${escapeRegExp(file)}\\)`);
-    if (!targetRe.test(content)) {
-      pushError(`History file is not indexed in docs/archive/history/README.md: ${file}`);
-    }
-  }
-}
-
-function checkSubdirReadmeCoverage() {
-  const subdirs = [
-    { dir: path.join(docsDir, "plans"), label: "docs/plans" },
-    { dir: path.join(docsDir, "research"), label: "docs/research" },
-    { dir: path.join(docsDir, "prompts"), label: "docs/prompts" },
-  ];
-  for (const { dir, label } of subdirs) {
-    if (!fs.existsSync(dir)) continue;
-    const readme = path.join(dir, "README.md");
-    if (!fs.existsSync(readme)) {
-      pushError(`Missing index: ${label}/README.md`);
-      continue;
-    }
-    const content = fs.readFileSync(readme, "utf8");
-    const files = fs.readdirSync(dir)
-      .filter((name) => name.endsWith(".md") && name !== "README.md");
-    for (const file of files) {
-      const targetRe = new RegExp(`\\[[^\\]]+\\]\\(${escapeRegExp(file)}\\)`);
-      if (!targetRe.test(content)) {
-        pushError(`File is not indexed in ${label}/README.md: ${file}`);
-      }
-    }
-  }
-}
+// Replaced by checkSubDirectoryReadmeCoverage (unified, covers all subdirs including archive/history)
 
 function checkRootReadmeCompleteness() {
   const rootReadme = path.join(repoRoot, "README.md");
@@ -121,22 +86,7 @@ function checkRootReadmeCompleteness() {
   }
 }
 
-const validTypePrefixes = new Set([
-  "ANALYSIS", "RESEARCH", "IMPLEMENTATION", "PROMPT", "REVIEW",
-  "FIX", "CHANGELOG", "POSTMORTEM", "GOVERNANCE", "PLAYBOOK", "HISTORY",
-]);
-
-function checkDatedFileNamingConvention() {
-  const allDocs = walk(docsDir).filter((f) => f.endsWith(".md"));
-  for (const file of allDocs) {
-    const name = path.basename(file, ".md");
-    if (!topLevelDateRe.test(name)) continue;
-    const prefix = name.split("_")[0];
-    if (!validTypePrefixes.has(prefix)) {
-      pushWarning(`Dated file has non-standard TYPE prefix "${prefix}": ${rel(file)}`);
-    }
-  }
-}
+// Replaced by checkFilenamePatterns (stricter pattern + TYPE validation)
 
 function isSkippableLink(target) {
   return (
@@ -213,6 +163,47 @@ function checkNoAbsoluteProjectPath(files) {
     const content = fs.readFileSync(file, "utf8");
     if (repoRootRe.test(content) || obviousAbsRe.test(content)) {
       pushError(`Absolute project path found in ${rel(file)}`);
+    }
+  }
+}
+
+function checkSubDirectoryReadmeCoverage() {
+  const targets = ["plans", "research", "prompts", "archive/history"];
+  for (const sub of targets) {
+    const dir = path.join(docsDir, sub);
+    if (!fs.existsSync(dir)) continue;
+    const readmePath = path.join(dir, "README.md");
+    if (!fs.existsSync(readmePath)) {
+      pushError(`Missing README.md in docs/${sub}/`);
+      continue;
+    }
+    const readmeContent = fs.readFileSync(readmePath, "utf8");
+    const files = fs.readdirSync(dir)
+      .filter((n) => n.endsWith(".md") && n !== "README.md");
+    for (const f of files) {
+      const targetRe = new RegExp(`\\[[^\\]]+\\]\\(${escapeRegExp(f)}\\)`);
+      if (!targetRe.test(readmeContent)) {
+        pushError(`File docs/${sub}/${f} is not indexed in its README.md`);
+      }
+    }
+  }
+}
+
+function checkFilenamePatterns() {
+  const allMd = walk(docsDir).filter((f) => f.endsWith(".md"));
+  const datedFilePattern = /^[A-Z][A-Z0-9_]*_\d{4}-\d{2}-\d{2}\.md$/;
+  for (const full of allMd) {
+    const name = path.basename(full);
+    if (name === "README.md") continue;
+    if (topLevelDateRe.test(name)) {
+      if (!datedFilePattern.test(name)) {
+        pushWarning(`Dated file does not follow TYPE_TOPIC_YYYY-MM-DD.md pattern: ${rel(full)}`);
+        continue;
+      }
+      const type = name.split("_")[0];
+      if (!validTypes.has(type)) {
+        pushWarning(`Dated file has non-standard TYPE prefix '${type}': ${rel(full)}`);
+      }
     }
   }
 }
@@ -461,13 +452,12 @@ function main() {
   const targetFiles = listTargetDocsFiles();
 
   checkTopLevelNoDateFile();
-  checkHistoryReadmeCoverage();
-  checkSubdirReadmeCoverage();
+  checkSubDirectoryReadmeCoverage();
   checkDocCodeBidirectionalIndexes();
 
   if (runAll) {
     checkRootReadmeCompleteness();
-    checkDatedFileNamingConvention();
+    checkFilenamePatterns();
   }
 
   if (targetFiles.length === 0) {
