@@ -1,3 +1,9 @@
+---
+status: active
+created: 2026-03-25
+updated: 2026-04-14
+---
+
 # ClawLens 使用说明
 
 > [!IMPORTANT]
@@ -392,5 +398,7 @@ ClawLens 的 SQLite 数据库文件位于：
 ```bash
 ssh -L 18789:127.0.0.1:18789 user@remote-host
 ```
+
+远程访问前，先确认本机 `18789` 未被占用，避免与已有 tunnel 或本地 gateway 冲突。
 
 然后在本地浏览器打开 `openclaw dashboard --no-open` 输出的 URL。

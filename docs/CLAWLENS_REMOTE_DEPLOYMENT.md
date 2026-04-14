@@ -1,3 +1,9 @@
+---
+status: active
+created: 2026-04-10
+updated: 2026-04-14
+---
+
 # ClawLens Remote Deployment
 
 > [!IMPORTANT]
@@ -23,6 +29,10 @@
 ssh szhdy 'bash -lc "source ~/.bashrc && <command>"'
 ```
 
+> [!IMPORTANT]
+> 当前 `szhdy` 机器的非交互 SSH 默认 PATH 会落到系统工具链（`/usr/bin/node`、`/usr/bin/npm`）。
+> 远端执行 `node/npm/pnpm/openclaw` 时，不要依赖默认 PATH；优先使用 nvm 绝对路径，或在命令内显式导出 nvm PATH。
+
 远端当前绝对路径（用于排障与兜底）：
 
 | 工具 | 远端路径 |
@@ -31,6 +41,22 @@ ssh szhdy 'bash -lc "source ~/.bashrc && <command>"'
 | `npm` | `/home/openclaw/.nvm/versions/node/v24.14.0/bin/npm` |
 | `pnpm` | `/home/openclaw/.nvm/versions/node/v24.14.0/bin/pnpm` |
 | `openclaw` | `/home/openclaw/.nvm/versions/node/v24.14.0/bin/openclaw` |
+
+推荐统一前缀（可直接复用）：
+
+```bash
+ssh szhdy 'bash -lc "
+  source ~/.bashrc
+  export PATH=\"/home/openclaw/.nvm/versions/node/v24.14.0/bin:/home/openclaw/.local/share/pnpm:$PATH\"
+  <command>
+"'
+```
+
+若仍不稳定，直接使用绝对路径执行（最稳妥）：
+
+```bash
+ssh szhdy 'bash -lc "/home/openclaw/.nvm/versions/node/v24.14.0/bin/openclaw --version"'
+```
 
 ## 2. 复制插件文件到远端
 
@@ -168,6 +194,10 @@ ssh szhdy 'bash -lc "source ~/.bashrc && curl -s http://localhost:18789/plugins/
 ```bash
 ssh -L 18789:127.0.0.1:18789 szhdy
 ```
+
+> [!IMPORTANT]
+> 若本机 `18789` 已被占用（常见为已有 tunnel 或本地 gateway），请改用其他本地端口映射；
+> 不要与本地 QA 验证流程共用同一个 `18789`。
 
 然后在本地浏览器访问：
 
