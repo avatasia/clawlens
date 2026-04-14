@@ -7,7 +7,7 @@ superseded_by: docs/CLAWLENS_QA_LAB_TEST_SOP.md
 
 # ClawLens QA Lab 测试 SOP（草案 — 已提升）
 
-> **本文件已提升为正式 SOP**：[CLAWLENS_QA_LAB_TEST_SOP.md](../CLAWLENS_QA_LAB_TEST_SOP.md)。
+> **本文件已提升为正式 SOP**：[CLAWLENS_QA_LAB_TEST_SOP.md](../../CLAWLENS_QA_LAB_TEST_SOP.md)。
 > 以下内容保留为历史参考，不再作为操作依据。
 
 ## 适用范围
@@ -394,8 +394,8 @@ curl -s http://127.0.0.1:18789/plugins/clawlens/api/overview
 
 ## 相关文档
 
-- `docs/research/RESEARCH_OPENCLAW_QA_LAB_LOCAL_ENABLEMENT_FINDINGS_2026-04-13.md`
-- `docs/research/ANALYSIS_CLAWLENS_QA_LAB_SOP_IMPROVEMENTS_2026-04-13.md`
+- `docs/archive/analysis/RESEARCH_OPENCLAW_QA_LAB_LOCAL_ENABLEMENT_FINDINGS_2026-04-13.md`
+- `docs/archive/analysis/ANALYSIS_CLAWLENS_QA_LAB_SOP_IMPROVEMENTS_2026-04-13.md`
 
 ## 已完成并纳入（本轮）
 
