@@ -76,6 +76,7 @@
 1. **方案 A：接受 `--openclaw-bin` 参数**
    - 允许显式指定远端或本地特定路径下的 `openclaw` 二进制文件。
    - 解决了非交互式 SSH PATH 缺失问题。
+   - 在 `szhdy` 机器上应优先指向 `/home/openclaw/.nvm/versions/node/v24.14.0/bin/openclaw`，避免误用系统 PATH 下的 CLI。
 
 2. **方案 B：使用 `projects-ref/openclaw` 做本地 import 验证**
    - 新增 `--use-local-ref` 标志。
@@ -156,8 +157,9 @@ OpenClaw 插件 manifest 分两处维护，职责不同：
 2. 完成开发与本地验证。
 3. 通过 `stable-gate`。
 4. 执行 `forward-compat` 验证并记录差异。
-5. 更新 manifest 兼容字段与发布说明。
-6. 用 `openclaw plugins inspect clawlens` 核对插件 shape 与兼容信号（`non-capability` / advisory / warning）。
+5. 执行 QA Lab 回归验证（详见 [CLAWLENS_QA_LAB_TEST_SOP.md](CLAWLENS_QA_LAB_TEST_SOP.md)）。
+6. 更新 manifest 兼容字段与发布说明。
+7. 用 `openclaw plugins inspect clawlens` 核对插件 shape 与兼容信号（`non-capability` / advisory / warning）。
 
 ## 自动执行约束（本地）
 

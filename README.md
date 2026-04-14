@@ -168,6 +168,7 @@ Recommended current-entry documents:
 - [architecture.md](docs/architecture.md) — current architecture authority
 - [clawlens-usage.md](docs/clawlens-usage.md)
 - [CLAWLENS_PLUGIN_DEV_WORKFLOW.md](docs/CLAWLENS_PLUGIN_DEV_WORKFLOW.md)
+- [CLAWLENS_QA_LAB_TEST_SOP.md](docs/CLAWLENS_QA_LAB_TEST_SOP.md)
 - [CLAWLENS_REMOTE_DEPLOYMENT.md](docs/CLAWLENS_REMOTE_DEPLOYMENT.md)
 - [CLAWLENS_TRANSCRIPT_BINDING_ROLLBACK_PLAYBOOK.md](docs/CLAWLENS_TRANSCRIPT_BINDING_ROLLBACK_PLAYBOOK.md)
 - [PROMPT_IMPLEMENTATION.md](docs/PROMPT_IMPLEMENTATION.md)

@@ -12,6 +12,7 @@
 ### 2. [开发与部署工作流](CLAWLENS_PLUGIN_DEV_WORKFLOW.md)
 开发者必备指南，涵盖本地环境配置、远端部署 SOP 以及兼容性门禁说明。
 - [Plugin Dev Workflow](CLAWLENS_PLUGIN_DEV_WORKFLOW.md)
+- [QA Lab Test SOP](CLAWLENS_QA_LAB_TEST_SOP.md)
 - [Remote Deployment SOP](CLAWLENS_REMOTE_DEPLOYMENT.md)
 
 ### 3. [工程治理与质量保证](GOVERNANCE_DOCS_PLAN.md)
