@@ -391,6 +391,112 @@ function checkDocCodeBidirectionalIndexes() {
   }
 }
 
+// ── Frontmatter lifecycle checks ─────────────────────────────────────────
+
+const validStatuses = new Set(["active", "deprecated", "merged"]);
+
+function parseFrontmatter(filePath) {
+  const content = fs.readFileSync(filePath, "utf8");
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!match) return null;
+  const result = {};
+  for (const line of match[1].split("\n")) {
+    const kv = line.match(/^(\w[\w_]*):\s*(.*)$/);
+    if (kv) result[kv[1]] = kv[2].trim();
+  }
+  return result;
+}
+
+function listFrontmatterApplicableFiles() {
+  const topLevel = fs.readdirSync(docsDir, { withFileTypes: true })
+    .filter((e) => e.isFile() && e.name.endsWith(".md")
+      && e.name !== "README.md" && !topLevelDateRe.test(e.name))
+    .map((e) => path.join(docsDir, e.name));
+
+  const plansDir = path.join(docsDir, "plans");
+  const plans = fs.existsSync(plansDir)
+    ? fs.readdirSync(plansDir, { withFileTypes: true })
+      .filter((e) => e.isFile() && e.name.endsWith(".md") && e.name !== "README.md")
+      .map((e) => path.join(plansDir, e.name))
+    : [];
+
+  return [...topLevel, ...plans];
+}
+
+function listMainBranchFiles() {
+  try {
+    const out = childProcess.execSync(
+      "git ls-tree -r main --name-only",
+      { encoding: "utf8", cwd: repoRoot },
+    );
+    return new Set(out.split("\n").map((l) => l.trim()).filter(Boolean));
+  } catch {
+    return new Set();
+  }
+}
+
+function checkFrontmatter() {
+  const applicable = listFrontmatterApplicableFiles();
+  const mainFiles = listMainBranchFiles();
+
+  for (const file of applicable) {
+    const relPath = rel(file);
+    const fm = parseFrontmatter(file);
+    const isNew = !mainFiles.has(relPath);
+
+    // Phase 1: only warn on new files missing frontmatter
+    if (!fm) {
+      if (isNew) {
+        pushWarning(`[FRONTMATTER] missing frontmatter in new file: ${relPath}`);
+      }
+      continue;
+    }
+
+    if (!fm.status) {
+      pushWarning(`[FRONTMATTER] missing 'status' field in ${relPath}`);
+    } else if (!validStatuses.has(fm.status)) {
+      pushWarning(
+        `[FRONTMATTER] invalid status '${fm.status}' in ${relPath} (expected: active, deprecated, merged)`,
+      );
+    }
+
+    if ((fm.status === "deprecated" || fm.status === "merged") && fm.superseded_by) {
+      const resolved = path.resolve(repoRoot, fm.superseded_by);
+      if (!fs.existsSync(resolved)) {
+        pushWarning(
+          `[FRONTMATTER] superseded_by target not found in ${relPath}: ${fm.superseded_by}`,
+        );
+      }
+    }
+  }
+}
+
+function checkDeprecatedDocReferences() {
+  const allDocs = walk(docsDir).filter((f) => f.endsWith(".md"));
+  const deprecatedDocs = new Map();
+
+  for (const file of allDocs) {
+    const fm = parseFrontmatter(file);
+    if (fm && (fm.status === "deprecated" || fm.status === "merged")) {
+      deprecatedDocs.set(rel(file), fm.status);
+    }
+  }
+  if (deprecatedDocs.size === 0) return;
+
+  const codeFiles = listCodeFilesForIndexChecks();
+  const markers = parseCodeIndexMarkers(codeFiles);
+
+  for (const marker of markers) {
+    if (!marker.target) continue;
+    const status = deprecatedDocs.get(marker.target);
+    if (status) {
+      pushIndexIssue(
+        `[FRONTMATTER] ${marker.type}:${marker.id} at ${rel(marker.file)}:${marker.line} points to ${status} doc: ${marker.target}`,
+      );
+    }
+  }
+}
+
 // ── New automated checks ──────────────────────────────────────────────────
 
 const backtickPathPrefixes = [
@@ -454,6 +560,8 @@ function main() {
   checkTopLevelNoDateFile();
   checkSubDirectoryReadmeCoverage();
   checkDocCodeBidirectionalIndexes();
+  checkFrontmatter();
+  checkDeprecatedDocReferences();
 
   if (runAll) {
     checkRootReadmeCompleteness();

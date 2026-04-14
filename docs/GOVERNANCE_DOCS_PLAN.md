@@ -1,3 +1,9 @@
+---
+status: active
+created: 2026-04-03
+updated: 2026-04-14
+---
+
 # Docs Governance Plan
 
 > [!IMPORTANT]
@@ -46,6 +52,22 @@
 1. 优先按业务主题和长期检索习惯归类，不按临时文件名随意投递。
 2. 如果某主题已经有专门分类目录，相关归档材料优先放入该主题目录。
 3. 若无法判断主题归属，才放入更通用的 `analysis/`。
+
+## 子目录 README 覆盖规则
+
+以下子目录必须维护 `README.md`，且 README 必须双向覆盖目录下所有 `.md` 文件：
+
+- `docs/plans/`
+- `docs/research/`
+- `docs/prompts/`
+- `docs/archive/history/`
+
+双向覆盖含义：
+
+1. 正向：目录内每个 `.md` 文件（不含 `README.md`）都被 README 链接。
+2. 反向：README 中链接的每个文件都实际存在。
+
+`docs/archive/` 下的其他子目录（`analysis/`、`chat-audit/`、`reviews/`、`prompts/`）不强制要求 README 覆盖。这些目录以批量归档为主，文件通过主题 history 索引检索，不依赖目录级 README。
 
 ## `docs/prompts/` 目录职责
 
@@ -126,6 +148,51 @@
 3. 带日期文件完成其阶段性作用后，应进入 `docs/archive/` 或写入对应 `history`。
 4. 若某主题已有无日期主文档，不再把新的带日期稿长期保留在顶层。
 
+## 文档生命周期元数据
+
+适用范围：`docs/` 顶层无日期主文档、`docs/plans/` 方案文档。
+
+上述范围内**新建**的文档必须在文件开头加 YAML frontmatter。本规则生效前已存在的文档不强制补填，但鼓励在下次实质修改时补上。带日期的过程稿、研究快照、`docs/prompts/` 提示词文档不要求 frontmatter。
+
+```yaml
+---
+status: active
+created: 2026-01-15
+updated: 2026-04-01
+---
+```
+
+### 字段说明
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `status` | 是 | `active` / `deprecated` / `merged` |
+| `superseded_by` | 仅 deprecated/merged 时 | 替代文档的仓库相对路径 |
+| `created` | 推荐 | 初始创建日期 |
+| `updated` | 推荐 | 最近一次实质更新日期 |
+
+### 状态定义
+
+| 状态 | 含义 | 行为 |
+|------|------|------|
+| `active` | 当前有效，正常使用 | 正常引用 |
+| `deprecated` | 已废弃但未删除 | 仍可阅读；若有 `DOC_INDEX` / `ROLLBACK_INDEX` 指向该文档，治理脚本应报警 |
+| `merged` | 内容已合并到其他文档 | `superseded_by` 指向目标文档；同上报警规则 |
+
+### 规则
+
+1. 适用范围内新建的文档必须填写 frontmatter。已有文档不强制补填，鼓励在下次实质修改时补上。
+2. 归档前，先将 `status` 标为 `deprecated` 或 `merged` 并填写 `superseded_by`（如适用），再执行归档 SOP。
+3. `deprecated`/`merged` 状态的文档若仍有代码端 `DOC_INDEX` / `ROLLBACK_INDEX` 指向它，视为治理缺陷。
+4. 带日期的过程稿、研究快照不要求 frontmatter。
+
+### 自动化推进
+
+治理脚本对 frontmatter 的检查分两阶段：
+
+1. **当前阶段**：仅对适用范围内新增文件（未出现在 main 分支的文件）检查 frontmatter 存在性，缺失时 warn。
+2. **后续阶段**：存量文档补填完成后，切换为对所有适用范围文件做 warn（或 `--strict` 下 fail）。
+
 ## 路径引用规则
 
 1. 文档中**绝对不要使用本项目文件的绝对路径**。
@@ -155,6 +222,16 @@
 
 - `entry_points:`（关键函数名；脚本会做 warn 级别存在性提示）
 
+推荐项（纯约定，不做自动检查，不影响 CI）：
+
+- 代码端标记旁加一行 `// Why:` 说明该代码路径存在的原因，降低接手成本。
+  这是人工约定，治理脚本不会检查其存在性或格式。
+
+```ts
+// DOC_INDEX: CLAWLENS_TRANSCRIPT_BINDING_PLAYBOOK -> docs/CLAWLENS_TRANSCRIPT_BINDING_ROLLBACK_PLAYBOOK.md
+// Why: 处理 session 中途断开后的 unknown runId 恢复
+```
+
 规则：
 
 1. `ID` 使用 `UPPER_SNAKE_CASE`，全仓库唯一。
@@ -171,15 +248,17 @@
 
 1. 识别候选文件
    区分当前主入口文档与历史材料。
-2. 选择 archive 分类
+2. 更新生命周期元数据
+   若候选文件有 frontmatter，将 `status` 设为 `deprecated` 或 `merged`，并填写 `superseded_by`（如适用）。
+3. 选择 archive 分类
    在 `reviews`、`analysis`、`prompts`、`chat-audit` 中确定目标目录。
-3. 执行文件移动
+4. 执行文件移动
    将历史材料移入 `docs/archive/` 对应目录。
-4. 修复引用路径
+5. 修复引用路径
    包括顶层主文档、`README.md`、`docs/archive/README.md`、其他索引文档。
-5. 更新主题 history
+6. 更新主题 history
    在对应 `docs/archive/history/*_HISTORY.md` 中登记被归档文件。
-6. 验证顶层收敛
+7. 验证顶层收敛
    确认 `docs/` 顶层是否仍残留不应存在的带日期旧稿。
 
 推荐规则：
@@ -198,6 +277,8 @@
 3. 是否仍存在断链、错链或旧路径残留。
 4. 顶层当前目录是否仍残留应归档旧稿。
 5. 是否引入新的项目内绝对路径。
+6. 被归档文件的 frontmatter `status` 是否已标为 `deprecated` 或 `merged`；若有 `superseded_by`，目标路径是否有效。
+7. 是否仍有代码端 `DOC_INDEX` / `ROLLBACK_INDEX` 指向已归档文件的旧路径。
 
 如果上述任一项未通过，本轮归档不应视为完成。
 

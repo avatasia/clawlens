@@ -1,3 +1,9 @@
+---
+status: active
+created: 2026-04-10
+updated: 2026-04-14
+---
+
 # ClawLens Local Automation
 
 本文件说明 `clawlens` 仓库内本地自动检查命令（docs 治理 + 开发门禁）的使用方式。
@@ -58,6 +64,13 @@
 
 - Backtick 路径引用时效性：inline code 中匹配已知目录前缀的文件路径存在性检查。
 - Link text/target basename mismatch：当链接文本看起来像文件名时，校验其 basename 与 target 的 basename 是否一致。
+
+以下规则已实现自动 warn 级别检查（2026-04-13 起）：
+
+- Frontmatter 存在性：适用范围（顶层无日期主文档 + `docs/plans/`）内新增文件缺少 frontmatter 时 warn（Phase 1：仅检查不在 main 分支的文件）。
+- Frontmatter `status` 值合法性：存在 frontmatter 时校验 `status` 必须为 `active` / `deprecated` / `merged`。
+- `superseded_by` 路径有效性：`deprecated`/`merged` 文档的 `superseded_by` 指向的文件必须存在。
+- Deprecated/merged 文档代码引用：若代码端 `DOC_INDEX`/`ROLLBACK_INDEX` 指向 `deprecated`/`merged` 状态的文档，warn（`--strict` 下 fail）。
 
 定期执行 `docs/PROMPT_DOCS_AUDIT.md` 或全局验证提示词可覆盖上述维度。
 

@@ -1,12 +1,18 @@
+---
+status: active
+created: 2026-04-03
+updated: 2026-04-14
+---
+
 # Docs Audit Prompt
 
 > [!IMPORTANT]
 > Current Authority: This is the active master version for docs audit prompts.
 >
-> 当前主文档，用于执行 `docs/` 体系治理审计。
+> 当前主文档，用于执行 `docs/` 体系治理审计（7 维度）。
 
 ```md
-Perform a full governance audit for the `docs/` tree, covering doc quality, structural compliance, link integrity, and doc-code bidirectional indexing consistency.
+Perform a full governance audit for the `docs/` tree (7 dimensions), covering doc quality, structural compliance, link integrity, doc-code bidirectional indexing consistency, and lifecycle metadata.
 
 Audit scope:
 - All documents under `docs/` (top-level + subdirs + archive).
@@ -47,17 +53,24 @@ Required audit dimensions:
    - Duplicate `CODE_INDEX` IDs across multiple docs must be flagged.
    - `entry_points:` warnings (symbol not found) are non-blocking unless policy says otherwise.
 
-4. Policy-automation consistency
+4. Lifecycle metadata
+   - Applicable files (top-level undated main docs + `docs/plans/`) that are new should have YAML frontmatter with `status`.
+   - `status` value must be one of: `active`, `deprecated`, `merged`.
+   - `deprecated`/`merged` docs must have `superseded_by` pointing to a valid repo-relative path (when applicable).
+   - No code-side `DOC_INDEX`/`ROLLBACK_INDEX` should point to a `deprecated`/`merged` doc.
+   - Verify that the Archive SOP lifecycle step (set status before move) is being followed in recent archive operations.
+
+5. Policy-automation consistency
    - `GOVERNANCE_DOCS_PLAN.md` rules match actual checker behavior.
    - `DOCS_GOVERNANCE_AUTOMATION.md` command semantics match script behavior.
    - Identify any governance rule that has no corresponding automated check (document the gap).
 
-5. Content freshness (manual only)
+6. Content freshness (manual only)
    - Flag factual claims about tooling or check status that contradict current state (e.g., "check X still fails" when it now passes).
    - Flag TODO/follow-up items that reference completed or deleted work.
    - This dimension is inherently non-automatable; check `docs/plans/` files first as they are most likely to go stale.
 
-6. Uncommitted state review
+7. Uncommitted state review
    - Run `git status` and review all uncommitted changes (modified, deleted, untracked) for consistency with governance rules.
    - Verify that archive moves are atomic: file deletion, new file addition, README updates, and history registration should form a coherent set.
 
@@ -65,7 +78,7 @@ Output format (strict):
 1. Severity-ranked findings (Critical / High / Medium / Low / Info).
 2. For each finding: file path + line reference + concrete impact + fix recommendation.
 3. Pass/Fail summary table with columns: Category, Result, Notes.
-   Categories: Structural governance, Link integrity, Bidirectional indexing, Policy-automation consistency, Content freshness.
+   Categories: Structural governance, Link integrity, Bidirectional indexing, Lifecycle metadata, Policy-automation consistency, Content freshness, Uncommitted state review.
 4. Explicit list of blocking items to reach `--all --strict` green.
 5. Non-blocking cleanup suggestions, clearly separated from blockers.
 
@@ -76,7 +89,7 @@ Constraints:
 - Distinguish pre-existing baseline debt vs newly introduced regressions.
 ```
 
-For full technical content validation (9 dimensions including code accuracy, cross-doc consistency, per-topic completeness), see [PROMPT_DOCS_GLOBAL_VALIDATION.md](PROMPT_DOCS_GLOBAL_VALIDATION.md).
+For full technical content validation (10 dimensions including code accuracy, cross-doc consistency, per-topic completeness), see [PROMPT_DOCS_GLOBAL_VALIDATION.md](PROMPT_DOCS_GLOBAL_VALIDATION.md).
 
 历史日期版：
 

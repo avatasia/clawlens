@@ -1,13 +1,19 @@
+---
+status: active
+created: 2026-04-11
+updated: 2026-04-14
+---
+
 # Docs Global Validation Prompt
 
 > [!IMPORTANT]
 > Current Authority: This is the active master version for full docs global validation.
 >
-> 当前主文档，用于执行 `docs/` 体系全局验证（9 维度）。
-> 日常治理审计请用 [PROMPT_DOCS_AUDIT.md](PROMPT_DOCS_AUDIT.md)（6 维度）。
+> 当前主文档，用于执行 `docs/` 体系全局验证（10 维度）。
+> 日常治理审计请用 [PROMPT_DOCS_AUDIT.md](PROMPT_DOCS_AUDIT.md)（7 维度）。
 
 ```md
-Perform a full global validation of the `docs/` documentation system. This goes beyond governance structure — it validates that the content is technically accurate, internally consistent, and faithfully represents current code and project state.
+Perform a full global validation of the `docs/` documentation system (10 dimensions). This goes beyond governance structure — it validates that the content is technically accurate, internally consistent, and faithfully represents current code and project state.
 
 Prerequisites:
 1. `node scripts/check-docs-governance.mjs --all`
@@ -61,7 +67,17 @@ Record the output of each command before proceeding. If either governance check 
 
 ---
 
-## Dimension 4: Technical Content Accuracy
+## Dimension 4: Lifecycle Metadata
+
+4.1 Applicable files (top-level undated main docs + `docs/plans/`) that are new (not on main branch) must have YAML frontmatter with at least `status`.
+4.2 `status` value must be one of: `active`, `deprecated`, `merged`.
+4.3 `deprecated`/`merged` docs should have `superseded_by` with a valid repo-relative path to the replacement doc.
+4.4 No code-side `DOC_INDEX`/`ROLLBACK_INDEX` should point to a doc whose frontmatter `status` is `deprecated` or `merged`.
+4.5 Recent archive operations should follow the lifecycle step: `status` set to `deprecated`/`merged` before file move. Cross-check with `git log` for recent archive commits.
+
+---
+
+## Dimension 5: Technical Content Accuracy
 
 Cross-check the following authoritative docs against current code. Read the relevant source files — do not rely solely on doc claims.
 
@@ -80,28 +96,28 @@ Target docs and their code counterparts:
 | `docs/clawlens-usage.md` | `src/api-routes.ts`, `ui/inject.js`, `openclaw.plugin.json` |
 
 Check for:
-4.1 Doc claims a feature exists but the implementing code is absent or commented out.
-4.2 Doc claims a feature does NOT exist but the code has since added it.
-4.3 API route paths, query parameters, or response shapes documented incorrectly.
-4.4 Config schema fields documented but absent from `openclaw.plugin.json`, or vice versa.
-4.5 Architecture doc reference version does not match `projects-ref/openclaw` state (check the version line).
-4.6 "Current status" or capability claims that conflate implemented vs planned.
+5.1 Doc claims a feature exists but the implementing code is absent or commented out.
+5.2 Doc claims a feature does NOT exist but the code has since added it.
+5.3 API route paths, query parameters, or response shapes documented incorrectly.
+5.4 Config schema fields documented but absent from `openclaw.plugin.json`, or vice versa.
+5.5 Architecture doc reference version does not match `projects-ref/openclaw` state (check the version line).
+5.6 "Current status" or capability claims that conflate implemented vs planned.
 
 ---
 
-## Dimension 5: Cross-Document Consistency
+## Dimension 6: Cross-Document Consistency
 
-5.1 Same capability described differently across docs (one says "done", another says "planned").
-5.2 Same API endpoint listed with different paths or semantics in different docs.
-5.3 Same config field described with different schema, defaults, or behavior.
-5.4 Architecture conclusions in `architecture.md` contradicted by topic-specific docs.
-5.5 History summaries that contradict the current authoritative doc for their topic.
+6.1 Same capability described differently across docs (one says "done", another says "planned").
+6.2 Same API endpoint listed with different paths or semantics in different docs.
+6.3 Same config field described with different schema, defaults, or behavior.
+6.4 Architecture conclusions in `architecture.md` contradicted by topic-specific docs.
+6.5 History summaries that contradict the current authoritative doc for their topic.
 
 For each conflict found: name both files, quote the conflicting claims, identify which is closer to current code truth, and recommend which to fix.
 
 ---
 
-## Dimension 6: Per-Topic Completeness
+## Dimension 7: Per-Topic Completeness
 
 For each major topic, verify:
 
@@ -130,29 +146,29 @@ Topics to cover (at minimum):
 
 ---
 
-## Dimension 7: Content Freshness
+## Dimension 8: Content Freshness
 
-7.1 Active plan docs (`docs/plans/`): flag any status claims, environment state descriptions, or ahead/behind counts that are hardcoded and likely stale.
-7.2 Follow-up / TODO docs: flag items marked as open but actually completed (verify against code and git history).
-7.3 Research docs (`docs/research/`): flag any that should have been archived (conclusions fully absorbed into authoritative docs) or promoted (converted into active plans).
-7.4 Snapshot markers: any doc that describes point-in-time state should have a visible date/snapshot annotation. Flag docs that read as "current" but are actually frozen snapshots.
-
----
-
-## Dimension 8: README and Entry Point Accuracy
-
-8.1 `README.md` only links to current authoritative docs, not archived dated drafts.
-8.2 `README.md` document list matches what actually exists in `docs/`.
-8.3 `docs/archive/README.md` "recommended current docs" section is accurate and up-to-date.
-8.4 No README references a file that has been moved or deleted.
+8.1 Active plan docs (`docs/plans/`): flag any status claims, environment state descriptions, or ahead/behind counts that are hardcoded and likely stale.
+8.2 Follow-up / TODO docs: flag items marked as open but actually completed (verify against code and git history).
+8.3 Research docs (`docs/research/`): flag any that should have been archived (conclusions fully absorbed into authoritative docs) or promoted (converted into active plans).
+8.4 Snapshot markers: any doc that describes point-in-time state should have a visible date/snapshot annotation. Flag docs that read as "current" but are actually frozen snapshots.
 
 ---
 
-## Dimension 9: Policy-Automation Gap Analysis
+## Dimension 9: README and Entry Point Accuracy
 
-9.1 List every rule in `docs/GOVERNANCE_DOCS_PLAN.md`.
-9.2 For each rule, state whether `scripts/check-docs-governance.mjs` enforces it automatically.
-9.3 Classify each gap: automatable (should add to script), manual-only (inherently requires human judgment), or out-of-scope (not worth automating).
+9.1 `README.md` only links to current authoritative docs, not archived dated drafts.
+9.2 `README.md` document list matches what actually exists in `docs/`.
+9.3 `docs/archive/README.md` "recommended current docs" section is accurate and up-to-date.
+9.4 No README references a file that has been moved or deleted.
+
+---
+
+## Dimension 10: Policy-Automation Gap Analysis
+
+10.1 List every rule in `docs/GOVERNANCE_DOCS_PLAN.md`.
+10.2 For each rule, state whether `scripts/check-docs-governance.mjs` enforces it automatically.
+10.3 Classify each gap: automatable (should add to script), manual-only (inherently requires human judgment), or out-of-scope (not worth automating).
 
 ---
 
@@ -180,6 +196,7 @@ Columns: Topic, Authoritative Doc, History, Archive Clean, Verdict.
 | Structural governance | | |
 | Link integrity | | |
 | Bidirectional indexing | | |
+| Lifecycle metadata | | |
 | Technical accuracy | | |
 | Cross-doc consistency | | |
 | Per-topic completeness | | |
