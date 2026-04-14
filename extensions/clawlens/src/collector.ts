@@ -836,11 +836,23 @@ function normalizeTranscriptMessage(message: unknown): {
   const role = typeof msg.role === "string" ? msg.role : "unknown";
   const content = msg.content;
   const raw = typeof content === "string" ? content : JSON.stringify(content ?? "");
-  const toolCalls = Array.isArray(msg.toolCalls)
+  const explicitToolCalls = Array.isArray(msg.toolCalls)
     ? msg.toolCalls.length
     : Array.isArray(msg.tool_calls)
       ? msg.tool_calls.length
       : 0;
+  // Some providers (including MiniMax chat payloads) emit tool calls inline
+  // inside content[] items as { type: "toolCall", ... } instead of top-level
+  // toolCalls/tool_calls arrays. Check both surfaces and take the higher count
+  // to avoid under-reporting assistant turn tool-call density in Chat Audit.
+  const contentToolCalls = Array.isArray(content)
+    ? content.filter((item) => {
+        if (!item || typeof item !== "object") return false;
+        const typeValue = (item as Record<string, unknown>).type;
+        return typeof typeValue === "string" && typeValue.toLowerCase() === "toolcall";
+      }).length
+    : 0;
+  const toolCalls = Math.max(explicitToolCalls, contentToolCalls);
   const usage = (msg.usage && typeof msg.usage === "object") ? msg.usage as Record<string, unknown> : null;
   const tokensUsed = typeof usage?.totalTokens === "number"
     ? usage.totalTokens as number
