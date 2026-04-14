@@ -13,6 +13,8 @@ try {
   // Will throw at Store construction time if Node < 22
   DatabaseSync = null as any;
 }
+type DatabaseSyncInstance = InstanceType<typeof DatabaseSync>;
+type SqlParam = null | number | bigint | string;
 
 type RunInsertOpts = {
   channel?: string;
@@ -92,22 +94,22 @@ function classifyTurnKindFromPreview(preview?: string | null): "heartbeat" | "ch
 }
 
 export class Store {
-  private db: DatabaseSync;
+  private db: DatabaseSyncInstance;
   private debugEnabled = isClawLensDebugEnabled();
 
   // Prepared statement caches
-  private stmtInsertRun: ReturnType<DatabaseSync["prepare"]>;
-  private stmtCompleteRun: ReturnType<DatabaseSync["prepare"]>;
-  private stmtInsertLlmCall: ReturnType<DatabaseSync["prepare"]>;
-  private stmtInsertToolExec: ReturnType<DatabaseSync["prepare"]>;
-  private stmtInsertSnapshot: ReturnType<DatabaseSync["prepare"]>;
-  private stmtCleanup: ReturnType<DatabaseSync["prepare"]>;
-  private stmtAggregateRun: ReturnType<DatabaseSync["prepare"]>;
-  private stmtInsertConvTurn: ReturnType<DatabaseSync["prepare"]>;
-  private stmtUpdateConvTurnByMessageId: ReturnType<DatabaseSync["prepare"]>;
-  private stmtFindConvTurnByMessageId: ReturnType<DatabaseSync["prepare"]>;
-  private stmtNextTurnIndex: ReturnType<DatabaseSync["prepare"]>;
-  private stmtUpdateRunLlmStreamMetrics: ReturnType<DatabaseSync["prepare"]>;
+  private stmtInsertRun: ReturnType<DatabaseSyncInstance["prepare"]>;
+  private stmtCompleteRun: ReturnType<DatabaseSyncInstance["prepare"]>;
+  private stmtInsertLlmCall: ReturnType<DatabaseSyncInstance["prepare"]>;
+  private stmtInsertToolExec: ReturnType<DatabaseSyncInstance["prepare"]>;
+  private stmtInsertSnapshot: ReturnType<DatabaseSyncInstance["prepare"]>;
+  private stmtCleanup: ReturnType<DatabaseSyncInstance["prepare"]>;
+  private stmtAggregateRun: ReturnType<DatabaseSyncInstance["prepare"]>;
+  private stmtInsertConvTurn: ReturnType<DatabaseSyncInstance["prepare"]>;
+  private stmtUpdateConvTurnByMessageId: ReturnType<DatabaseSyncInstance["prepare"]>;
+  private stmtFindConvTurnByMessageId: ReturnType<DatabaseSyncInstance["prepare"]>;
+  private stmtNextTurnIndex: ReturnType<DatabaseSyncInstance["prepare"]>;
+  private stmtUpdateRunLlmStreamMetrics: ReturnType<DatabaseSyncInstance["prepare"]>;
 
   private static readonly SOURCE_PRIORITY = {
     transcript_explicit: 3,
@@ -542,7 +544,7 @@ export class Store {
 
   getSessions(filters?: SessionFilters): unknown[] {
     const conditions: string[] = [];
-    const params: unknown[] = [];
+    const params: SqlParam[] = [];
 
     if (filters?.channel) {
       conditions.push("r.channel = ?");
@@ -606,7 +608,7 @@ export class Store {
 
   getAuditSessions(opts?: { channel?: string; days?: number; limit?: number; offset?: number }): unknown[] {
     const conditions: string[] = [];
-    const params: unknown[] = [];
+    const params: SqlParam[] = [];
     if (opts?.channel) { conditions.push("channel = ?"); params.push(opts.channel); }
     if (opts?.days) { conditions.push("started_at >= ?"); params.push(Date.now() - opts.days * 86_400_000); }
     const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
@@ -1029,7 +1031,7 @@ export class Store {
     sessionKey: string,
     opts?: { limit?: number; before?: number; since?: number; includeDetails?: boolean; excludeKinds?: string[]; requireConversation?: boolean },
   ): unknown {
-    const params: unknown[] = [sessionKey];
+    const params: SqlParam[] = [sessionKey];
     const conditions = [
       "session_key = ?",
       `(

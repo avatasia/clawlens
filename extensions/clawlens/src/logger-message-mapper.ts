@@ -155,7 +155,7 @@ export async function parseLoggerMessageMappings(filePath: string): Promise<Pars
     if (!prompt) continue;
     const promptKind = classifyPrompt(prompt);
     if (promptKind !== "user-entry") continue;
-    const messageId = extractPromptMessageId(prompt);
+    const messageId = extractPromptMessageId(prompt) ?? undefined;
     const userTextPreview = extractPromptUserText(prompt).slice(0, 200);
     if (!messageId && !userTextPreview) continue;
     parsed.push({

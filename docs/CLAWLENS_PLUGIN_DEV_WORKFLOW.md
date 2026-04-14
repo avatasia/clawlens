@@ -48,9 +48,10 @@
 
 - `check-docs-governance.mjs`：文档治理规则检查。
 - `check-clawlens-manifest.mjs`：manifest 格式与必填字段检查。
+- `tsc --noEmit`：TypeScript 静态类型检查（通过本地 `typings/` 中的 SDK 类型 stub 解析 `openclaw/plugin-sdk/*` 导入）。
 - `pnpm test`：插件单元测试。
 
-**`stable-gate` 不验证运行时兼容性。** 它证明的是 manifest 正确性与测试隔离通过，不证明插件能在 OpenClaw 运行时中成功加载。
+**`stable-gate` 不验证运行时兼容性。** 它证明的是 manifest 正确性、类型安全与测试隔离通过，不证明插件能在 OpenClaw 运行时中成功加载。
 
 ### `forward-compat`
 
@@ -90,9 +91,12 @@
 
 ### `stable-gate` 补充说明
 
-`stable-gate` 当前行为准确，不需要修改。但应在文档中明确其验证边界：
+`stable-gate` 验证边界：
 
-- 它证明 manifest 正确、文档合规、测试通过。
+- 它证明 manifest 正确、文档合规、类型安全（`tsc --noEmit`）、测试通过。
+- 类型检查基于 `extensions/clawlens/typings/` 中的本地 SDK stub，不依赖 OpenClaw 构建产物。当 OpenClaw SDK 接口变更时，需同步更新 stub（stub 文件头部记录了对应的上游 commit）。
+- 类型门禁默认 fail-closed：缺少 `tsc` 时报错退出。可通过 `CLAWLENS_GATE_SKIP_TYPECHECK=1` 显式跳过。
+- **残差风险：** tsc gate 证明的是"本地代码与本地 stub 一致"，而非"ClawLens 与上游 SDK/runtime 合约一致"。导入路径是否存在于上游参考源树中由 `scripts/verify-local-imports.mjs` 单独检查（`forward-compat --use-local-ref`）。两者互补，不可替代。
 - 它**不**证明插件能在 OpenClaw 运行时中加载运行。
 - 运行时兼容性验证是 `forward-compat` 的职责。
 
