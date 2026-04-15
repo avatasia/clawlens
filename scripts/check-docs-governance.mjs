@@ -189,12 +189,19 @@ function checkSubDirectoryReadmeCoverage() {
   }
 }
 
+const archiveDir = path.join(docsDir, "archive");
+
+function isArchived(filePath) {
+  return filePath.startsWith(archiveDir + path.sep);
+}
+
 function checkFilenamePatterns() {
   const allMd = walk(docsDir).filter((f) => f.endsWith(".md"));
   const datedFilePattern = /^[A-Z][A-Z0-9_]*_\d{4}-\d{2}-\d{2}\.md$/;
   for (const full of allMd) {
     const name = path.basename(full);
     if (name === "README.md") continue;
+    if (isArchived(full)) continue;
     if (topLevelDateRe.test(name)) {
       if (!datedFilePattern.test(name)) {
         pushWarning(`Dated file does not follow TYPE_TOPIC_YYYY-MM-DD.md pattern: ${rel(full)}`);
@@ -510,6 +517,7 @@ const backtickPathRe = new RegExp(
 
 function checkBacktickPathValidity(files) {
   for (const file of files) {
+    if (isArchived(file)) continue;
     const raw = fs.readFileSync(file, "utf8");
     const content = stripFencedCodeBlocks(raw);
     let match;
