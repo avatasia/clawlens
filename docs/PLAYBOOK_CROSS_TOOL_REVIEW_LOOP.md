@@ -6,8 +6,6 @@ updated: 2026-04-19
 
 # Cross-Tool Review Loop (CTRL) Playbook
 
-> **Under external review** — round-card at [plans/REVIEW_ROUND_CTRL_PLAYBOOK_2026-04-19.md](plans/REVIEW_ROUND_CTRL_PLAYBOOK_2026-04-19.md). 编辑本文件前请先读回合卡，避免破坏本轮冻结决策。
-
 > 目的：Claude 作为 writer、异构模型（Codex / GPT-5 / Gemini 等）作为 reviewer、人工承担复制-粘贴传递的多轮文档评审场景下，同时控制两类成本：
 >
 > 1. Anthropic prompt cache 的 5 分钟 TTL 失效；

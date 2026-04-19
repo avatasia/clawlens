@@ -1,16 +1,17 @@
 ---
-status: active
+status: merged
+superseded_by: docs/PLAYBOOK_CROSS_TOOL_REVIEW_LOOP.md
 created: 2026-04-19
 updated: 2026-04-19
 ---
 
 # Review Round Card — CTRL Playbook (rounds 1–5)
 
-- 评审对象：[docs/PLAYBOOK_CROSS_TOOL_REVIEW_LOOP.md](../PLAYBOOK_CROSS_TOOL_REVIEW_LOOP.md)
+- 评审对象：[docs/PLAYBOOK_CROSS_TOOL_REVIEW_LOOP.md](../../PLAYBOOK_CROSS_TOOL_REVIEW_LOOP.md)
 - Writer：`claude-opus-4-7`
 - Reviewer：codex（cross-family，跨轮保持同一 reviewer）
 - 评审周期：2026-04-19 起，预期 > 1 天 → 触发 Layer 4 落盘
-- 当前状态：round 5 Handoff Header 已输出（见下），待 reviewer 回执；session 额度紧张，下轮预期跨 session
+- 当前状态：round 5 reviewer 回执 READY（无 findings），`review-processor` subagent 核验 `READY_CONFIRMED`，已归档
 
 ## 冻结决策（carried forward through round 5）
 
@@ -89,7 +90,7 @@ updated: 2026-04-19
 
 ## 相关文件
 
-- 评审主文档：[../PLAYBOOK_CROSS_TOOL_REVIEW_LOOP.md](../PLAYBOOK_CROSS_TOOL_REVIEW_LOOP.md)
-- Reviewer 提示词：[../prompts/ANALYSIS_PROMPT_PLAYBOOK_EXTERNAL_REVIEW.md](../prompts/ANALYSIS_PROMPT_PLAYBOOK_EXTERNAL_REVIEW.md)
-- 评审包组装脚本：[../../scripts/assemble-review-package.sh](../../scripts/assemble-review-package.sh)
-- 治理归档 SOP：[../GOVERNANCE_DOCS_PLAN.md](../GOVERNANCE_DOCS_PLAN.md)
+- 评审主文档：[../../PLAYBOOK_CROSS_TOOL_REVIEW_LOOP.md](../../PLAYBOOK_CROSS_TOOL_REVIEW_LOOP.md)
+- Reviewer 提示词：[../../prompts/ANALYSIS_PROMPT_PLAYBOOK_EXTERNAL_REVIEW.md](../../prompts/ANALYSIS_PROMPT_PLAYBOOK_EXTERNAL_REVIEW.md)
+- 评审包组装脚本：[../../../scripts/assemble-review-package.sh](../../../scripts/assemble-review-package.sh)
+- 治理归档 SOP：[../../GOVERNANCE_DOCS_PLAN.md](../../GOVERNANCE_DOCS_PLAN.md)
