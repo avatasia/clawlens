@@ -45,9 +45,9 @@ Claude 无法主动定时唤醒自己。可行 fallback：
 
 选择准则：预计 reviewer 回来 ≤ 10 min 且你愿意留在终端前 → (b) 的手动保活；预计 10~15 min 且已在 `/loop` 中 → (a) 的 `ScheduleWakeup`；预计 > 15 min 或人要离开 → 躺平。
 
-### Layer 2 — 轮尾手动 `/compact`
+### Layer 2 — 轮尾手动 `/compact`（或按 §"Context high-water 决策" 升级到 `/clear-restart`）
 
-Claude 处理完本轮评审意见、产出 v(N+1) 之后，立刻 `/compact`。
+Claude 处理完本轮评审意见、产出 v(N+1) 之后，默认立刻 `/compact`。若当前 session 已触发下文 §"Context high-water 决策" 的条件，writer 必须在 `/compact-continue` 与 `/clear-restart` 两条路径中显式选一条，不得默认继续叠加。
 
 - 把本轮完整对话压成摘要，作为后续 cache 基础。
 - 对保留"本轮为什么这样改"的因果链非常关键；不 compact 则下一轮评审回来时语境会和 session 历史混在一起，噪音增加。
@@ -72,19 +72,20 @@ Claude 处理完本轮评审意见、产出 v(N+1) 之后，立刻 `/compact`。
 **当 `TaskList` 返回 0 条匹配任务**（上述任一"不保证"边界已越过），操作者和 Claude 必须按以下顺序恢复：
 
 1. **同轮 `/compact` 例外**：若 TaskList 丢失发生在刚做完 `/compact` 的当轮——Handoff Header 与 draft 仍在 compact 后的对话摘要内、未跨 `/clear`、未跨进程重启、未跨 session、未跨新机器——允许直接从当前对话重建 card（再次 `TaskCreate`，内容取自当前 session 的 compact 摘要）。这是标准流程的明示退路，不触发下面的 2、3 步。其它任何丢失场景（`/clear`、重启、新 session、新机器）一律 **不允许** 凭记忆重建。
-2. 跨 `/clear`、跨进程、跨 session 导致的丢失：查看 `docs/plans/` 下是否存在本评审对应的 `REVIEW_ROUND_<topic>_*.md`（即 Layer 4 产物）。若存在，读最新一份恢复语境，视为 Layer 3 降级到 Layer 4。
+2. 跨 `/clear`、跨进程、跨 session 导致的丢失：查看 `docs/plans/` 下是否存在本评审对应的 `REVIEW_ROUND_<topic>_*.md`（即 Layer 4 产物）。若存在，**先用 `git log -- <path>` 或 `git status` 确认该文件已 commit**；已 commit 则读最新一份恢复语境，视为 Layer 3 降级到 Layer 4。若文件存在但**未 git-commit**（典型场景：Path B 步骤 3 被跳过的裸 `/clear` 后文件仍残留在同机器 worktree 中），不得作为可信恢复源——视为 Layer 4 未持久化，降级到下一步从第 1 轮重启，并在下一轮 Handoff Header 的 `Reviewer mis-citations (not addressed)` 邻近独立记录本次 bare-/clear 事件以便后续审计。
 3. 若 `docs/plans/` 下没有对应文件，视为评审未持久化——从第 1 轮重启评审；不要猜测上轮结论。
 4. 不要从 git 历史里捞 Claude 之前的输出冒充 TaskList——历史对话不等于可信的 frozen decisions。
 
 不要把 TaskList 的内容落到 `docs/` ——它是 ephemeral 状态，落盘会违反治理原则。任何需要跨 session 硬持久化的场景，统一走 Layer 4。
 
-### Layer 4 — 跨日 / 多人交接（只有此时才落盘）
+### Layer 4 — 跨日 / 多人交接 / 主动 `/clear` 前置（触发时才落盘）
 
-只有同时满足以下任一条件时，把评审回合卡落盘：
+只有满足以下任一条件时，把评审回合卡落盘：
 
 - 评审周期 > 1 天，需要跨 Claude 进程持久化；
 - 多人轮流接手同一评审；
-- 评审产物本身要进入归档证据链。
+- 评审产物本身要进入归档证据链；
+- Writer 按下文 §"Context high-water 决策" 选择 `/clear-restart` 路径——此时 Layer 4 落盘是 `/clear` 的前置条件，违反则触发该节禁止的"裸 `/clear`"。
 
 落盘位置：`docs/plans/` 目录下，命名形如 `REVIEW_ROUND_<topic>_<YYYY-MM-DD>.md`，必须带 frontmatter：
 
@@ -124,6 +125,39 @@ updated: YYYY-MM-DD
 - 归档不登记到主题 `_HISTORY.md`（治理明文禁止：不完整归档）；
 - 把创建 / 合入 / history 登记拆成多个 commit（违反归档原子性，审计追溯会断）。
 
+## Context high-water 决策：`/compact-continue` vs `/clear-restart`
+
+Layer 1–4 解决的是"`/compact` 之后如何续跑、`/clear` 之后如何恢复"，但没有定义"何时应该主动选择 `/clear`、而不是继续 `/compact`"。默认成本表推"保活 + `/compact`" 为最省，仅在轮内 cache 视角成立；当 session 跨多轮累积、`/compact` 摘要开始失真时，这个默认不再成立。
+
+**决策规则**：当 session 达到 context high-water 时，writer 必须显式在下列两条路径中选一条，不得默认继续叠加：
+
+- **Path A — `/compact-continue`**
+  适用条件：本轮因果链仍需保留，且 `/compact` 输出摘要对 frozen decisions / 上一轮 blockers / 下一步动作的覆盖仍然完整。
+  动作：照 Layer 2 正常 `/compact`，进入下一轮。
+- **Path B — Layer 4 persist + `/clear-restart`**
+  适用条件：`/compact` 摘要已出现可观察的失真（关键决策丢失、frozen 条目标记漂移、因果链断裂等），或 context usage 超过本机型推荐阈值且下一轮预期继续膨胀。
+  动作顺序严格遵守，任何一步缺失即视为"裸 `/clear`"，禁止：
+  1. 按 Layer 4 规则创建或更新本评审的 `REVIEW_ROUND_<topic>_<YYYY-MM-DD>.md`，确保 frozen decisions / 当前版本 / open questions / 下一步动作全部落盘；
+  2. 原子同 commit 内更新 `docs/plans/README.md` 索引与主文档 "under external review" 标注；
+  3. 确认 Layer 4 文件已提交到 git；
+  4. 再执行 `/clear`（或新开 session）；
+  5. 新 session 按 §"Reviewer 输出回到 Claude 后的默认动作" **step 0** 走 Layer 3 恢复（读取 round-card、`TaskCreate` 重建回合卡），恢复成功后再继续下一轮。
+
+**高水位触发信号（heuristic，非硬阈值）：**
+
+- context usage 超过当前机型窗口的约 50%——本数字仅为推荐阈值，实际取决于模型上下文窗口、文档长度、轮次，允许 writer 基于摘要质量主观改判；
+- 上一次 `/compact` 的摘要在 frozen decisions / blockers / action items 任一维度出现可观察的失真。
+
+**不作为高水位触发信号**（各自由其他规则处理，避免误伤）：
+
+- Reviewer 重复挑战已冻结事项——由 §"Frozen decision challenge handling" 的 Hold / Downgrade / Escalate 流程处理；`/clear` 会把解决挑战所需的 rationale 语境一并清空，属于错误反应。
+- Session 延迟或 token 成本单独升高——属 writer-side budget / 5h quota 范畴，不在 CTRL playbook scope 内。
+
+**禁止：**
+
+- 裸 `/clear`：未完成上述 5 步动作序列即执行 `/clear`。此时 Layer 3 恢复会降级到"从 round 1 重启"（见 Layer 3 步骤 3），轮次预算立即烧掉。
+- 用 `/compact` 次数堆叠代替 `/clear-restart`：当摘要失真已经可观察，继续 `/compact` 只会把失真压得更紧，下一轮 reviewer 会开始在已冻结条目上反复提相同 finding。
+
 ## 标准每轮流程
 
 ```
@@ -139,7 +173,17 @@ updated: YYYY-MM-DD
 [human paste]  → Claude
     │
     ▼
-[Claude]  dispatch review-processor subagent → verified findings → apply VALID/PARTIAL fixes → draft v(N+1) → TaskUpdate → /compact → verify TaskList still present; if empty, see Layer 3 recovery rules (the same-turn /compact exception applies here; all other loss modes must fall through to Layer 4 or a round-1 restart)
+[Claude]  dispatch review-processor subagent → verified findings → apply VALID/PARTIAL fixes → draft v(N+1) → TaskUpdate
+    │
+    ▼
+[Claude]  §"Context high-water 决策" check (D11) — Path A or Path B, 不得默认继续叠加
+    │
+    ├─ Path A  /compact-continue → verify TaskList still present; if empty, see Layer 3 recovery rules
+    │          (same-turn /compact exception applies here; other loss modes fall to Layer 4 or round-1 restart)
+    │
+    └─ Path B  Layer 4 persist (write/refresh round-card) → 原子 commit README + under-external-review marker
+               → 确认 git-commit 已落盘 → /clear（或新 session）
+               → 新 session 按 §"Reviewer 输出回到 Claude 后的默认动作" step 0 走 Layer 3 恢复再续轮
     │
     ▼
 (repeat until reviewer returns READY)
@@ -247,7 +291,7 @@ updated: YYYY-MM-DD
 > **Heuristic section — order-of-magnitude estimates only.**
 > 表中数字依赖 Anthropic 当期定价、session 的实际 token 量、以及"cache read ≈ cache write 10%"这条经验比。定价和比值会随时间变化，数字不是精确预算。表格的作用是指出**策略之间的相对关系**（保活 vs 躺平 vs compact 配合），不是给出某一轮的绝对 USD 成本。
 >
-> 关于更长 TTL：本 playbook 不建模 "1h 扩展 cache"（若 Anthropic 后续开放）这类 API-level 选项，因为它不是 Claude Code session 内由 writer 决定的变量；等 API 层稳定提供 + Claude Code 暴露相应接口后再修本章。
+> 关于更长 TTL：Anthropic 已在 API 层提供 1h 扩展 cache，但本 playbook 不建模这类 API-level 选项，因为它不是 Claude Code session 内由 writer 决定的变量；等 Claude Code 暴露相应接口后再修本章。
 
 假设 Claude session 在第 3 轮达到 50k tokens：
 
@@ -255,10 +299,11 @@ updated: YYYY-MM-DD
 |---|---|---|
 | 裸等（> 5min） | 1 × full cache write | 基线成本 |
 | 保活（ScheduleWakeup 240s × N） | N × cache read ≈ 0.1N × full write | N=6 时约 0.6 × full；等待 > 15 min 后反而更贵 |
-| 保活 + 轮尾 /compact | 同上，但下轮基础从 50k 降到 ~10k | **最优**：单轮便宜 + 后续轮次也便宜 |
+| 保活 + 轮尾 /compact | 同上，但下轮基础从 50k 降到 ~10k | 在 /compact 摘要质量未失真时单轮便宜 + 后续轮次也便宜；失真后失效，见下一行 |
 | 不保活 + 轮尾 /compact | 1 × full cache write（但基础小） | 可接受，适合不确定等待时长 |
+| Layer 4 persist + `/clear-restart` + 新 session 读 round-card | 1 × full cache write on 新 session（基础 ≈ round-card 体积，通常 < 5k） | 适用于 /compact 摘要已失真或 context 已达高水位；详见 §"Context high-water 决策" |
 
-经验值：等待 ≤ 10 min 选保活；10~20 min 看情况；> 20 min 躺平 + 轮尾 compact。
+经验值：等待 ≤ 10 min 选保活；10~20 min 看情况；> 20 min 躺平 + 轮尾 compact。context 已到高水位或 `/compact` 摘要失真时，按 §"Context high-water 决策" 切换到 `/clear-restart` 路径。
 
 ## 反模式
 
