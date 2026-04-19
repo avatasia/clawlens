@@ -6,6 +6,8 @@ updated: 2026-04-19
 
 # Cross-Tool Review Loop (CTRL) Playbook
 
+> **Under external review** — round-card at [plans/REVIEW_ROUND_CTRL_PLAYBOOK_2026-04-19.md](plans/REVIEW_ROUND_CTRL_PLAYBOOK_2026-04-19.md). 编辑本文件前请先读回合卡，避免破坏本轮冻结决策。
+
 > 目的：Claude 作为 writer、异构模型（Codex / GPT-5 / Gemini 等）作为 reviewer、人工承担复制-粘贴传递的多轮文档评审场景下，同时控制两类成本：
 >
 > 1. Anthropic prompt cache 的 5 分钟 TTL 失效；
@@ -71,7 +73,7 @@ Claude 处理完本轮评审意见、产出 v(N+1) 之后，立刻 `/compact`。
 
 **当 `TaskList` 返回 0 条匹配任务**（上述任一"不保证"边界已越过），操作者和 Claude 必须按以下顺序恢复：
 
-1. **同轮 `/compact` 例外**：若 TaskList 丢失发生在刚做完 `/compact` 的当轮——Handoff Header 与 draft 仍在 compact 后的对话摘要内、未跨 `/clear`、未跨进程重启、未跨 session——允许直接从当前对话重建 card（再次 `TaskCreate`，内容取自当前 session 的 compact 摘要）。这是标准流程的明示退路，不触发下面的 2、3 步。其它任何丢失场景（`/clear`、重启、新 session、新机器）一律 **不允许** 凭记忆重建。
+1. **同轮 `/compact` 例外**：若 TaskList 丢失发生在刚做完 `/compact` 的当轮——Handoff Header 与 draft 仍在 compact 后的对话摘要内、未跨 `/clear`、未跨进程重启、未跨 session、未跨新机器——允许直接从当前对话重建 card（再次 `TaskCreate`，内容取自当前 session 的 compact 摘要）。这是标准流程的明示退路，不触发下面的 2、3 步。其它任何丢失场景（`/clear`、重启、新 session、新机器）一律 **不允许** 凭记忆重建。
 2. 跨 `/clear`、跨进程、跨 session 导致的丢失：查看 `docs/plans/` 下是否存在本评审对应的 `REVIEW_ROUND_<topic>_*.md`（即 Layer 4 产物）。若存在，读最新一份恢复语境，视为 Layer 3 降级到 Layer 4。
 3. 若 `docs/plans/` 下没有对应文件，视为评审未持久化——从第 1 轮重启评审；不要猜测上轮结论。
 4. 不要从 git 历史里捞 Claude 之前的输出冒充 TaskList——历史对话不等于可信的 frozen decisions。
@@ -149,9 +151,10 @@ updated: YYYY-MM-DD
 
 当人工把 reviewer 的 5 段输出粘回 Claude（无论是否先做了 `/clear`），main agent 的默认动作 **不是** 按 finding 直接改文档，而是：
 
+0. **若 `TaskList` 返回 0 条匹配任务**（因 `/clear`、进程重启、新 session、新机器等导致），先按 Layer 3 恢复回合状态（同轮 `/compact` 例外适用；其它场景按 Layer 3 步骤 2、3 降级到 Layer 4 或从第 1 轮重启）。**恢复完成前禁止执行 `TaskUpdate`、禁止生成下一个 Handoff Header**；subagent 验收可以并行启动（它不依赖 TaskList），但其输出必须等回合卡恢复后再落到 Handoff。
 1. **Dispatch `review-processor` subagent**（定义见 `.claude/agents/review-processor.md`）。把 reviewer 原文 + 被评审文档的 repo-relative 路径交给它，让它在干净的 subagent 上下文里逐条核验每个 finding 是否与现行文档一致。
 2. Subagent 返回验证后的清单（每条标 `VALID` / `INVALID` / `PARTIAL`，附 `file:line` 证据）与最小化修复建议。
-3. Main agent 只对 `VALID` / `PARTIAL` 条目动手；`INVALID` 条目在下一轮 Handoff Header 的 Previous-round blockers 段显式标注为 `reviewer mis-citation in round N, not addressed, counter-evidence: "<quoted line>"`，避免 reviewer 下一轮继续复述同一误读。
+3. Main agent 只对 `VALID` / `PARTIAL` 条目动手；`INVALID` 条目 **不写入** `Previous-round blockers addressed in this draft`（该段保留给有四字段证据的实际修复），而是写入下一轮 Handoff Header 中独立新增的 `Reviewer mis-citations (not addressed)` 段，格式为 `- "<finding title verbatim>" — mis-citation in round N, counter-evidence: "<file:line quoted text>"`，避免 reviewer 下一轮继续复述同一误读。
 
 为什么走 subagent：
 
@@ -182,7 +185,10 @@ updated: YYYY-MM-DD
   - D2: ...
 - Previous-round blockers addressed in this draft:
   - "<Blocker finding title verbatim from prior round>" -> addressed in section "<doc section heading>", lines L<start>-L<end>; changed sentence: "<exact quoted sentence from the new draft>"
-  - (each item MUST cite ALL four: prior finding title verbatim + section heading + concrete line range + an exact quoted sentence from the new draft. Free-form summary of the edit is NOT an acceptable substitute. Items that omit any of these four are rejected by the next-round reviewer.)
+  - (each item MUST cite ALL four: prior finding title verbatim + section heading + concrete line range + an exact quoted sentence from the new draft. Free-form summary of the edit is NOT an acceptable substitute. Items that omit any of these four are rejected by the next-round reviewer. INVALID mis-citations do NOT belong here — list them in the next section.)
+- Reviewer mis-citations (not addressed):
+  - "<Finding title verbatim from prior round>" — mis-citation in round N, counter-evidence: "<file:line quoted text from the document that refutes the finding>"
+  - (this section is only for findings that the `review-processor` subagent marked INVALID. Each item requires the original finding title + the round number + an exact quote from the document that contradicts the reviewer's claim. Leaving INVALID findings out of Handoff entirely is prohibited — reviewers will re-raise them next round.)
 - Out-of-scope for this review:
   - ...
 - Governance constraints to respect:
