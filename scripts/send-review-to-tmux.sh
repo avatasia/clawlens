@@ -45,7 +45,11 @@ fi
 
 # 1. clear reviewer conversation context
 tmux send-keys -t "$SESSION" "/clear" Enter
-sleep 1
+# Codex TUI rebuilds its input frame after /clear; under load (e.g. previous
+# session still flushing tokens) 3s is still not enough and the subsequent
+# paste-buffer silently lands outside the input. 5s is empirically stable for
+# codex 0.121.0.
+sleep 5
 
 # 2. paste package body via bracketed paste
 BUFFER="send-review-$$"

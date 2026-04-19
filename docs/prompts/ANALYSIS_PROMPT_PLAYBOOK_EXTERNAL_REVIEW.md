@@ -142,6 +142,40 @@ Send ONE message to the reviewer containing these three parts, concatenated in t
 
 Do **not** include the frontmatter, the file title, the operator note, or this "Operator reference" section.
 
+### Minimal send template
+
+Use this shape when you want the shortest possible operator flow:
+
+```md
+[paste the text between BEGIN REVIEWER PROMPT and END REVIEWER PROMPT]
+
+## Review Handoff (round N of estimated M)
+
+- Document: docs/<TARGET>.md
+- Writer model: claude-opus-4-7
+- Reviewer target: <codex | gpt-5 | gemini-2.5-pro>
+- Goal of this round: <one sentence>
+- Open questions for this round:
+  - Q1: ...
+- Frozen decisions (do not re-litigate):
+  - D1: ...
+- Previous-round blockers addressed in this draft:
+  - (none)
+- Reviewer mis-citations (not addressed):
+  - (none)
+- Out-of-scope for this review:
+  - ...
+- Governance constraints to respect:
+  - Top-level `docs/*.md` filenames must not contain dates; frontmatter `created` / `updated` dates remain required by `docs/GOVERNANCE_DOCS_PLAN.md`.
+  - Sub-directory READMEs must index all `.md` files.
+  - No absolute repo-root paths in content.
+  - Bidirectional `DOC_INDEX` / `CODE_INDEX` must stay consistent.
+
+[paste the draft document in full]
+```
+
+If this is round 1, keep `Previous-round blockers addressed in this draft` and `Reviewer mis-citations (not addressed)` as `(none)`.
+
 ### Expected reviewer output shape (for Claude-side parsing)
 
 After the reviewer returns, Claude should be able to parse:
