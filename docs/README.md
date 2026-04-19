@@ -20,14 +20,23 @@
 - [Docs Governance Plan](GOVERNANCE_DOCS_PLAN.md)
 - [Governance Automation](DOCS_GOVERNANCE_AUTOMATION.md)
 - [Transcript Binding Rollback Playbook](CLAWLENS_TRANSCRIPT_BINDING_ROLLBACK_PLAYBOOK.md)
+- [Docs Audit Prompt](PROMPT_DOCS_AUDIT.md)
+- [Docs Global Validation Prompt](PROMPT_DOCS_GLOBAL_VALIDATION.md)
 
 ### 4. [方法论与提示词库](PLAYBOOK_ANALYSIS_PROMPT.md)
 用于提升 AI Agent 协作效率的专用提示词体系与工程教训总结。
 - [Analysis Prompt Playbook](PLAYBOOK_ANALYSIS_PROMPT.md)
 - [Model and Effort Selection Playbook](PLAYBOOK_MODEL_AND_EFFORT_SELECTION.md)
 - [Model and Effort Selection Quick Reference](PLAYBOOK_MODEL_AND_EFFORT_SELECTION_QUICK_REFERENCE.md)
+- [Cross-Tool Review Loop Playbook](PLAYBOOK_CROSS_TOOL_REVIEW_LOOP.md)
 - [Engineering Lessons Playbook](PLAYBOOK_ENGINEERING_LESSONS.md)
 - [Implementation Guidance](PROMPT_IMPLEMENTATION.md)
+
+### 5. 功能分析
+针对具体功能模块的深度分析文档。
+- [Chat Audit](ANALYSIS_CHAT_AUDIT.md)
+- [Chat Audit Long-Term Enhancements](ANALYSIS_CHAT_AUDIT_ENHANCEMENTS.md)
+- [LLM API Logger Message Mapping](ANALYSIS_LLM_API_LOGGER_MESSAGE_MAPPING.md)
 
 ## 子目录职责
 
@@ -39,4 +48,4 @@
 | [archive/](archive/) | 历史归档库，包含已完成主题的 History 索引。 |
 
 ---
-*Last Global Validation: 2026-04-11*
+*Last Global Validation: 2026-04-19*
