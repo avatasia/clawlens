@@ -14,6 +14,8 @@ updated: 2026-04-19
 > [!NOTE]
 > **Heuristic document, not benchmark truth.**
 > 本文基于当前仓库的实际协作经验整理，不宣称对所有任务、所有版本、所有团队都最优。若与你们的真实质量数据冲突，以实际效果覆盖本文。
+>
+> 快查版见：[PLAYBOOK_MODEL_AND_EFFORT_SELECTION_QUICK_REFERENCE.md](PLAYBOOK_MODEL_AND_EFFORT_SELECTION_QUICK_REFERENCE.md)。
 
 ## 目标
 
@@ -275,6 +277,7 @@ updated: 2026-04-19
 
 ## 相关文档
 
+- [PLAYBOOK_MODEL_AND_EFFORT_SELECTION_QUICK_REFERENCE.md](PLAYBOOK_MODEL_AND_EFFORT_SELECTION_QUICK_REFERENCE.md) — 1 页内快查版
 - [PLAYBOOK_CROSS_TOOL_REVIEW_LOOP.md](PLAYBOOK_CROSS_TOOL_REVIEW_LOOP.md) — Claude writer / 外部 reviewer 多轮评审闭环
 - [PLAYBOOK_ANALYSIS_PROMPT.md](PLAYBOOK_ANALYSIS_PROMPT.md) — 分析提示词入口
 - [PLAYBOOK_ENGINEERING_LESSONS.md](PLAYBOOK_ENGINEERING_LESSONS.md) — 仓库沉淀出的通用工程经验

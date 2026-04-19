@@ -25,6 +25,7 @@
 用于提升 AI Agent 协作效率的专用提示词体系与工程教训总结。
 - [Analysis Prompt Playbook](PLAYBOOK_ANALYSIS_PROMPT.md)
 - [Model and Effort Selection Playbook](PLAYBOOK_MODEL_AND_EFFORT_SELECTION.md)
+- [Model and Effort Selection Quick Reference](PLAYBOOK_MODEL_AND_EFFORT_SELECTION_QUICK_REFERENCE.md)
 - [Engineering Lessons Playbook](PLAYBOOK_ENGINEERING_LESSONS.md)
 - [Implementation Guidance](PROMPT_IMPLEMENTATION.md)
 
