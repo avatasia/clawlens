@@ -26,6 +26,7 @@
 ### 4. [方法论与提示词库](PLAYBOOK_ANALYSIS_PROMPT.md)
 用于提升 AI Agent 协作效率的专用提示词体系与工程教训总结。
 - [Analysis Prompt Playbook](PLAYBOOK_ANALYSIS_PROMPT.md)
+- [Claude Tmux Control Playbook](PLAYBOOK_CLAUDE_TMUX_CONTROL.md)
 - [Model and Effort Selection Playbook](PLAYBOOK_MODEL_AND_EFFORT_SELECTION.md)
 - [Model and Effort Selection Quick Reference](PLAYBOOK_MODEL_AND_EFFORT_SELECTION_QUICK_REFERENCE.md)
 - [Cross-Tool Review Loop Playbook](PLAYBOOK_CROSS_TOOL_REVIEW_LOOP.md)
@@ -48,4 +49,4 @@
 | [archive/](archive/) | 历史归档库，包含已完成主题的 History 索引。 |
 
 ---
-*Last Global Validation: 2026-04-19*
+*Last Global Validation: 2026-04-20*

@@ -38,18 +38,37 @@ if ! tmux has-session -t "$SESSION" 2>/dev/null; then
     echo "ERROR: tmux session '$SESSION' not found" >&2
     exit 1
 fi
+if [ -n "${TMUX:-}" ]; then
+    CURRENT_SESSION="$(tmux display-message -p '#S' 2>/dev/null || true)"
+    if [ -n "$CURRENT_SESSION" ] && [ "$CURRENT_SESSION" = "$SESSION" ]; then
+        echo "ERROR: refusing to send review package to the current tmux session '$SESSION'" >&2
+        exit 1
+    fi
+fi
 if [ ! -f "$PKG" ]; then
     echo "ERROR: package file '$PKG' not found" >&2
     exit 1
 fi
 
+LOCK_SESSION="$(printf '%s' "$SESSION" | tr -c 'A-Za-z0-9_.-' '_')"
+LOCK_FILE="${TMPDIR:-/tmp}/clawlens-review-${LOCK_SESSION}.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -w 60 9; then
+    echo "ERROR: timed out waiting for review dispatch lock for '$SESSION'" >&2
+    exit 1
+fi
+trap 'rm -f "$LOCK_FILE"' EXIT
+
 # 1. clear reviewer conversation context
 tmux send-keys -t "$SESSION" "/clear" Enter
-# Codex TUI rebuilds its input frame after /clear; under load (e.g. previous
-# session still flushing tokens) 3s is still not enough and the subsequent
-# paste-buffer silently lands outside the input. 5s is empirically stable for
-# codex 0.121.0.
-sleep 5
+deadline=$((SECONDS + 30))
+while [ "$SECONDS" -lt "$deadline" ]; do
+    pane_text="$(tmux capture-pane -pt "$SESSION" -S -120 2>/dev/null || true)"
+    if printf '%s\n' "$pane_text" | grep -Eq 'Type your message or @path/to/file|^[[:space:]]*[›❯>][[:space:]]*$'; then
+        break
+    fi
+    sleep 1
+done
 
 # 2. paste package body via bracketed paste
 BUFFER="send-review-$$"

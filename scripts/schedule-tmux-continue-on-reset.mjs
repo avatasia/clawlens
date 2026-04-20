@@ -4,8 +4,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
+import { withSessionLock } from "./tmux-session-lock.mjs";
 
 function usage() {
   console.log(`Usage: node scripts/schedule-tmux-continue-on-reset.mjs [options]
@@ -101,18 +102,17 @@ function parseRelativeDuration(text) {
 
 export function extractResetSpec(text) {
   const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  const absoluteCandidates = [];
-  const relativeCandidates = [];
+  const candidates = [];
 
-  for (let i = lines.length - 1; i >= 0; i -= 1) {
+  for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
-    if (!/limit reached|hit your limit/i.test(line) && !/resets/i.test(line)) {
+    if (!/limit reached|hit your limit|0% left/i.test(line) && !/resets/i.test(line)) {
       continue;
     }
 
-    const absolute = line.match(/resets\s+([0-9]{1,2}(?::[0-9]{2})?\s*(?:am|pm))(?:\s*\(([^)]+)\))?/i);
+    const absolute = line.match(/resets(?:\s+at|\s*[: ]+)\s*([0-9]{1,2}(?::[0-9]{2})?\s*(?:am|pm)?)(?!\s*[hms])(?:\s*\(([^)]+)\))?/i);
     if (absolute) {
-      absoluteCandidates.push({
+      candidates.push({
         kind: "absolute",
         resetText: absolute[1].trim(),
         timezone: absolute[2]?.trim() || null,
@@ -121,11 +121,11 @@ export function extractResetSpec(text) {
       continue;
     }
 
-    const relative = line.match(/resets\s+((?:(?:\d+)\s*[hms]\s*){1,3})/i);
+    const relative = line.match(/resets(?:\s+at|\s*[: ]+)\s*((?:(?:\d+)\s*[hms]\s*){1,3})/i);
     if (relative) {
       const duration = parseRelativeDuration(relative[1]);
       if (duration) {
-        relativeCandidates.push({
+        candidates.push({
           kind: "relative",
           ...duration,
           sourceLine: line,
@@ -134,14 +134,7 @@ export function extractResetSpec(text) {
     }
   }
 
-  if (absoluteCandidates.length > 0) {
-    return absoluteCandidates[0];
-  }
-  if (relativeCandidates.length > 0) {
-    return relativeCandidates[0];
-  }
-
-  return null;
+  return candidates.length > 0 ? candidates : null;
 }
 
 function dateInTimezone(format, timezone, dateExpr = "now") {
@@ -187,33 +180,118 @@ function sanitizeName(value) {
   return value.replace(/[^A-Za-z0-9_.-]+/g, "_");
 }
 
-function makeRunnerScript({ session, delaySeconds, logPath, metadataPath, runnerPath }) {
+function makeRunnerScript({ session, delaySeconds, logPath, metadataPath, runnerPath, lockHelperPath }) {
   return `#!/usr/bin/env bash
 set -euo pipefail
 
 sleep ${delaySeconds}
 
-if ! tmux has-session -t ${shellQuote(session)} 2>/dev/null; then
-  printf '[%s] session missing: %s\\n' "$(date '+%Y-%m-%d %H:%M:%S %Z %z')" ${shellQuote(session)} >> ${shellQuote(logPath)}
-  rm -f ${shellQuote(metadataPath)} "$0"
-  exit 0
-fi
+TMUX_CONTINUE_SESSION=${shellQuote(session)} \
+TMUX_CONTINUE_LOG_PATH=${shellQuote(logPath)} \
+TMUX_CONTINUE_METADATA_PATH=${shellQuote(metadataPath)} \
+TMUX_CONTINUE_RUNNER_PATH=${shellQuote(runnerPath)} \
+TMUX_CONTINUE_LOCK_HELPER=${shellQuote(pathToFileURL(lockHelperPath).href)} \
+node --input-type=module <<'NODE'
+import fs from "node:fs";
+import { spawnSync } from "node:child_process";
+const { withSessionLock } = await import(process.env.TMUX_CONTINUE_LOCK_HELPER);
 
-pane=$(tmux display-message -p -t ${shellQuote(session)} '#{session_name}:#{window_index}.#{pane_index}')
-printf '[%s] pane=%s\\n' "$(date '+%Y-%m-%d %H:%M:%S %Z %z')" "$pane" >> ${shellQuote(logPath)}
-tmux send-keys -t "$pane" continue Enter
-printf '[%s] sent continue\\n' "$(date '+%Y-%m-%d %H:%M:%S %Z %z')" >> ${shellQuote(logPath)}
-rm -f ${shellQuote(metadataPath)} "$0"
+const session = process.env.TMUX_CONTINUE_SESSION;
+const logPath = process.env.TMUX_CONTINUE_LOG_PATH;
+const metadataPath = process.env.TMUX_CONTINUE_METADATA_PATH;
+const runnerPath = process.env.TMUX_CONTINUE_RUNNER_PATH;
+
+function log(line) {
+  fs.appendFileSync(logPath, "[" + new Date().toISOString() + "] " + line + "\\n", "utf8");
+}
+
+function run(command, args) {
+  const result = spawnSync(command, args, { encoding: "utf8" });
+  if (result.status !== 0) {
+    const stderr = (result.stderr || result.stdout || "").trim();
+    throw new Error(command + " " + args.join(" ") + " failed: " + stderr);
+  }
+  return (result.stdout || "").trimEnd();
+}
+
+function isBusy(text) {
+  return /•\\s+Working\\b/.test(text) || /tab to queue message/i.test(text) || /Thinking\\.\\.\\./i.test(text) || /Considering Command Execution/i.test(text);
+}
+
+function isPromptReady(text) {
+  return /Type your message or @path\\/to\\/file|^\\s*>\\s*$/m.test(text);
+}
+
+try {
+  await withSessionLock(session, async () => {
+    const hasSession = spawnSync("tmux", ["has-session", "-t", session], { encoding: "utf8" });
+    if (hasSession.status !== 0) {
+      log("session missing: " + session);
+      return;
+    }
+
+    const pane = run("tmux", ["display-message", "-p", "-t", session, "#{session_name}:#{window_index}.#{pane_index}"]);
+    log("pane=" + pane);
+    const paneText = run("tmux", ["capture-pane", "-pt", pane, "-S", "-120"]);
+    if (isBusy(paneText)) {
+      log("busy, skipped continue");
+      return;
+    }
+    if (!isPromptReady(paneText)) {
+      log("prompt not ready, skipped continue");
+      return;
+    }
+    run("tmux", ["send-keys", "-t", pane, "continue", "Enter"]);
+    log("sent continue");
+  }, 30_000);
+} catch (error) {
+  log("runner failed: " + (error instanceof Error ? error.message : String(error)));
+  process.exitCode = 1;
+} finally {
+  try {
+    fs.rmSync(metadataPath, { force: true });
+  } catch {}
+  try {
+    fs.rmSync(runnerPath, { force: true });
+  } catch {}
+}
+NODE
 `;
 }
 
 export function analyzePane(text) {
   const spec = extractResetSpec(text);
-  const waitingForReset = /limit reached|hit your limit/i.test(text);
+  const waitingForReset = /limit reached|hit your limit|0% left/i.test(text);
   return { waitingForReset, spec };
 }
 
-function main() {
+export function selectResetCandidate(specs, nowEpoch, offsetMinutes) {
+  const absoluteSpecs = specs.filter((spec) => spec.kind === "absolute");
+  const relativeSpecs = specs.filter((spec) => spec.kind === "relative");
+  const prioritized = absoluteSpecs.length > 0 ? absoluteSpecs : relativeSpecs;
+
+  return prioritized
+    .map((spec) => ({
+      spec,
+      targetEpoch: computeTargetEpoch(spec, nowEpoch, offsetMinutes),
+    }))
+    .sort((a, b) => a.targetEpoch - b.targetEpoch)[0] ?? null;
+}
+
+export function isBusyForContinue(text) {
+  return (
+    /•\s+Working\b/.test(String(text || "")) ||
+    /tab to queue message/i.test(String(text || "")) ||
+    /Thinking\.\.\./i.test(String(text || "")) ||
+    /Considering Command Execution/i.test(String(text || ""))
+  );
+}
+
+export function isPromptReadyForContinue(text) {
+  return /Type your message or @path\/to\/file|^\s*>\s*$/m.test(String(text || ""));
+}
+
+async function main() {
   const options = parseArgs(process.argv.slice(2));
   const paneText = capturePane(options.session, options.bufferLines);
   const paneId = currentPaneId(options.session);
@@ -226,7 +304,13 @@ function main() {
   }
 
   const nowEpoch = Math.floor(Date.now() / 1000);
-  const targetEpoch = computeTargetEpoch(analysis.spec, nowEpoch, options.offsetMinutes);
+  const specs = Array.isArray(analysis.spec) ? analysis.spec : [analysis.spec];
+  const selected = selectResetCandidate(specs, nowEpoch, options.offsetMinutes);
+  if (!selected) {
+    console.error(`Session ${options.session} has no usable reset candidate.`);
+    process.exit(1);
+  }
+  const { spec, targetEpoch } = selected;
   const delaySeconds = Math.max(0, targetEpoch - nowEpoch);
   const metadataDir = path.join(os.tmpdir(), "clawlens-auto-continue");
   const metadataPath = path.join(metadataDir, `${sanitizeName(options.session)}.json`);
@@ -250,7 +334,7 @@ function main() {
   const metadata = {
     session: options.session,
     paneId,
-    sourceLine: analysis.spec.sourceLine,
+    sourceLine: spec.sourceLine,
     targetEpoch,
     targetTime: formatEpoch(targetEpoch),
     logPath,
@@ -263,36 +347,48 @@ function main() {
     return;
   }
 
-  fs.writeFileSync(
-    runnerPath,
-    makeRunnerScript({
-      session: options.session,
-      delaySeconds,
-      logPath,
-      metadataPath,
+  await withSessionLock(options.session, async () => {
+    if (fs.existsSync(metadataPath) && !options.force) {
+      const existing = JSON.parse(fs.readFileSync(metadataPath, "utf8"));
+      if (existing.targetEpoch > nowEpoch) {
+        console.log(`Already scheduled for session ${options.session}.`);
+        console.log(`Existing target: ${formatEpoch(existing.targetEpoch)}`);
+        console.log(`Metadata: ${metadataPath}`);
+        console.log(`Log: ${existing.logPath}`);
+        return;
+      }
+    }
+
+    fs.writeFileSync(
       runnerPath,
-    }),
-    "utf8",
-  );
-  fs.chmodSync(runnerPath, 0o755);
-  fs.writeFileSync(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+      makeRunnerScript({
+        session: options.session,
+        delaySeconds,
+        logPath,
+        metadataPath,
+        runnerPath,
+        lockHelperPath: path.join(__dirname, "tmux-session-lock.mjs"),
+      }),
+      "utf8",
+    );
+    fs.chmodSync(runnerPath, 0o755);
+    fs.writeFileSync(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
 
-  run("tmux", ["run-shell", "-b", `bash ${shellQuote(runnerPath)}`]);
+    run("tmux", ["run-shell", "-b", `bash ${shellQuote(runnerPath)}`]);
 
-  console.log(`Scheduled continue for session ${options.session}.`);
-  console.log(`Current pane: ${paneId}`);
-  console.log(`Trigger line: ${analysis.spec.sourceLine}`);
-  console.log(`Target: ${metadata.targetTime}`);
-  console.log(`Metadata: ${metadataPath}`);
-  console.log(`Log: ${logPath}`);
+    console.log(`Scheduled continue for session ${options.session}.`);
+    console.log(`Current pane: ${paneId}`);
+    console.log(`Trigger line: ${spec.sourceLine}`);
+    console.log(`Target: ${metadata.targetTime}`);
+    console.log(`Metadata: ${metadataPath}`);
+    console.log(`Log: ${logPath}`);
+  }, 30_000);
 }
 
 const entryPath = fileURLToPath(import.meta.url);
 if (process.argv[1] && path.resolve(process.argv[1]) === entryPath) {
-  try {
-    main();
-  } catch (err) {
+  main().catch((err) => {
     console.error(String(err instanceof Error ? err.message : err));
     process.exit(1);
-  }
+  });
 }

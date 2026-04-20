@@ -176,7 +176,9 @@ Recommended current-entry documents:
 - [ANALYSIS_CHAT_AUDIT_ENHANCEMENTS.md](docs/ANALYSIS_CHAT_AUDIT_ENHANCEMENTS.md)
 - [ANALYSIS_LLM_API_LOGGER_MESSAGE_MAPPING.md](docs/ANALYSIS_LLM_API_LOGGER_MESSAGE_MAPPING.md)
 - [PLAYBOOK_ENGINEERING_LESSONS.md](docs/PLAYBOOK_ENGINEERING_LESSONS.md)
+- [PLAYBOOK_CLAUDE_TMUX_CONTROL.md](docs/PLAYBOOK_CLAUDE_TMUX_CONTROL.md)
 - [PLAYBOOK_MODEL_AND_EFFORT_SELECTION.md](docs/PLAYBOOK_MODEL_AND_EFFORT_SELECTION.md)
+- [PLAYBOOK_MODEL_AND_EFFORT_SELECTION_QUICK_REFERENCE.md](docs/PLAYBOOK_MODEL_AND_EFFORT_SELECTION_QUICK_REFERENCE.md)
 - [PLAYBOOK_CROSS_TOOL_REVIEW_LOOP.md](docs/PLAYBOOK_CROSS_TOOL_REVIEW_LOOP.md)
 - [GOVERNANCE_DOCS_PLAN.md](docs/GOVERNANCE_DOCS_PLAN.md)
 - [DOCS_GOVERNANCE_AUTOMATION.md](docs/DOCS_GOVERNANCE_AUTOMATION.md)
@@ -216,6 +218,8 @@ Maintenance helper:
 
 - `bash scripts/update-openclaw-reference-version.sh`
   updates the OpenClaw reference version line in `docs/architecture.md` from the local `projects-ref/openclaw/` checkout
+- `node scripts/claude-tmux-control.mjs status --session cc1`
+  inspects the active Claude Code tmux pane and reports current model / effort state
 
 Docs governance automation (local-first, no PR required):
 
