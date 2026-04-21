@@ -40,6 +40,7 @@ Options:
   --settle-ms <n>              extra wait after submit before polling (default: 500)
   --stable-polls <n>           consecutive identical idle polls required (default: 3)
   --message <text>             message text for send/type commands
+  --no-wait                    send without waiting for a response
   --json                       emit machine-readable JSON
   --include-pane-text          include raw pane snapshots in JSON output
   --help                       show this help
@@ -70,6 +71,7 @@ function parseArgs(argv) {
     if (arg === "--settle-ms") { options.settleMs = Number(argv[++i]); continue; }
     if (arg === "--stable-polls") { options.stablePolls = Number(argv[++i]); continue; }
     if (arg === "--message") { options.message = argv[++i] ?? ""; continue; }
+    if (arg === "--no-wait") { options.waitForResponse = false; continue; }
     if (arg === "--json") { options.json = true; continue; }
     if (arg === "--include-pane-text") { options.includePaneText = true; continue; }
     if (arg === "--help" || arg === "-h") { usage(); process.exit(0); }
@@ -99,7 +101,14 @@ function parseArgs(argv) {
 }
 
 function run(command, args) {
-  const result = spawnSync(command, args, { encoding: "utf8" });
+  const result = spawnSync(command, args, {
+    encoding: "utf8",
+    timeout: command === "tmux" ? 10_000 : undefined,
+    killSignal: "SIGKILL",
+  });
+  if (result.error?.code === "ETIMEDOUT") {
+    throw new Error(`${command} ${args.join(" ")} timed out`);
+  }
   if (result.status !== 0) {
     const stderr = (result.stderr || result.stdout || "").trim();
     throw new Error(`${command} ${args.join(" ")} failed: ${stderr}`);
@@ -370,7 +379,7 @@ export function extractResponseMeta(baselineRaw, finalRaw, sentMessage) {
   const inputBlock = findGeminiInputBlock(finalLines, sentMessage);
   if (inputBlock) {
     for (let i = inputBlock.end; i < finalLines.length; i += 1) {
-      if (finalLines[i].startsWith("✦ ")) {
+      if (finalLines[i].startsWith("✦")) {
         splitIdx = i;
         method = "input_block";
         break;
@@ -427,9 +436,13 @@ export function extractResponseMeta(baselineRaw, finalRaw, sentMessage) {
   ) {
     responseLines.pop();
   }
+  const joined = responseLines
+    .map((line) => (line.startsWith("✦ ") ? line.slice(2) : line))
+    .join("\n")
+    .trim();
   return {
     method,
-    text: responseLines.join("\n").trim(),
+    text: joined,
   };
 }
 
@@ -464,12 +477,20 @@ export function buildStatusSnapshot(text) {
 
 async function sendMessage(session, options, message) {
   const target = currentPaneTarget(session);
-  const baseline = await waitForReady(target, options);
+  const readyOptions = options.waitForResponse === false
+    ? { ...options, timeoutMs: Math.min(options.timeoutMs, 2_000) }
+    : options;
+  const baseline = await waitForReady(target, readyOptions);
 
-  run("tmux", ["send-keys", "-t", target, message]);
+  run("tmux", ["send-keys", "-l", "-t", target, message]);
   await sleep(250);
   run("tmux", ["send-keys", "-t", target, "Enter"]);
-  await sleep(options.settleMs);
+  await sleep(options.waitForResponse === false ? Math.min(options.settleMs, 200) : options.settleMs);
+
+  if (options.waitForResponse === false) {
+    const finalText = capturePane(target, options.bufferLines);
+    return { target, baseline, output: finalText, becameBusy: false, waitForResponse: false };
+  }
 
   const busyDeadline = Date.now() + 10_000;
   let becameBusy = false;
@@ -511,7 +532,7 @@ async function typeMessage(session, options, message) {
   const target = currentPaneTarget(session);
   const baseline = await waitForReady(target, options);
 
-  run("tmux", ["send-keys", "-t", target, message]);
+  run("tmux", ["send-keys", "-l", "-t", target, message]);
   await sleep(250);
 
   const finalText = capturePane(target, options.bufferLines);
@@ -565,7 +586,7 @@ async function clearConversation(session, options) {
   const target = currentPaneTarget(session);
   const baseline = await waitForReady(target, options);
 
-  run("tmux", ["send-keys", "-t", target, "/clear"]);
+  run("tmux", ["send-keys", "-l", "-t", target, "/clear"]);
   await sleep(200);
   run("tmux", ["send-keys", "-t", target, "Enter"]);
   await sleep(options.settleMs);
@@ -701,6 +722,7 @@ async function main() {
       action: "send",
       session: options.session,
       message: options.message,
+      waitForResponse: options.waitForResponse !== false,
       response: responseMeta.text,
       responseMeta,
       ...paneDiagnostics(result.output ?? ""),

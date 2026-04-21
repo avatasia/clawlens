@@ -140,8 +140,8 @@ test("challenge broadcasts carry offender and audience fields", () => {
     "missing response",
     "2026-04-20T00:00:00.000Z",
   );
-  assert.match(challenge, /\[robo-squat challenge round=1 reporter=gemini1 offender=codex audience=cc1,codex deadline=/);
-  assert.match(challenge, /质疑: round=1 reporter=gemini1 offender=codex reason=missing response/);
+  assert.match(challenge, /\[robo-squat challenge round=1 mode=distributed reporter=gemini1 offender=codex audience=cc1,codex deadline=/);
+  assert.match(challenge, /质疑: round=1 mode=distributed reporter=gemini1 offender=codex reason=missing response/);
 });
 
 test("challenge audience excludes only the reporter", () => {

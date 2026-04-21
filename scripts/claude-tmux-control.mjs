@@ -57,6 +57,7 @@ Options:
   --model <value>              model alias or model id for set-model/set-combo
   --effort <value>             effort for set-effort/set-combo
   --message <text>             message text for send/type commands
+  --no-wait                    send without waiting for a response
   --json                       emit machine-readable JSON
   --include-pane-text          include raw pane snapshots in JSON output
   --help                       show this help
@@ -115,6 +116,10 @@ function parseArgs(argv) {
       options.message = argv[++i] ?? "";
       continue;
     }
+    if (arg === "--no-wait") {
+      options.waitForResponse = false;
+      continue;
+    }
     if (arg === "--json") {
       options.json = true;
       continue;
@@ -160,8 +165,13 @@ function parseArgs(argv) {
 function run(command, args) {
   const result = spawnSync(command, args, {
     encoding: "utf8",
+    timeout: command === "tmux" ? 10_000 : undefined,
+    killSignal: "SIGKILL",
   });
 
+  if (result.error?.code === "ETIMEDOUT") {
+    throw new Error(`${command} ${args.join(" ")} timed out`);
+  }
   if (result.status !== 0) {
     const stderr = (result.stderr || result.stdout || "").trim();
     throw new Error(`${command} ${args.join(" ")} failed: ${stderr}`);
@@ -428,12 +438,20 @@ async function waitForReady(target, options) {
 
 async function sendMessageToClaude(session, options, message) {
   const target = currentPaneTarget(session);
-  const baselineText = await waitForReady(target, options);
+  const readyOptions = options.waitForResponse === false
+    ? { ...options, timeoutMs: Math.min(options.timeoutMs, 2_000) }
+    : options;
+  const baselineText = await waitForReady(target, readyOptions);
 
-  run("tmux", ["send-keys", "-t", target, message]);
+  run("tmux", ["send-keys", "-l", "-t", target, message]);
   await sleep(300);
   run("tmux", ["send-keys", "-t", target, "Enter"]);
-  await sleep(options.settleMs);
+  await sleep(options.waitForResponse === false ? Math.min(options.settleMs, 200) : options.settleMs);
+
+  if (options.waitForResponse === false) {
+    const finalText = capturePane(target, options.bufferLines);
+    return { target, baseline: baselineText, output: finalText, becameBusy: false, waitForResponse: false };
+  }
 
   // Wait for busy then idle
   const busyDeadline = Date.now() + 5_000;
@@ -457,14 +475,14 @@ async function sendMessageToClaude(session, options, message) {
   }
 
   const finalText = capturePane(target, options.bufferLines);
-  return { target, baseline: baselineText, output: finalText, becameBusy: false };
+  return { target, baseline: baselineText, output: finalText, becameBusy: false, waitForResponse: true };
 }
 
 async function typeMessageToClaude(session, options, message) {
   const target = currentPaneTarget(session);
   const baselineText = await waitForReady(target, options);
 
-  run("tmux", ["send-keys", "-t", target, message]);
+  run("tmux", ["send-keys", "-l", "-t", target, message]);
   await sleep(300);
 
   const finalText = capturePane(target, options.bufferLines);
@@ -511,7 +529,7 @@ async function clearConversation(session, options) {
   }
   const baselineText = await waitForReady(target, options);
 
-  run("tmux", ["send-keys", "-t", target, "/clear"]);
+  run("tmux", ["send-keys", "-l", "-t", target, "/clear"]);
   await sleep(200);
   run("tmux", ["send-keys", "-t", target, "Enter"]);
   await sleep(options.settleMs);
@@ -539,7 +557,7 @@ function capturePane(target, bufferLines) {
 async function sendSlashCommand(target, commandText) {
   run("tmux", ["send-keys", "-t", target, "C-u"]);
   await sleep(200);
-  run("tmux", ["send-keys", "-t", target, commandText]);
+  run("tmux", ["send-keys", "-l", "-t", target, commandText]);
   await sleep(300);
   run("tmux", ["send-keys", "-t", target, "Enter"]);
 }
@@ -745,7 +763,13 @@ async function main() {
       async () => sendMessageToClaude(options.session, options, options.message),
       options.timeoutMs + 10_000,
     );
-    const payload = { action: "send", session: options.session, message: options.message, ...result };
+    const payload = {
+      action: "send",
+      session: options.session,
+      message: options.message,
+      waitForResponse: options.waitForResponse !== false,
+      ...result,
+    };
     if (options.json && !options.includePaneText) {
       delete payload.baseline;
       delete payload.output;

@@ -209,7 +209,7 @@ workspace (/directory)                                                          
 
   assert.equal(
     extractResponse(baseline, final, "What soundtrack fits deep work best?"),
-    "✦ Ambient, low-variance music works best for long focus blocks.\n  Something steady is better than lyrical.",
+    "Ambient, low-variance music works best for long focus blocks.\n  Something steady is better than lyrical.",
   );
 });
 
@@ -244,7 +244,7 @@ workspace (/directory)                                                          
       final,
       "Please keep this answer short and practical while mentioning one concrete next step for the bridge.",
     ),
-    "✦ Use a dedicated dialogue session.\n  Then extraction and reset logic stop fighting operator context.",
+    "Use a dedicated dialogue session.\n  Then extraction and reset logic stop fighting operator context.",
   );
 });
 
@@ -258,7 +258,7 @@ test("extractResponseMeta reports extraction method", () => {
 
   assert.deepEqual(
     extractResponseMeta("", final, "Wrapped prompt starts here and continues on the next line."),
-    { method: "input_block", text: "✦ Reply body" },
+    { method: "input_block", text: "Reply body" },
   );
 });
 
@@ -274,7 +274,7 @@ test("extractResponseMeta tolerates noisy leading prompt text", () => {
     extractResponseMeta("", final, "Focus on the logging signals that matter most for the bridge."),
     {
       method: "input_block",
-      text: "✦ Keep the timestamp, the extraction method, and the exact pane target.",
+      text: "Keep the timestamp, the extraction method, and the exact pane target.",
     },
   );
 });
@@ -299,7 +299,7 @@ test("refineResponseMetaWithWiderCapture prefers the wider non-fallback capture"
     refineResponseMetaWithWiderCapture(baseline, narrow, wide, "Please keep the logging hints short and practical."),
     {
       method: "input_block",
-      text: "✦ Keep the timestamp, the method tag, and the pane target.",
+      text: "Keep the timestamp, the method tag, and the pane target.",
     },
   );
 });

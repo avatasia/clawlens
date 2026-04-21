@@ -39,6 +39,10 @@
 - [Chat Audit Long-Term Enhancements](ANALYSIS_CHAT_AUDIT_ENHANCEMENTS.md)
 - [LLM API Logger Message Mapping](ANALYSIS_LLM_API_LOGGER_MESSAGE_MAPPING.md)
 
+### 6. 实施方案
+当前仍在实施或待验收的方案文档。
+- [Challenge Mode Implementation](IMPL_CHALLENGE_MODE.md)
+
 ## 子目录职责
 
 | 目录 | 职责 |

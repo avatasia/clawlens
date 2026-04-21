@@ -62,6 +62,7 @@ Options:
   --model <value>              model name for set-model/set-combo (e.g. gpt-5.4)
   --effort <value>             effort level for set-effort/set-combo
   --message <text>             message text for send/type commands
+  --no-wait                    send without waiting for a response
   --json                       emit machine-readable JSON
   --include-pane-text          include raw pane snapshots in JSON output
   --help                       show this help
@@ -96,6 +97,7 @@ function parseArgs(argv) {
     if (arg === "--model") { options.model = argv[++i] ?? ""; continue; }
     if (arg === "--effort") { options.effort = argv[++i] ?? ""; continue; }
     if (arg === "--message") { options.message = argv[++i] ?? ""; continue; }
+    if (arg === "--no-wait") { options.waitForResponse = false; continue; }
     if (arg === "--json") { options.json = true; continue; }
     if (arg === "--include-pane-text") { options.includePaneText = true; continue; }
     if (arg === "--help" || arg === "-h") { usage(); process.exit(0); }
@@ -131,7 +133,14 @@ function parseArgs(argv) {
 }
 
 function run(command, args) {
-  const result = spawnSync(command, args, { encoding: "utf8" });
+  const result = spawnSync(command, args, {
+    encoding: "utf8",
+    timeout: command === "tmux" ? 10_000 : undefined,
+    killSignal: "SIGKILL",
+  });
+  if (result.error?.code === "ETIMEDOUT") {
+    throw new Error(`${command} ${args.join(" ")} timed out`);
+  }
   if (result.status !== 0) {
     const stderr = (result.stderr || result.stdout || "").trim();
     throw new Error(`${command} ${args.join(" ")} failed: ${stderr}`);
@@ -443,12 +452,20 @@ export function hasNewNonInputContent(baseline, current) {
 
 async function sendMessage(session, options, message) {
   const target = currentPaneTarget(session);
-  const baselineText = await waitForReady(target, options);
+  const readyOptions = options.waitForResponse === false
+    ? { ...options, timeoutMs: Math.min(options.timeoutMs, 2_000) }
+    : options;
+  const baselineText = await waitForReady(target, readyOptions);
 
-  run("tmux", ["send-keys", "-t", target, message]);
+  run("tmux", ["send-keys", "-l", "-t", target, message]);
   await sleep(300);
   run("tmux", ["send-keys", "-t", target, "Enter"]);
-  await sleep(Math.max(options.settleMs, 400));
+  await sleep(options.waitForResponse === false ? Math.min(options.settleMs, 200) : Math.max(options.settleMs, 400));
+
+  if (options.waitForResponse === false) {
+    const finalText = capturePane(target, options.bufferLines);
+    return { target, baseline: baselineText, output: finalText, becameBusy: false, waitForResponse: false };
+  }
 
   // Joint readiness condition: prompt ready AND not busy AND (we saw busy at some point
   // OR pane has grown with non-input-block content). This avoids returning prematurely
@@ -472,7 +489,7 @@ async function typeMessage(session, options, message) {
   const target = currentPaneTarget(session);
   const baselineText = await waitForReady(target, options);
 
-  run("tmux", ["send-keys", "-t", target, message]);
+  run("tmux", ["send-keys", "-l", "-t", target, message]);
   // Wait longer for long messages to finish typing (estimate ~30ms per 50 chars + base)
   const typeDelayMs = Math.max(300, Math.min(2000, Math.ceil(message.length / 50) * 30 + 100));
   await sleep(typeDelayMs);
@@ -485,14 +502,26 @@ async function submitMessage(session, options) {
   const target = currentPaneTarget(session);
   const baselineText = await waitForReady(target, options);
 
+  // Codex's bordered input can partially render a long paste; sending End moves
+  // the cursor to end-of-input and forces a full re-render before Enter lands.
+  run("tmux", ["send-keys", "-t", target, "End"]);
+  await sleep(150);
   run("tmux", ["send-keys", "-t", target, "Enter"]);
   await sleep(Math.max(options.settleMs, 400));
 
   const busyDeadline = Date.now() + 15_000;
   let becameBusy = false;
+  let nextRetryAt = Date.now() + 3_000;
+  let retried = 0;
+  const maxRetries = 2;
   while (Date.now() <= busyDeadline) {
     const text = capturePane(target, options.bufferLines);
     if (isBusy(text)) { becameBusy = true; break; }
+    if (retried < maxRetries && Date.now() >= nextRetryAt) {
+      run("tmux", ["send-keys", "-t", target, "Enter"]);
+      retried += 1;
+      nextRetryAt = Date.now() + 3_000;
+    }
     await sleep(options.pollMs);
   }
 
@@ -520,7 +549,7 @@ async function clearConversation(session, options) {
   }
   const baselineText = await waitForReady(target, options);
 
-  run("tmux", ["send-keys", "-t", target, "/clear"]);
+  run("tmux", ["send-keys", "-l", "-t", target, "/clear"]);
   await sleep(200);
   run("tmux", ["send-keys", "-t", target, "Enter"]);
   await sleep(options.settleMs);
@@ -750,7 +779,14 @@ async function main() {
       async () => sendMessage(options.session, options, options.message),
       options.timeoutMs + 10_000,
     );
-    const payload = { action: "send", session: options.session, message: options.message, ...paneDiagnostics(result.output ?? ""), ...result };
+    const payload = {
+      action: "send",
+      session: options.session,
+      message: options.message,
+      waitForResponse: options.waitForResponse !== false,
+      ...paneDiagnostics(result.output ?? ""),
+      ...result,
+    };
     if (options.json && !options.includePaneText) {
       delete payload.baseline;
       delete payload.output;
@@ -794,7 +830,7 @@ async function main() {
       const target = currentPaneTarget(options.session);
       run("tmux", ["send-keys", "-t", target, "C-u"]);
       await sleep(200);
-      run("tmux", ["send-keys", "-t", target, "/fast"]);
+      run("tmux", ["send-keys", "-l", "-t", target, "/fast"]);
       await sleep(300);
       run("tmux", ["send-keys", "-t", target, "Enter"]);
     }, options.timeoutMs + 10_000);
