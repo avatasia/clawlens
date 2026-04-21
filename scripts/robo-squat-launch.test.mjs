@@ -10,7 +10,9 @@ import {
   classifyRecipientResponse,
   exactBootstrapLines,
   makeRoster,
+  narrowResponseRegion,
   parseTurn,
+  tighterReparse,
 } from "./robo-squat-launch.mjs";
 
 function sampleRoster() {
@@ -153,4 +155,86 @@ test("challenge audience excludes only the reporter", () => {
     "2026-04-20T00:00:00.000Z",
   );
   assert.match(challenge, /audience=codex,gemini1/);
+});
+
+test("parseTurn scans from tail and skips excluded (echoed broadcast) lines", () => {
+  const roster = sampleRoster();
+  // Pane contains the prior broadcast sentence echoed above the real reply.
+  const pane = [
+    "[robo-squat round=1 speaker=cc1 target=codex audience=codex,gemini1 deadline=...]",
+    "cc1蹲cc1蹲，cc1蹲完codex蹲",
+    "",
+    "codex蹲codex蹲，codex蹲完gemini1蹲",
+  ].join("\n");
+  const result = parseTurn(pane, roster, {
+    excludeText: "cc1蹲cc1蹲，cc1蹲完codex蹲",
+  });
+  assert.equal(result.kind, "turn");
+  assert.equal(result.speaker, "codex");
+  assert.equal(result.target, "gemini1");
+});
+
+test("parseTurn returns other when only the excluded echo is present", () => {
+  const roster = sampleRoster();
+  const pane = "cc1蹲cc1蹲，cc1蹲完codex蹲";
+  const result = parseTurn(pane, roster, {
+    excludeText: "cc1蹲cc1蹲，cc1蹲完codex蹲",
+  });
+  assert.equal(result.kind, "other");
+});
+
+test("classifyRecipientResponse returns stale_echo when prior speaker's line reappears", () => {
+  const roster = sampleRoster();
+  const response = classifyRecipientResponse(
+    roster[1],
+    "cc1蹲cc1蹲，cc1蹲完codex蹲",
+    roster,
+    { previousSpeaker: "cc1", excludeText: null },
+  );
+  assert.equal(response.kind, "stale_echo");
+  assert.match(response.reason, /cc1's prior sentence/);
+});
+
+test("classifyRecipientResponse still flags out_of_turn when previousSpeaker differs", () => {
+  const roster = sampleRoster();
+  const response = classifyRecipientResponse(
+    roster[1],
+    "gemini1蹲gemini1蹲，gemini1蹲完cc1蹲",
+    roster,
+    { previousSpeaker: "cc1" },
+  );
+  assert.equal(response.kind, "out_of_turn");
+  assert.match(response.reason, /expected speaker codex but saw gemini1/);
+});
+
+test("narrowResponseRegion trims to the tail when over the line cap", () => {
+  const lines = Array.from({ length: 50 }, (_, i) => `line-${i}`);
+  const narrowed = narrowResponseRegion(lines.join("\n"), 10);
+  const narrowedLines = narrowed.split("\n");
+  assert.equal(narrowedLines.length, 10);
+  assert.equal(narrowedLines[0], "line-40");
+  assert.equal(narrowedLines[9], "line-49");
+});
+
+test("narrowResponseRegion returns full text when within the line cap", () => {
+  const text = ["a", "b", "c"].join("\n");
+  assert.equal(narrowResponseRegion(text, 10), text);
+});
+
+test("tighterReparse narrows region and excludes current turn", () => {
+  const roster = sampleRoster();
+  const pane = [
+    ...Array.from({ length: 40 }, (_, i) => `noise-${i}`),
+    "cc1蹲cc1蹲，cc1蹲完codex蹲",
+    "codex蹲codex蹲，codex蹲完gemini1蹲",
+  ].join("\n");
+  const currentTurn = {
+    speaker: "cc1",
+    target: "codex",
+    text: "cc1蹲cc1蹲，cc1蹲完codex蹲",
+  };
+  const result = tighterReparse(pane, roster, currentTurn);
+  assert.equal(result.kind, "turn");
+  assert.equal(result.speaker, "codex");
+  assert.equal(result.target, "gemini1");
 });

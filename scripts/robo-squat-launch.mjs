@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 
 import { randomInt } from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { extractResponse as extractClaudeResponse } from "./claude-codex-dialogue.mjs";
-import { extractCodexResponse } from "./gemini-codex-dialogue.mjs";
+import { extractCodexResponse, extractCodexResponseMeta } from "./gemini-codex-dialogue.mjs";
 import { extractResponse as extractGeminiResponse } from "./gemini-tmux-control.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -294,7 +295,7 @@ export function buildChallengeBroadcast(round, reporter, offender, recipients, r
   ].join("\n");
 }
 
-export function parseTurn(text, roster) {
+export function parseTurn(text, roster, options = {}) {
   const lines = normalizeLines(text).map(line => line.replace(/^[•›❯●•*-]+\s*/, "").trim());
   for (const line of lines) {
     if (line.startsWith("结束:")) {
@@ -305,11 +306,20 @@ export function parseTurn(text, roster) {
     }
   }
 
-  for (const speaker of roster) {
-    for (const target of roster) {
-      if (speaker.name === target.name) continue;
-      const expected = `${speaker.name}蹲${speaker.name}蹲，${speaker.name}蹲完${target.name}蹲`;
-      for (const line of lines) {
+  const excludeSet = new Set();
+  if (options.excludeText) {
+    for (const line of normalizeLines(options.excludeText)) {
+      excludeSet.add(line);
+    }
+  }
+
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i];
+    if (excludeSet.has(line)) continue;
+    for (const speaker of roster) {
+      for (const target of roster) {
+        if (speaker.name === target.name) continue;
+        const expected = `${speaker.name}蹲${speaker.name}蹲，${speaker.name}蹲完${target.name}蹲`;
         if (line === expected) {
           return {
             kind: "turn",
@@ -338,19 +348,62 @@ function extractRoleResponse(role, result, sentMessage) {
   return extractGeminiResponse(result.baseline ?? "", result.output ?? "", sentMessage);
 }
 
-export function classifyRecipientResponse(entry, text, roster) {
-  const parsed = parseTurn(text, roster);
+function extractRoleResponseMeta(role, result, sentMessage) {
+  if (role === "codex") {
+    const meta = extractCodexResponseMeta(result.baseline ?? "", result.output ?? "", sentMessage);
+    return { responseText: meta.text, method: meta.method };
+  }
+  return { responseText: extractRoleResponse(role, result, sentMessage), method: null };
+}
+
+async function dumpRoundDiagnostics(round, currentTurn, deliveries, reason) {
+  const payload = {
+    timestamp: new Date().toISOString(),
+    round,
+    reason,
+    currentTurn,
+    deliveries: deliveries.map((delivery) => ({
+      recipient: delivery.recipient.name,
+      role: delivery.recipient.role,
+      method: delivery.method ?? null,
+      classification: delivery.classification.kind,
+      classificationReason: delivery.classification.reason ?? null,
+      responseText: delivery.responseText,
+      baseline: delivery.result?.baseline ?? null,
+      output: delivery.result?.output ?? null,
+    })),
+  };
+  const file = `/tmp/robo-squat-round-${round}.json`;
+  try {
+    await fs.promises.writeFile(file, JSON.stringify(payload, null, 2));
+    process.stdout.write(`  [diagnostics] saved ${file} (${reason})\n`);
+  } catch (error) {
+    process.stdout.write(`  [diagnostics] failed to save ${file}: ${error?.message || error}\n`);
+  }
+}
+
+export function classifyRecipientResponse(entry, text, roster, options = {}) {
+  const parsed = parseTurn(text, roster, { excludeText: options.excludeText });
   if (parsed.kind === "turn") {
-    if (parsed.speaker !== entry.name) {
+    if (parsed.speaker === entry.name) {
+      return { kind: "turn", entry, parsed, text };
+    }
+    if (options.previousSpeaker && parsed.speaker === options.previousSpeaker) {
       return {
-        kind: "out_of_turn",
+        kind: "stale_echo",
         entry,
         parsed,
         text,
-        reason: `expected speaker ${entry.name} but saw ${parsed.speaker}`,
+        reason: `observed ${parsed.speaker}'s prior sentence instead of a fresh turn from ${entry.name}`,
       };
     }
-    return { kind: "turn", entry, parsed, text };
+    return {
+      kind: "out_of_turn",
+      entry,
+      parsed,
+      text,
+      reason: `expected speaker ${entry.name} but saw ${parsed.speaker}`,
+    };
   }
   if (parsed.kind === "challenge") {
     return { kind: "challenge", entry, parsed, text, reason: parsed.text };
@@ -362,6 +415,17 @@ export function classifyRecipientResponse(entry, text, roster) {
     return { kind: "empty", entry, parsed, text };
   }
   return { kind: "other", entry, parsed, text, reason: parsed.text };
+}
+
+export function narrowResponseRegion(text, maxLines = 30) {
+  const lines = normalizeLines(text);
+  if (lines.length <= maxLines) return lines.join("\n");
+  return lines.slice(-maxLines).join("\n");
+}
+
+export function tighterReparse(text, roster, currentTurn) {
+  const narrowed = narrowResponseRegion(text);
+  return parseTurn(narrowed, roster, { excludeText: currentTurn.text });
 }
 
 async function clearSession(entry, opts) {
@@ -423,7 +487,7 @@ async function relayBroadcast(round, currentTurn, roster, opts) {
   const recipients = otherEntries(roster, currentTurn.speaker);
   const deadline = new Date(Date.now() + opts.timeoutMs).toISOString();
   const broadcast = buildTurnBroadcast(round, currentTurn, recipients, deadline);
-  const sendChallenge = async (reporter, offender, reason) => {
+  const sendChallenge = async (reporter, offender, reason, { synthetic = false } = {}) => {
     const challengeRecipients = roster.filter((entry) => entry.name !== reporter.name);
     const challengeText = buildChallengeBroadcast(
       round,
@@ -433,7 +497,8 @@ async function relayBroadcast(round, currentTurn, roster, opts) {
       reason,
       deadline,
     );
-    process.stdout.write(`  [challenge] ${reporter.name} -> ${offender.name}: ${reason}\n`);
+    const label = synthetic ? "synthetic-challenge" : "challenge";
+    process.stdout.write(`  [${label}] ${reporter.name} -> ${offender.name}: ${reason}\n`);
     for (const recipient of challengeRecipients) {
       process.stdout.write(`  [relay-challenge] ${recipient.name} … `);
       await sendSession(recipient, challengeText, opts);
@@ -447,10 +512,13 @@ async function relayBroadcast(round, currentTurn, roster, opts) {
   for (const recipient of recipients) {
     process.stdout.write(`  [route] ${recipient.name} … `);
     const result = await sendSession(recipient, broadcast, opts);
-    const responseText = extractRoleResponse(recipient.role, result, broadcast);
-    const classification = classifyRecipientResponse(recipient, responseText, roster);
-    deliveries.push({ recipient, result, responseText, classification });
-    process.stdout.write(`done\n`);
+    const { responseText, method } = extractRoleResponseMeta(recipient.role, result, broadcast);
+    const classification = classifyRecipientResponse(recipient, responseText, roster, {
+      excludeText: currentTurn.text,
+      previousSpeaker: currentTurn.speaker,
+    });
+    deliveries.push({ recipient, result, responseText, method, classification });
+    process.stdout.write(`done${method ? ` (method=${method})` : ""}\n`);
   }
 
   const targetDelivery = deliveries.find((delivery) => delivery.recipient.name === currentTurn.target);
@@ -474,9 +542,23 @@ async function relayBroadcast(round, currentTurn, roster, opts) {
     };
   }
 
+  if (targetDelivery.classification.kind === "stale_echo") {
+    const reparsed = tighterReparse(targetDelivery.responseText, roster, currentTurn);
+    if (reparsed.kind === "turn" && reparsed.speaker === currentTurn.target) {
+      process.stdout.write(`  [stale_echo] recovered via tighter re-parse\n`);
+      return { done: false, nextTurn: reparsed };
+    }
+    await dumpRoundDiagnostics(round, currentTurn, deliveries, "stale_echo_persisted");
+    return {
+      done: false,
+      ambiguous: true,
+      reason: `stale_echo persisted for target ${currentTurn.target} after tighter re-parse`,
+    };
+  }
+
   if (targetDelivery.classification.kind !== "turn") {
     const reason = targetDelivery.classification.reason || targetDelivery.classification.text || "target did not produce a valid turn";
-    await sendChallenge(watcherDelivery.recipient, targetDelivery.recipient, reason);
+    await sendChallenge(watcherDelivery.recipient, targetDelivery.recipient, reason, { synthetic: true });
     return {
       done: false,
       challenge: true,
@@ -507,7 +589,7 @@ async function relayBroadcast(round, currentTurn, roster, opts) {
     };
   }
 
-  // Watcher empty is expected behavior
+  // Watcher empty or stale_echo (from watcher) is treated as expected silence
   return {
     done: false,
     nextTurn: targetDelivery.classification.parsed,
@@ -554,6 +636,13 @@ async function main() {
       console.log(`[done] ${result.finalText}`);
       return;
     }
+    if (result.ambiguous) {
+      console.error(`[ambiguous] round ${round}: ${result.reason}`);
+      console.error(`  diagnostics: /tmp/robo-squat-round-${round}.json`);
+      console.error(`  no auto-challenge issued; halting for manual inspection`);
+      process.exitCode = 2;
+      return;
+    }
     if (result.challenge) {
       throw new Error(`Round ${round} challenge from ${result.offender}: ${result.reason}`);
     }
@@ -564,7 +653,10 @@ async function main() {
   console.log(`[done] reached round limit ${opts.turns}`);
 }
 
-main().catch((error) => {
-  console.error(error.message);
-  process.exit(1);
-});
+const __filename = fileURLToPath(import.meta.url);
+if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
+  main().catch((error) => {
+    console.error(error.message);
+    process.exit(1);
+  });
+}

@@ -12,13 +12,16 @@ import {
   assertDistinctBridgeSessions,
   extractCodexResponse,
   extractCodexResponseMeta,
+  findCodexInputBlock,
   formatProgressStatus,
+  lineStartsWithPrompt,
   markDecisionModeApplied,
   markDecisionModePaused,
   isRetryableSendError,
   prepareForwardingText,
   parseDecisionEscalationReply,
   resolveDecisionEscalationTarget,
+  stripInputDecoration,
   summarizeDialogueHealth,
   shouldEscalateDecisionModel,
 } from "./gemini-codex-dialogue.mjs";
@@ -342,4 +345,35 @@ test("markDecisionModeApplied stores the escalation outcome in checkpoint state"
   assert.equal(updated.decisionMode.preflightAttempts, 1);
   assert.equal(updated.decisionMode.waitedForIdle, false);
   assert.equal(updated.decisionMode.verified, true);
+});
+
+test("stripInputDecoration removes box-border and selection-bar prefixes", () => {
+  assert.equal(stripInputDecoration("│ › hello"), "› hello");
+  assert.equal(stripInputDecoration("▌› hello"), "› hello");
+  assert.equal(stripInputDecoration("  › hello"), "› hello");
+  assert.equal(stripInputDecoration("› hello"), "› hello");
+});
+
+test("lineStartsWithPrompt detects prompt lines under decoration", () => {
+  assert.equal(lineStartsWithPrompt("│ › hello"), true);
+  assert.equal(lineStartsWithPrompt("▌ › hello"), true);
+  assert.equal(lineStartsWithPrompt("› hello"), true);
+  assert.equal(lineStartsWithPrompt("• bullet"), false);
+  assert.equal(lineStartsWithPrompt("plain text"), false);
+});
+
+test("findCodexInputBlock locates decorated input blocks", () => {
+  const sent = "Please keep this short and mention one concrete next step.";
+  const lines = [
+    "╭────────────────────╮",
+    "│ › Please keep this short and mention",
+    "│   one concrete next step.",
+    "╰────────────────────╯",
+    "",
+    "• Some reply here.",
+  ];
+  const block = findCodexInputBlock(lines, sent);
+  assert.ok(block, "expected to find a decorated input block");
+  assert.equal(block.start, 1);
+  assert.ok(block.end > block.start);
 });

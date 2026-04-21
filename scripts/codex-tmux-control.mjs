@@ -422,6 +422,25 @@ async function waitForTextGone(target, bufferLines, timeoutMs, pollMs, keyword) 
   throw new Error(`Timed out waiting for picker to dismiss: "${keyword}"`);
 }
 
+export function countSubstantiveLines(text) {
+  const clean = stripAnsi(text);
+  let count = 0;
+  for (const rawLine of clean.split(/\r?\n/)) {
+    const trimmed = rawLine.trim();
+    if (trimmed === "") continue;
+    if (/^[│┃▌▍▎▏▐▕]*\s*›/.test(trimmed)) continue;
+    if (/^\s*\S+\s+(?:low|medium|high|xhigh|max)\s+·/.test(trimmed)) continue;
+    if (/^[╭╮╰╯│─]+$/.test(trimmed)) continue;
+    if (/^[▀▄]+$/.test(trimmed)) continue;
+    count += 1;
+  }
+  return count;
+}
+
+export function hasNewNonInputContent(baseline, current) {
+  return countSubstantiveLines(current) > countSubstantiveLines(baseline);
+}
+
 async function sendMessage(session, options, message) {
   const target = currentPaneTarget(session);
   const baselineText = await waitForReady(target, options);
@@ -431,30 +450,22 @@ async function sendMessage(session, options, message) {
   run("tmux", ["send-keys", "-t", target, "Enter"]);
   await sleep(Math.max(options.settleMs, 400));
 
-  // Wait for Codex to become busy (up to 15s), then wait until not busy
-  const busyDeadline = Date.now() + 15_000;
-  let becameBusy = false;
-  while (Date.now() <= busyDeadline) {
+  // Joint readiness condition: prompt ready AND not busy AND (we saw busy at some point
+  // OR pane has grown with non-input-block content). This avoids returning prematurely
+  // when Codex is still warming up to respond, without relying on a fixed 15s window.
+  const deadline = Date.now() + options.timeoutMs;
+  let sawBusy = false;
+  while (Date.now() <= deadline) {
     const text = capturePane(target, options.bufferLines);
-    if (isBusy(text)) { becameBusy = true; break; }
+    const busy = isBusy(text);
+    if (busy) {
+      sawBusy = true;
+    } else if (isPromptReady(text) && (sawBusy || hasNewNonInputContent(baselineText, text))) {
+      return { target, baseline: baselineText, output: text, becameBusy: sawBusy };
+    }
     await sleep(options.pollMs);
   }
-
-  if (becameBusy) {
-    const deadline = Date.now() + options.timeoutMs;
-    while (Date.now() <= deadline) {
-      const text = capturePane(target, options.bufferLines);
-      if (!isBusy(text) && isPromptReady(text)) {
-        return { target, baseline: baselineText, output: text, becameBusy: true };
-      }
-      await sleep(options.pollMs);
-    }
-    throw new Error("Timed out waiting for Codex to finish responding");
-  }
-
-  // Never became busy — quick response or already answered
-  const finalText = capturePane(target, options.bufferLines);
-  return { target, baseline: baselineText, output: finalText, becameBusy: false };
+  throw new Error("Timed out waiting for Codex to finish responding");
 }
 
 async function typeMessage(session, options, message) {

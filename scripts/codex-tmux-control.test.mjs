@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { isBusy, isPromptReady, paneDiagnostics, parseFooterState, parseRestartState, parseStopState, findPickerItemNumber } from "./codex-tmux-control.mjs";
+import { countSubstantiveLines, hasNewNonInputContent, isBusy, isPromptReady, paneDiagnostics, parseFooterState, parseRestartState, parseStopState, findPickerItemNumber } from "./codex-tmux-control.mjs";
 
 test("parseFooterState reads Codex model and effort footer", () => {
   const text = `
@@ -138,4 +138,47 @@ gpt-5.4 mini · ~/github/clawlens · gpt-5.4 · clawlens · main · Context 30% 
 `;
 
   assert.equal(isBusy(text), true);
+});
+
+test("countSubstantiveLines ignores input prompt, footer, and box borders", () => {
+  const text = [
+    "╭────────────────╮",
+    "│ › some input",
+    "╰────────────────╯",
+    "gpt-5.4 high · ~/x · gpt-5.4 · clawlens · main · Context 0% used",
+    "• Real reply line one",
+    "• Real reply line two",
+    "",
+  ].join("\n");
+  assert.equal(countSubstantiveLines(text), 2);
+});
+
+test("hasNewNonInputContent detects real pane growth", () => {
+  const baseline = [
+    "› earlier prompt",
+    "gpt-5.4 high · ~/x · gpt-5.4 · clawlens · main · Context 0% used",
+    "• Earlier reply",
+  ].join("\n");
+  const current = [
+    "› earlier prompt",
+    "gpt-5.4 high · ~/x · gpt-5.4 · clawlens · main · Context 0% used",
+    "• Earlier reply",
+    "• New reply",
+  ].join("\n");
+  assert.equal(hasNewNonInputContent(baseline, current), true);
+});
+
+test("hasNewNonInputContent ignores pure input-block and footer growth", () => {
+  const baseline = [
+    "• existing reply",
+    "gpt-5.4 high · ~/x · gpt-5.4 · clawlens · main · Context 0% used",
+  ].join("\n");
+  const current = [
+    "• existing reply",
+    "╭────────────────╮",
+    "│ › typed input",
+    "╰────────────────╯",
+    "gpt-5.4 high · ~/x · gpt-5.4 · clawlens · main · Context 0% used",
+  ].join("\n");
+  assert.equal(hasNewNonInputContent(baseline, current), false);
 });

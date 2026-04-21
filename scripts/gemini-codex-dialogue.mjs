@@ -223,24 +223,39 @@ function normalizeInlineWhitespace(text) {
   return text.replace(/\s+/g, " ").trim();
 }
 
+// Strip left-column decoration (box borders, left-bar markers) so prompt
+// detection still works when Codex renders the input inside a bordered box
+// like "│ › ..." or with a selection-bar prefix like "▌› ...".
+const INPUT_DECORATION_RE = /^[\s│┃┆┇┊┋▌▍▎▏▐▕│]+/;
+
+function stripInputDecoration(line) {
+  return String(line || "").replace(INPUT_DECORATION_RE, "");
+}
+
+function lineStartsWithPrompt(line) {
+  const stripped = stripInputDecoration(line).trimStart();
+  return stripped.startsWith("›");
+}
+
 function findCodexInputBlock(lines, sentMessage) {
   const normalizedMessage = normalizeInlineWhitespace(sentMessage);
   const anchor = normalizedMessage.slice(0, 80);
 
   for (let i = lines.length - 1; i >= 0; i -= 1) {
-    if (!lines[i].trimStart().startsWith("›")) continue;
+    if (!lineStartsWithPrompt(lines[i])) continue;
 
-    const block = [lines[i].replace(/^\s*›\s?/, "")];
+    const firstLine = stripInputDecoration(lines[i]).replace(/^\s*›\s?/, "");
+    const block = [firstLine];
     let j = i + 1;
     while (j < lines.length) {
       const raw = lines[j];
       const trimmed = raw.trim();
       if (trimmed === "") break;
       if (raw.trimStart().startsWith("•")) break;
-      if (raw.trimStart().startsWith("›")) break;
+      if (lineStartsWithPrompt(raw)) break;
       if (isCodexDivider(raw)) break;
       if (/gpt-[^·]+\s+(?:low|medium|high|xhigh|max)\s+·/.test(trimmed)) break;
-      block.push(trimmed);
+      block.push(stripInputDecoration(raw).trim());
       j += 1;
     }
 
@@ -252,6 +267,8 @@ function findCodexInputBlock(lines, sentMessage) {
 
   return null;
 }
+
+export { findCodexInputBlock, stripInputDecoration, lineStartsWithPrompt };
 
 export function extractCodexResponseMeta(baselineRaw, finalRaw, sentMessage) {
   const baselineLines = stripAnsi(baselineRaw).split("\n");
