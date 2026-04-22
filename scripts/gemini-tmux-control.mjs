@@ -20,6 +20,9 @@ const HUMAN_METHOD_LABELS = {
   input_block: "BLOCK",
   baseline_fingerprint: "FINGERPRINT",
   tail_fallback: "FRAYED",
+  'tail_fallback+stop_hook': 'FRAYED+STOP',
+  'input_block+stop_hook':   'BLOCK+STOP',
+  'baseline_fingerprint+stop_hook': 'FINGERPRINT+STOP',
 };
 
 function usage() {
@@ -416,14 +419,26 @@ export function extractResponseMeta(baselineRaw, finalRaw, sentMessage) {
     method = "tail_fallback";
   }
 
+  const stopState = parseStopState(finalRaw);
+  const stopEndIdx = stopState.stopSeen ? stopState.stopLineIndex : -1;
+
   const newLines = finalLines.slice(splitIdx);
-  let end = newLines.length;
-  for (let i = newLines.length - 1; i >= 0; i -= 1) {
-    const raw = newLines[i];
-    const trimmed = raw.trim();
-    if (trimmed === "") continue;
-    if (isGeminiNoiseLine(raw)) { end = i; continue; }
-    break;
+  let end;
+  if (stopEndIdx >= 0 && stopEndIdx > splitIdx) {
+    end = stopEndIdx - splitIdx;
+    method = method + "+stop_hook";
+  } else {
+    end = newLines.length;
+    for (let i = newLines.length - 1; i >= 0; i -= 1) {
+      const raw = newLines[i];
+      const trimmed = raw.trim();
+      if (trimmed === "") continue;
+      if (isGeminiNoiseLine(raw)) {
+        end = i;
+        continue;
+      }
+      break;
+    }
   }
 
   const responseLines = newLines.slice(0, end);
@@ -448,12 +463,12 @@ export function extractResponseMeta(baselineRaw, finalRaw, sentMessage) {
 
 export function refineResponseMetaWithWiderCapture(baselineRaw, narrowRaw, wideRaw, sentMessage) {
   const narrowMeta = extractResponseMeta(baselineRaw, narrowRaw, sentMessage);
-  if (narrowMeta.method !== "tail_fallback") {
+  if (!narrowMeta.method.startsWith("tail_fallback")) {
     return narrowMeta;
   }
 
   const wideMeta = extractResponseMeta(baselineRaw, wideRaw, sentMessage);
-  if (wideMeta.method === "tail_fallback") {
+  if (wideMeta.method.startsWith("tail_fallback")) {
     return narrowMeta;
   }
 

@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 
 import { extractResponse as extractClaudeResponse } from "./claude-codex-dialogue.mjs";
 import { extractCodexResponse, extractCodexResponseMeta } from "./gemini-codex-dialogue.mjs";
-import { extractResponse as extractGeminiResponse } from "./gemini-tmux-control.mjs";
+import { extractResponse as extractGeminiResponse, extractResponseMeta as extractGeminiResponseMeta } from "./gemini-tmux-control.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -102,10 +102,8 @@ const ROLE_ADAPTERS = Object.freeze({
       return extractGeminiResponse(result.baseline ?? "", result.output ?? "", sentMessage);
     },
     extractResponseMeta(result, sentMessage) {
-      return {
-        responseText: extractGeminiResponse(result.baseline ?? "", result.output ?? "", sentMessage),
-        method: null,
-      };
+      const meta = extractGeminiResponseMeta(result.baseline ?? "", result.output ?? "", sentMessage);
+      return { responseText: meta.text, method: meta.method };
     },
   },
 });

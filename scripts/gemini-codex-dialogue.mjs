@@ -706,13 +706,13 @@ export function markDecisionModePaused(state, info) {
 
 export function computeTurnHealth(responseMeta, forwarded) {
   if (forwarded.length < responseMeta.text.length) return "THREAD_FRAYED";
-  if (responseMeta.method === "tail_fallback") return "THREAD_FRAYED";
-  if (responseMeta.method === "baseline_fingerprint") return "THREAD_STRETCHED";
+  if (responseMeta.method === "tail_fallback" || (responseMeta.method ?? "").startsWith("tail_fallback+")) return "THREAD_FRAYED";
+  if (responseMeta.method === "baseline_fingerprint" || (responseMeta.method ?? "").startsWith("baseline_fingerprint+")) return "THREAD_STRETCHED";
   return "THREAD_STABLE";
 }
 
 export function assertForwardingSafe(responseMeta) {
-  if (responseMeta.method === "tail_fallback") {
+  if ((responseMeta.method ?? "").startsWith("tail_fallback")) {
     throw new Error(`THREAD_FRAYED: extraction fell back to tail capture; aborting instead of forwarding uncertain context`);
   }
 }
