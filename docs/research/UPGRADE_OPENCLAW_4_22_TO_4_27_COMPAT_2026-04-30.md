@@ -111,11 +111,11 @@
 ## 7. 升级动作清单（按"必须 → 建议"排序）
 
 1. ✅（远端已完成）`~/.openclaw/openclaw.json` 中 `plugins.entries.clawlens.hooks.allowConversationAccess: true`
-2. ⬜ 改 `extensions/clawlens/package.json`：`openclaw.install.minHostVersion` 由 `>=2026.4.8` → `>=2026.4.24`
-3. ⬜ 改 `extensions/clawlens/openclaw.plugin.json`：顶层加 `"activation": { "onStartup": true }`
-4. ⬜（可选）clawlens 的 collector 加 `model_call_started/_ended` 监听，写到调用维度表
-5. ⬜（可选）comparator 用 `before_agent_finalize` 替代 `before_agent_start`
-6. ⬜（可选）`registerApiRoutes / registerStaticRoutes` 的入参类型从局部 `PluginApi` 升级到 `OpenClawPluginApi`，去 `as any`
+2. ✅ 改 `extensions/clawlens/package.json`：`openclaw.install.minHostVersion` 由 `>=2026.4.8` → `>=2026.4.24`
+3. ✅ 改 `extensions/clawlens/openclaw.plugin.json`：顶层加 `"activation": { "onStartup": true }`
+4. ✅（已完成）clawlens 的 collector 加 `model_call_started/_ended` 监听，写到调用维度表
+5. ✅（已完成）comparator 用 `before_agent_finalize` 替代 `before_agent_start`
+6. ✅（已完成）`registerApiRoutes / registerStaticRoutes` 的入参类型从局部 `PluginApi` 升级到 `OpenClawPluginApi`，去 `as any`
 
 只做 2 + 3 已经能让 clawlens 在 4.27 路上无杂音；1 已落地。
 
