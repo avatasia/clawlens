@@ -8,7 +8,7 @@
       "./index.ts"
     ],
     "install": {
-      "minHostVersion": ">=2026.4.8",
+      "minHostVersion": ">=2026.4.24",
       "npmSpec": "clawlens@0.1.0"
     }
   },
