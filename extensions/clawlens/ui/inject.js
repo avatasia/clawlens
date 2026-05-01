@@ -589,6 +589,7 @@ function renderAuditPanel(data) {
           ${run.runKind === "heartbeat" ? '<span class="clawlens-tag exclusive">HEARTBEAT</span>' : ""}
           <span>${run.summary?.llmCalls ?? 0} LLM</span>
           <span>${run.summary?.toolCalls ?? 0} tool</span>
+          ${(run.summary?.modelCalls ?? 0) > 0 ? `<span>${run.summary.modelCalls} model</span>` : ""}
           <span>${fmtTokens((run.summary?.totalInputTokens ?? 0) + (run.summary?.totalOutputTokens ?? 0))} tok</span>
           <span class="cost">${fmtCost(run.summary?.officialCost ?? run.summary?.calculatedCost ?? run.summary?.totalCost)}</span>
         </div>

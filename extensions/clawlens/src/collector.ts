@@ -93,6 +93,7 @@ export class Collector {
   private costMap = new Map<string, { input: number; output: number; cacheRead: number; cacheWrite: number }>();
   private debugEnabled = false;
   private liveLlmByRunId = new Map<string, LiveLlmStream>();
+  private pendingModelCallStarts = new Map<string, number>();
   // ROLLBACK_INDEX: CLAWLENS_TRANSCRIPT_BINDING_STRATEGY -> docs/CLAWLENS_TRANSCRIPT_BINDING_ROLLBACK_PLAYBOOK.md
   // DOC_INDEX: CLAWLENS_TRANSCRIPT_BINDING_PLAYBOOK -> docs/CLAWLENS_TRANSCRIPT_BINDING_ROLLBACK_PLAYBOOK.md
   // Keep legacy as default. Switch explicitly via collector.transcriptBindingStrategy.
@@ -779,6 +780,51 @@ export class Collector {
       this.pendingTranscriptTurns.delete(sessionKey);
     }
     return matched;
+  }
+
+  recordModelCallStarted(
+    event: { callId?: string; runId?: string },
+    _ctx: unknown,
+  ): void {
+    const callId = event.callId;
+    if (!callId) return;
+    this.pendingModelCallStarts.set(callId, Date.now());
+  }
+
+  recordModelCallEnded(
+    event: {
+      callId?: string;
+      runId?: string;
+      provider?: string;
+      model?: string;
+      api?: string;
+      transport?: string;
+      durationMs?: number;
+      outcome?: string;
+      upstreamRequestIdHash?: string;
+    },
+    _ctx: unknown,
+  ): void {
+    const callId = event.callId;
+    if (!callId) return;
+    const startedAt = this.pendingModelCallStarts.get(callId);
+    this.pendingModelCallStarts.delete(callId);
+    const durationMs = event.durationMs ?? (startedAt ? Date.now() - startedAt : undefined);
+    try {
+      this.store.insertModelCallEvent({
+        callId,
+        runId: event.runId,
+        provider: event.provider,
+        model: event.model,
+        api: event.api,
+        transport: event.transport,
+        durationMs,
+        outcome: event.outcome,
+        upstreamRequestIdHash: event.upstreamRequestIdHash,
+      });
+    } catch (err) {
+      console.error("[clawlens] recordModelCallEnded: store write failed:", err);
+    }
   }
 
   private persistTranscriptTurn(runId: string, turn: PendingTranscriptTurn): void {

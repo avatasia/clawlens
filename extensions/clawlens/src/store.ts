@@ -110,6 +110,7 @@ export class Store {
   private stmtFindConvTurnByMessageId: ReturnType<DatabaseSyncInstance["prepare"]>;
   private stmtNextTurnIndex: ReturnType<DatabaseSyncInstance["prepare"]>;
   private stmtUpdateRunLlmStreamMetrics: ReturnType<DatabaseSyncInstance["prepare"]>;
+  private stmtInsertModelCallEvent: ReturnType<DatabaseSyncInstance["prepare"]>;
 
   private static readonly SOURCE_PRIORITY = {
     transcript_explicit: 3,
@@ -257,6 +258,22 @@ export class Store {
         applied_count INTEGER NOT NULL,
         skipped_count INTEGER NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS model_call_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        call_id TEXT NOT NULL,
+        run_id TEXT,
+        provider TEXT,
+        model TEXT,
+        api TEXT,
+        transport TEXT,
+        duration_ms INTEGER,
+        outcome TEXT,
+        upstream_request_id_hash TEXT,
+        recorded_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_model_call_run ON model_call_events(run_id);
     `);
 
     // Idempotent migrations
@@ -371,6 +388,12 @@ export class Store {
           ELSE llm_stream_last_at
         END
       WHERE run_id = ?
+    `);
+
+    this.stmtInsertModelCallEvent = this.db.prepare(`
+      INSERT OR IGNORE INTO model_call_events
+        (call_id, run_id, provider, model, api, transport, duration_ms, outcome, upstream_request_id_hash, recorded_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
   }
 
@@ -523,6 +546,31 @@ export class Store {
       lastAt,
       lastAt,
       runId,
+    );
+  }
+
+  insertModelCallEvent(opts: {
+    callId: string;
+    runId?: string;
+    provider?: string;
+    model?: string;
+    api?: string;
+    transport?: string;
+    durationMs?: number;
+    outcome?: string;
+    upstreamRequestIdHash?: string;
+  }): void {
+    this.stmtInsertModelCallEvent.run(
+      opts.callId,
+      opts.runId ?? null,
+      opts.provider ?? null,
+      opts.model ?? null,
+      opts.api ?? null,
+      opts.transport ?? null,
+      opts.durationMs ?? null,
+      opts.outcome ?? null,
+      opts.upstreamRequestIdHash ?? null,
+      Date.now(),
     );
   }
 
@@ -981,6 +1029,10 @@ export class Store {
     const mergedTotalCost = mergedCalculatedCost ?? mergedOfficialCost ?? null;
     const mergedCostMatch = Store.computeCostMatch(mergedOfficialCost, mergedCalculatedCost);
 
+    const modelCallCount = (this.db.prepare(
+      "SELECT COUNT(*) as cnt FROM model_call_events WHERE run_id = ?",
+    ).get(run.run_id) as { cnt: number }).cnt;
+
     const detectedTurnKinds = turns.map((t: any) => classifyTurnKindFromPreview(t.content_preview));
     const allHeartbeatTurns = detectedTurnKinds.length > 0 && detectedTurnKinds.every((kind) => kind === "heartbeat");
     const runKind = run.run_kind === "heartbeat" || allHeartbeatTurns ? "heartbeat" : "chat";
@@ -999,6 +1051,7 @@ export class Store {
       summary: {
         llmCalls: Math.max(run.total_llm_calls ?? 0, llmCount),
         toolCalls: Math.max(run.total_tool_calls ?? 0, toolCount),
+        modelCalls: modelCallCount,
         totalInputTokens: Math.max(run.total_input_tokens ?? 0, liveInputTokens),
         totalOutputTokens: Math.max(run.total_output_tokens ?? 0, liveOutputTokens),
         totalCacheRead: Math.max(run.total_cache_read ?? 0, liveCacheRead),

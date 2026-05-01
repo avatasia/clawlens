@@ -135,6 +135,8 @@ export default definePluginEntry({
       api.on("llm_input", (event: any, ctx: any) => collector.recordLlmInput(event, ctx));
       api.on("after_tool_call", (event: any, ctx: any) => collector.recordToolCall(event, ctx));
       api.on("agent_end", (event: any, ctx: any) => collector.recordAgentEnd(event, ctx));
+      api.on("model_call_started", (event: any, ctx: any) => collector.recordModelCallStarted(event, ctx));
+      api.on("model_call_ended", (event: any, ctx: any) => collector.recordModelCallEnded(event, ctx));
     }
 
     if (config.compare?.enabled) {
