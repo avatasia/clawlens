@@ -138,7 +138,7 @@ export default definePluginEntry({
     }
 
     if (config.compare?.enabled) {
-      api.on("before_agent_start", (event: any, ctx: any) =>
+      api.on("before_agent_finalize", (event: any, ctx: any) =>
         comparator.maybeForCompare(event, ctx, config.compare!),
       );
     }
