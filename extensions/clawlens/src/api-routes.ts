@@ -1,19 +1,9 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import type { Store } from "./store.js";
 import type { SSEManager } from "./sse-manager.js";
 import type { ClawLensConfig } from "./types.js";
 import { importLoggerMappings, inspectLoggerImportDir } from "./logger-import.js";
-
-type PluginApi = {
-  registerHttpRoute(opts: {
-    method?: string;
-    path: string;
-    match?: "prefix" | "exact";
-    auth?: string;
-    handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>;
-  }): void;
-  config?: unknown;
-};
 
 function parseIntParam(value: string | null, defaultValue: number): number {
   if (value === null) return defaultValue;
@@ -27,7 +17,7 @@ function sendJson(res: ServerResponse, status: number, data: unknown): void {
   res.end(body);
 }
 
-function getToken(api: PluginApi): string | undefined {
+function getToken(api: OpenClawPluginApi): string | undefined {
   return (api.config as any)?.auth?.token as string | undefined;
 }
 
@@ -47,7 +37,7 @@ function parseUrl(req: IncomingMessage): URL {
   return new URL(req.url ?? "/", "http://localhost");
 }
 
-export function registerApiRoutes(api: PluginApi, store: Store, sseManager: SSEManager, pluginConfig?: ClawLensConfig): void {
+export function registerApiRoutes(api: OpenClawPluginApi, store: Store, sseManager: SSEManager, pluginConfig?: ClawLensConfig): void {
   api.registerHttpRoute({
     path: "/plugins/clawlens/api",
     match: "prefix",

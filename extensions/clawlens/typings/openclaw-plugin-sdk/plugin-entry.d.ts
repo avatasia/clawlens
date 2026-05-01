@@ -56,6 +56,8 @@ export interface PluginRuntime {
 
 /* ----- OpenClawPluginApi (subset used by ClawLens) ----- */
 
+import type { IncomingMessage, ServerResponse } from "node:http";
+
 export type OpenClawPluginApi = {
   id: string;
   name: string;
@@ -71,7 +73,7 @@ export type OpenClawPluginApi = {
     path: string;
     match?: "prefix" | "exact";
     auth?: string;
-    handler: (req: unknown, res: unknown) => void | Promise<void>;
+    handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>;
   }): void;
   [key: string]: unknown;
 };

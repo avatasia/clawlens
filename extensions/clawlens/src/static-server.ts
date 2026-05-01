@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 const ALLOWED_EXTENSIONS = new Set([".js", ".css", ".html", ".svg", ".png"]);
@@ -12,17 +13,7 @@ const MIME_TYPES: Record<string, string> = {
   ".png": "image/png",
 };
 
-type PluginApi = {
-  registerHttpRoute(opts: {
-    method?: string;
-    path: string;
-    match?: "prefix" | "exact";
-    auth?: string;
-    handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>;
-  }): void;
-};
-
-export function registerStaticRoutes(api: PluginApi, rootDir: string): void {
+export function registerStaticRoutes(api: OpenClawPluginApi, rootDir: string): void {
   api.registerHttpRoute({
     path: "/plugins/clawlens/ui",
     match: "prefix",

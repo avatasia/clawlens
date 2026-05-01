@@ -145,8 +145,8 @@ export default definePluginEntry({
       );
     }
 
-    registerApiRoutes(api as any, store, sseManager, config);
-    registerStaticRoutes(api as any, path.join(api.rootDir!, "ui"));
+    registerApiRoutes(api, store, sseManager, config);
+    registerStaticRoutes(api, path.join(api.rootDir!, "ui"));
 
     api.registerService({
       id: "clawlens-service",
