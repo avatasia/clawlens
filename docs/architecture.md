@@ -11,7 +11,7 @@
 ClawLens 的上游参考代码不再通过 Git submodule 绑定。
 
 - 本地参考位置：`projects-ref/openclaw/`
-- 当前参考版本：`OpenClaw 2026.4.10 (65b781f9ae)`
+- 当前参考版本：`OpenClaw v2026.4.27 (cbc2ba0931)`
 
 该目录仅作为本地研究、对照和审计输入源，不构成 ClawLens 运行时依赖，也不要求主仓库对其提交指针进行硬绑定。
 

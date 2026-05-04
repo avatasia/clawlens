@@ -474,6 +474,100 @@ bash scripts/run-clawlens-qa-docker-smoke.sh
 - 区分 blocking（Critical/High）和 non-blocking（Medium/Low）
 - 无证据支撑的结论标记为 `unverified`
 
+## 14. UI Preview/Source 交互远程验证（Playwright）
+
+本节记录 2026-05-02 首次通过自动化浏览器验证 preview/source 交互行为的完整经验，供后续发版复用。
+
+### 14a. 关键前置发现：QA Lab UI (43124) 不代理插件静态文件
+
+**问题**：`inject.js` 通过 `<script src="/plugins/clawlens/ui/inject.js?v=...">` 注入，但通过 QA Lab UI 端口（43124）访问时，该路径返回 SPA 的 HTML（SPA fallback），导致 `inject.js` 解析失败并报 `Unexpected token '<'`，所有 ClawLens 函数均不可用。
+
+**正确做法**：UI 行为验证必须使用 gateway 端口（`18789`）直接访问 Control UI，而不是通过 `43124`：
+
+```
+# 正确 URL（inject.js 正常加载）
+http://127.0.0.1:18789/chat?session=main#token=<TOKEN>
+
+# 错误 URL（inject.js 返回 HTML，失效）
+http://127.0.0.1:43124/control-ui/chat?session=main#token=<TOKEN>
+```
+
+**诊断命令**：
+
+```bash
+# 验证 inject.js 从 18789 正常返回 JS（首行应为注释）
+curl -s http://127.0.0.1:18789/plugins/clawlens/ui/inject.js | head -2
+
+# 验证 inject.js 函数已在浏览器 window scope 中可用
+# （使用 Playwright 或 DevTools console）
+# typeof mountChatAuditSidebar === 'function'  → 应为 true
+```
+
+### 14b. Playwright 自动化验证步骤
+
+依赖：Python Playwright（`pip install playwright && playwright install chromium`）
+
+验证脚本要点：
+
+```python
+# 使用 domcontentloaded（SSE 连接导致 networkidle 永不触发）
+page.goto('http://127.0.0.1:18789/chat?session=main#token=TOKEN',
+          wait_until='domcontentloaded', timeout=15000)
+page.wait_for_timeout(5000)  # 等待 inject.js 执行
+
+# 验证 inject.js 已加载
+assert page.evaluate("() => typeof mountChatAuditSidebar === 'function'")
+
+# 点击 Audit toggle（由 injectAuditToggleBtn 注入到 .topbar）
+page.locator('#clawlens-audit-toggle-btn').click()
+```
+
+运行已验证项目列表（2026-05-02，PASS:13 FAIL:0 SKIP:6）：
+
+| 检查项 | 结果 | 说明 |
+|---|---|---|
+| inject.js 在 18789 正常加载 | PASS | window scope 有 `mountChatAuditSidebar` |
+| Audit toggle 自动注入到 .topbar | PASS | `injectAuditToggleBtn()` 匹配 `.topbar` 类 |
+| Audit sidebar 挂载 | PASS | `#clawlens-audit-sidebar` 出现 |
+| Hover 打开 preview surface | PASS | 120ms 延迟后 surface 出现 |
+| Mouseout 后 surface 不自动关闭 | PASS | hover-close 已去除 ✓ |
+| Click 进入 detail mode | PASS | 出现 Close 按钮 |
+| Detail mode 宽度 560px | PASS | `positionPreviewSurface` pinned 分支 ✓ |
+| Pinned surface 在 mouseout 后保持 | PASS | `previewPinnedKey` 机制正常 ✓ |
+| Turn Copy 不触发 source 请求 | PASS | 0 source request ✓ |
+| Turn Copy 按钮有反馈 | PASS | 按钮文案切换（HTTP 下为 "Copy failed"，HTTPS 下正常） |
+| Run Copy 按钮存在 | PASS | `.clawlens-turns-copy-btn` 在 Turns 标签后 ✓ |
+| Run Copy 不触发 source 请求 | PASS | 0 source request ✓ |
+| 点击 surface 外部关闭 | PASS | 外部 click 清除 surface ✓ |
+| Source button + 宽度稳定性（C3） | SKIP | 本轮测试 session 为 heartbeat，turns 无 `hasSourceLookup`；需使用有工具调用的会话复测 |
+
+### 14c. C3 补充验证（Source 按钮，需 hasSourceLookup=1 的 session）
+
+heartbeat 类 run 的 turns 没有 `hasSourceLookup=1`，因此 C3 组检查无法通过 heartbeat session 触发。如需验证 Source 按钮的宽度稳定性和 loading 状态，需使用包含工具调用的 QA smoke session：
+
+```bash
+# 1. 触发有工具调用的 session
+cd projects-ref/openclaw
+node dist/entry.js agent \
+  --session-id qa-source-verify \
+  --channel qa-channel \
+  --message "Use the session_status tool exactly once, then reply with exactly OK."
+
+# 2. 在浏览器访问该 session 的审计数据
+# http://127.0.0.1:18789/chat?session=qa-source-verify#token=<TOKEN>
+# 展开 run → 找到有 Source 按钮的 turn → 点击 Source → 验证 width 不抖动
+```
+
+网络层验证（DevTools Network，过滤 `/audit/source/`）：
+
+- hover turns → 无请求
+- 点击 `Source` 按钮 → 恰好 1 个请求
+- 点击 `Copy` → 无请求
+
+### 14d. "Copy failed" 说明
+
+在 headless 浏览器 HTTP 环境下，`navigator.clipboard.writeText` 和 `document.execCommand('copy')` 均因缺乏用户手势上下文而失败，按钮反馈为 "Copy failed"。这是测试环境限制，不是代码缺陷。在实际浏览器（HTTPS 或 localhost 用户交互）下，Copy 按钮正常工作并显示 "Copied" 后恢复。
+
 ## 相关文档
 
 - [插件开发工作流](CLAWLENS_PLUGIN_DEV_WORKFLOW.md)
