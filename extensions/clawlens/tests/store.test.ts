@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { serializePreviewForTextColumn } from "../src/structured-preview.js";
 
 // ── 环境检测 ──────────────────────────────────────────────────────────────
 
@@ -101,6 +102,163 @@ describe("Store — 正常值", () => {
     store.completeRun("r2", Date.now(), "completed");
     const sessions = store.getSessions() as any[];
     assert.ok(sessions.length >= 2);
+    store.close();
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  maybe("findUnknownRunIdByPromptMessageId works for legacy and structured previews", () => {
+    const dir = makeTmpDir();
+    const store = new Store(dir);
+    const ts = Date.now();
+
+    store.insertRun("legacy-run", "unknown", ts - 10_000);
+    store.insertLlmCall("legacy-run", 0, ts - 10_000, {
+      userPromptPreview: 'queued {"message_id":"msg-legacy"}',
+    });
+
+    store.insertRun("structured-run", "unknown", ts + 10_000);
+    store.insertLlmCall("structured-run", 0, ts + 10_000, {
+      userPromptPreview: serializePreviewForTextColumn({
+        queued: [{ message_id: "msg-structured" }],
+      }),
+    });
+
+    assert.equal(store.findUnknownRunIdByPromptMessageId("msg-legacy", { timestamp: ts - 10_000 }), "legacy-run");
+    assert.equal(store.findUnknownRunIdByPromptMessageId("msg-structured", { timestamp: ts + 10_000 }), "structured-run");
+
+    store.close();
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  maybe("applyLoggerSessionPreviewMapping works with quotes and backslashes in structured preview", () => {
+    const dir = makeTmpDir();
+    const store = new Store(dir);
+    const ts = Date.now();
+    const loggerTimestamp = new Date(ts).toISOString();
+    const sessionId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    const userText = 'say "hello" \\\\ world';
+
+    store.insertRun("target-run", "agent:main:main", ts - 1000);
+    store.insertRun("old-run", "agent:main:main", ts - 2000);
+    store.insertConversationTurn(
+      "old-run",
+      "agent:main:main",
+      0,
+      "user",
+      serializePreviewForTextColumn({
+        blocks: [{ type: "text", text: userText }],
+      }),
+      userText.length,
+      ts,
+      {
+        messageId: "msg-logger-1",
+        sessionFile: `/tmp/${sessionId}.jsonl`,
+        sourceKind: "session_fallback",
+      },
+    );
+
+    assert.equal(store.applyLoggerSessionPreviewMapping({
+      runId: "target-run",
+      sessionId,
+      userTextPreview: userText,
+      loggerTimestamp,
+    }), true);
+
+    assert.equal(store.findRunIdByMessageId("msg-logger-1"), "target-run");
+    store.close();
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  maybe("getAuditSession includes preview format metadata for structured previews", () => {
+    const dir = makeTmpDir();
+    const store = new Store(dir);
+    const ts = Date.now();
+    store.insertRun("r1", "sess-1", ts);
+    store.insertLlmCall("r1", 0, ts, {
+      userPromptPreview: serializePreviewForTextColumn({ text: "hello" }),
+    });
+    store.insertConversationTurn(
+      "r1",
+      "sess-1",
+      0,
+      "user",
+      serializePreviewForTextColumn({ message_id: "msg-1", text: "hello" }),
+      20,
+      ts,
+      { messageId: "msg-1", sourceKind: "transcript_explicit" },
+    );
+    store.completeRun("r1", ts + 1000, "completed");
+
+    const session = store.getAuditSession("sess-1") as any;
+    assert.equal(session.runs[0].userPromptPreviewFormat, "structured-json-v1");
+    assert.equal(session.runs[0].userPromptPreviewVersion, 1);
+    assert.equal(session.runs[0].turns[0].previewFormat, "structured-json-v1");
+    assert.equal(session.runs[0].turns[0].previewVersion, 1);
+
+    store.close();
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  maybe("32 KiB structured preview survives SQLite round-trip without silent truncation", () => {
+    const dir = makeTmpDir();
+    const store = new Store(dir);
+    const ts = Date.now();
+    const preview = serializePreviewForTextColumn({
+      text: "x".repeat(34 * 1024),
+      kind: "large-preview-roundtrip",
+    }, {
+      maxStringChars: 34 * 1024,
+      maxSerializedBytes: 64 * 1024,
+    });
+
+    assert.ok(Buffer.byteLength(preview, "utf8") >= 32 * 1024);
+
+    store.insertRun("r-roundtrip", "sess-roundtrip", ts);
+    store.insertConversationTurn(
+      "r-roundtrip",
+      "sess-roundtrip",
+      0,
+      "user",
+      preview,
+      preview.length,
+      ts,
+      {
+        messageId: "msg-roundtrip-32k",
+        sessionFile: "/tmp/78787878-7878-7878-7878-787878787878.jsonl",
+        sourceKind: "transcript_explicit",
+      },
+    );
+    store.completeRun("r-roundtrip", ts + 1, "completed");
+
+    const session = store.getAuditSession("sess-roundtrip", { includeDetails: true }) as any;
+    assert.equal(session.runs[0].turns[0].preview, preview);
+    assert.equal(session.runs[0].turns[0].previewFormat, "structured-json-v1");
+    assert.equal(session.runs[0].turns[0].messageId, "msg-roundtrip-32k");
+
+    store.close();
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  maybe("tool source anchor helper returns tool row plus session file hints", () => {
+    const dir = makeTmpDir();
+    const store = new Store(dir);
+    const ts = Date.now();
+    store.insertRun("r1", "sess-1", ts);
+    store.insertToolExecution("r1", "tool-1", "read", ts, {
+      argsSummary: serializePreviewForTextColumn({ path: "/tmp/a.txt" }),
+      resultSummary: serializePreviewForTextColumn({ ok: true }),
+    });
+    store.insertConversationTurn("r1", "sess-1", 0, "assistant", "preview", 7, ts, {
+      messageId: "msg-tool-1",
+      sessionFile: "/tmp/99999999-9999-9999-9999-999999999999.jsonl",
+      sourceKind: "transcript_explicit",
+    });
+
+    const anchor = store.getToolExecutionSourceAnchor("r1", "tool-1") as any;
+    assert.equal(anchor.toolCallId, "tool-1");
+    assert.equal(anchor.toolName, "read");
+    assert.deepEqual(anchor.sessionFiles, ["/tmp/99999999-9999-9999-9999-999999999999.jsonl"]);
+
     store.close();
     fs.rmSync(dir, { recursive: true });
   });

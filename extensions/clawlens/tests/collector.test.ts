@@ -7,7 +7,8 @@
  */
 import { test, describe, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { Collector } from "../src/collector.js";
+import { Collector, classifyTranscriptTurnKind, normalizeTranscriptMessage } from "../src/collector.js";
+import { parsePreviewFormat } from "../src/structured-preview.js";
 
 // ── Mock Store ────────────────────────────────────────────────────────────
 
@@ -194,6 +195,22 @@ describe("Collector — 正常值", () => {
     assert.equal(toolBroadcasts.length, 1);
   });
 
+  test("transcript kind classification uses raw searchable content, not serialized preview text", () => {
+    const normalized = normalizeTranscriptMessage({
+      role: "user",
+      content: "normal chat text",
+    });
+    assert.ok(normalized);
+    assert.equal(classifyTranscriptTurnKind({
+      role: normalized.role,
+      searchableText: normalized.searchableText,
+    }), "chat");
+    assert.equal(classifyTranscriptTurnKind({
+      role: normalized.role,
+      searchableText: "HEARTBEAT_OK",
+    }), "heartbeat");
+  });
+
   test("llmCallIndex 在同一 run 内递增", () => {
     const { collector, store } = makeCollector();
     collector.handleAgentEvent(lifecycleEvent("start"));
@@ -207,6 +224,35 @@ describe("Collector — 正常值", () => {
     assert.equal(calls[0].args[1], 0);
     assert.equal(calls[1].args[1], 1);
     assert.equal(calls[2].args[1], 2);
+  });
+
+  test("structuredPreviews enabled serializes llm/tool/transcript fallback previews", () => {
+    const { collector, store } = makeCollector();
+    collector.start({}, {}, { collector: { structuredPreviews: true } });
+    collector.handleAgentEvent(lifecycleEvent("start", { sessionId: "sess-source-1" }));
+    collector.recordLlmInput({ runId: "run-001", prompt: "hello structured world" }, {});
+    collector.recordLlmOutput({ runId: "run-001", usage: {} }, {});
+    collector.recordToolCall(
+      { toolName: "bash", toolCallId: "tc-1", params: { apiKey: "secret", cmd: "ls" }, result: { ok: true } },
+      { runId: "run-001" } as any,
+    );
+    collector.recordAgentEnd(
+      { messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }] },
+      { sessionId: "sess-source-1", sessionKey: "sess-001" },
+    );
+    collector.stop();
+
+    const llmCall = store.callsOf("insertLlmCall")[0];
+    const llmOpts = llmCall.args[3] as { userPromptPreview?: string };
+    assert.equal(parsePreviewFormat(llmOpts.userPromptPreview).previewFormat, "structured-json-v1");
+
+    const toolCall = store.callsOf("insertToolExecution")[0];
+    const toolOpts = toolCall.args[4] as { argsSummary?: string; resultSummary?: string };
+    assert.equal(parsePreviewFormat(toolOpts.argsSummary).previewFormat, "structured-json-v1");
+    assert.equal(parsePreviewFormat(toolOpts.resultSummary).previewFormat, "structured-json-v1");
+
+    const turnCall = store.callsOf("insertConversationTurn")[0];
+    assert.equal(parsePreviewFormat(turnCall.args[4] as string).previewFormat, "structured-json-v1");
   });
 });
 
