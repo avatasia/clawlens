@@ -2,6 +2,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { isClawLensDebugEnabled, logClawLensDebug } from "./debug.js";
+import {
+  extractMessageIdsFromPreview,
+  extractSearchTextFromPreview,
+  normalizeSearchText,
+  parsePreviewFormat,
+} from "./structured-preview.js";
 
 // node:sqlite is available in Node.js >= 22.5.0
 // Lazy-load so the module can be imported without crashing on older runtimes.
@@ -82,7 +88,7 @@ type SessionFilters = {
 };
 
 function classifyTurnKindFromPreview(preview?: string | null): "heartbeat" | "chat" {
-  const text = preview ?? "";
+  const text = extractSearchTextFromPreview(preview ?? "");
   if (
     text.includes("Read HEARTBEAT.md if it exists (workspace context).") ||
     text.includes("/home/openclaw/.openclaw/workspace/HEARTBEAT.md") ||
@@ -368,7 +374,8 @@ export class Store {
       WHERE message_id = ?
     `);
     this.stmtFindConvTurnByMessageId = this.db.prepare(`
-      SELECT id, run_id, turn_index, source_kind FROM conversation_turns WHERE message_id = ?
+      SELECT id, run_id, turn_index, source_kind, session_file, source_session_id, source_logger_ts, role, content_preview, content_length, timestamp
+      FROM conversation_turns WHERE message_id = ?
     `);
     this.stmtNextTurnIndex = this.db.prepare(`
       SELECT COALESCE(MAX(turn_index), -1) + 1 AS next_turn_index FROM conversation_turns WHERE run_id = ?
@@ -837,29 +844,35 @@ export class Store {
     const ts = Date.parse(params.loggerTimestamp);
     const loggerTs = Number.isFinite(ts) ? ts : run.started_at;
     const sessionFileSuffix = `${params.sessionId}.jsonl`;
-    const row = this.db.prepare(`
-      SELECT id, run_id, message_id, source_kind, source_session_id, source_logger_ts
+    const lowerBound = loggerTs - 60_000;
+    const upperBound = loggerTs + 60_000;
+    const searchNeedle = normalizeSearchText(params.userTextPreview);
+    const rows = this.db.prepare(`
+      SELECT id, run_id, message_id, source_kind, source_session_id, source_logger_ts, content_preview, timestamp
       FROM conversation_turns
       WHERE role = 'user'
         AND session_file LIKE ?
-        AND content_preview LIKE ?
         AND timestamp BETWEEN ? AND ?
       ORDER BY ABS(timestamp - ?) ASC, id DESC
-      LIMIT 1
-    `).get(
+      LIMIT 20
+    `).all(
       `%${sessionFileSuffix}`,
-      `%${params.userTextPreview.replace(/[%_]/g, "")}%`,
-      loggerTs - 10 * 60_000,
-      loggerTs + 10 * 60_000,
+      lowerBound,
+      upperBound,
       loggerTs,
-    ) as {
+    ) as Array<{
       id: number;
       run_id: string;
       message_id?: string | null;
       source_kind?: string | null;
       source_session_id?: string | null;
       source_logger_ts?: string | null;
-    } | undefined;
+      content_preview?: string | null;
+      timestamp?: number | null;
+    }>;
+    const row = rows.find((candidate) =>
+      normalizeSearchText(extractSearchTextFromPreview(candidate.content_preview ?? "")).includes(searchNeedle),
+    );
     if (!row) return false;
 
     const existingPriority = this.getSourcePriority(row.source_kind ?? undefined);
@@ -1004,12 +1017,21 @@ export class Store {
       });
     }
     for (const te of toolExecs) {
+      const argsMeta = parsePreviewFormat(te.args_summary ?? "");
+      const resultMeta = parsePreviewFormat(te.result_summary ?? "");
       timeline.push({
         type: "tool_execution",
         toolName: te.tool_name,
+        toolCallId: te.tool_call_id,
         startedAt: te.started_at - runStart,
         duration: te.duration_ms ?? 0,
         isError: te.is_error === 1,
+        argsPreview: te.args_summary ?? "",
+        argsPreviewFormat: argsMeta.previewFormat,
+        argsPreviewVersion: argsMeta.previewVersion,
+        resultPreview: te.result_summary ?? "",
+        resultPreviewFormat: resultMeta.previewFormat,
+        resultPreviewVersion: resultMeta.previewVersion,
       });
     }
     (timeline as any[]).sort((a: any, b: any) => a.startedAt - b.startedAt);
@@ -1037,6 +1059,9 @@ export class Store {
     const allHeartbeatTurns = detectedTurnKinds.length > 0 && detectedTurnKinds.every((kind) => kind === "heartbeat");
     const runKind = run.run_kind === "heartbeat" || allHeartbeatTurns ? "heartbeat" : "chat";
     const filteredTurns = turns.filter((t: any) => classifyTurnKindFromPreview(t.content_preview) === runKind);
+    const userPromptRaw = (llmCalls[0] as any)?.user_prompt_preview ?? "";
+    const userPromptMeta = parsePreviewFormat(userPromptRaw);
+    const runSessionFiles = dedupeStrings(filteredTurns.map((t: any) => t.session_file).filter(Boolean));
 
     return {
       runId: run.run_id,
@@ -1047,7 +1072,9 @@ export class Store {
       model: run.model ?? (llmCalls[0] as any)?.model ?? null,
       provider: run.provider ?? (llmCalls[0] as any)?.provider ?? null,
       errorMessage: run.error_message ?? null,
-      userPrompt: (llmCalls[0] as any)?.user_prompt_preview ?? "",
+      userPrompt: userPromptRaw,
+      userPromptPreviewFormat: userPromptMeta.previewFormat,
+      userPromptPreviewVersion: userPromptMeta.previewVersion,
       summary: {
         llmCalls: Math.max(run.total_llm_calls ?? 0, llmCount),
         toolCalls: Math.max(run.total_tool_calls ?? 0, toolCount),
@@ -1069,13 +1096,20 @@ export class Store {
       },
       timeline: includeDetails ? timeline : [],
       turns: filteredTurns.map((t: any) => ({
+        ...parsePreviewFormat(t.content_preview ?? ""),
         role: t.role,
         preview: t.content_preview ?? "",
         length: t.content_length ?? 0,
         messageId: t.message_id ?? null,
         sourceKind: t.source_kind ?? null,
+        sessionFile: t.session_file ?? null,
+        sourceSessionId: t.source_session_id ?? null,
+        sourceLoggerTs: t.source_logger_ts ?? null,
         toolCallsCount: t.tool_calls_count,
       })),
+      sourceLookupHints: {
+        sessionFiles: runSessionFiles,
+      },
       hasDetail: includeDetails ? true : (llmCalls.length > 0 || toolExecs.length > 0),
     };
   }
@@ -1167,28 +1201,26 @@ export class Store {
     const hasTs = typeof ts === "number" && Number.isFinite(ts);
     if (!hasTs) return null;
 
-    const before = Math.max(0, Math.floor(opts?.windowBeforeMs ?? 120_000));
-    const after = Math.max(0, Math.floor(opts?.windowAfterMs ?? 180_000));
+    const before = Math.max(0, Math.floor(opts?.windowBeforeMs ?? 60_000));
+    const after = Math.max(0, Math.floor(opts?.windowAfterMs ?? 60_000));
     const lower = Math.floor(ts - before);
     const upper = Math.floor(ts + after);
-    const quoted = id.replace(/"/g, '\\"');
-    const patternCompact = `%"message_id":"${quoted}"%`;
-    const patternSpaced = `%"message_id": "${quoted}"%`;
     const rows = this.db.prepare(`
-      SELECT r.run_id, r.started_at
+      SELECT r.run_id, r.started_at, l.user_prompt_preview
       FROM llm_calls l
       JOIN runs r ON r.run_id = l.run_id
       WHERE r.session_key = 'unknown'
         AND r.started_at >= ?
         AND r.started_at <= ?
-        AND (l.user_prompt_preview LIKE ? OR l.user_prompt_preview LIKE ?)
       ORDER BY ABS(r.started_at - ?) ASC, r.started_at DESC
-      LIMIT 5
-    `).all(lower, upper, patternCompact, patternSpaced, Math.floor(ts)) as Array<{
+      LIMIT 20
+    `).all(lower, upper, Math.floor(ts)) as Array<{
       run_id: string;
       started_at: number;
+      user_prompt_preview?: string | null;
     }>;
-    if (rows.length > 0) return rows[0].run_id;
+    const matched = rows.find((row) => extractMessageIdsFromPreview(row.user_prompt_preview).includes(id));
+    if (matched) return matched.run_id;
     return null;
   }
 
@@ -1317,6 +1349,81 @@ export class Store {
     return this.buildRunAuditDetail(run);
   }
 
+  getConversationTurnSourceAnchor(messageId: string): {
+    messageId: string;
+    runId: string | null;
+    role: string | null;
+    contentPreview: string | null;
+    contentLength: number | null;
+    timestamp: number | null;
+    sessionFile: string | null;
+    sourceKind: string | null;
+    sourceSessionId: string | null;
+    sourceLoggerTs: string | null;
+  } | null {
+    const row = this.stmtFindConvTurnByMessageId.get(messageId) as {
+      run_id?: string | null;
+      role?: string | null;
+      content_preview?: string | null;
+      content_length?: number | null;
+      timestamp?: number | null;
+      session_file?: string | null;
+      source_kind?: string | null;
+      source_session_id?: string | null;
+      source_logger_ts?: string | null;
+    } | undefined;
+    if (!row) return null;
+    return {
+      messageId,
+      runId: row.run_id ?? null,
+      role: row.role ?? null,
+      contentPreview: row.content_preview ?? null,
+      contentLength: row.content_length ?? null,
+      timestamp: row.timestamp ?? null,
+      sessionFile: row.session_file ?? null,
+      sourceKind: row.source_kind ?? null,
+      sourceSessionId: row.source_session_id ?? null,
+      sourceLoggerTs: row.source_logger_ts ?? null,
+    };
+  }
+
+  getToolExecutionSourceAnchor(runId: string, toolCallId: string): {
+    runId: string;
+    toolCallId: string;
+    toolName: string;
+    argsSummary: string | null;
+    resultSummary: string | null;
+    sessionFiles: string[];
+  } | null {
+    const tool = this.db.prepare(`
+      SELECT run_id, tool_call_id, tool_name, args_summary, result_summary
+      FROM tool_executions
+      WHERE run_id = ? AND tool_call_id = ?
+      LIMIT 1
+    `).get(runId, toolCallId) as {
+      run_id: string;
+      tool_call_id: string;
+      tool_name: string;
+      args_summary?: string | null;
+      result_summary?: string | null;
+    } | undefined;
+    if (!tool) return null;
+    const sessionFiles = this.db.prepare(`
+      SELECT DISTINCT session_file
+      FROM conversation_turns
+      WHERE run_id = ? AND session_file IS NOT NULL AND TRIM(session_file) != ''
+      ORDER BY id ASC
+    `).all(runId) as Array<{ session_file?: string | null }>;
+    return {
+      runId: tool.run_id,
+      toolCallId: tool.tool_call_id,
+      toolName: tool.tool_name,
+      argsSummary: tool.args_summary ?? null,
+      resultSummary: tool.result_summary ?? null,
+      sessionFiles: dedupeStrings(sessionFiles.map((row) => row.session_file ?? "").filter(Boolean)),
+    };
+  }
+
   getAuditMessage(messageId: string): unknown {
     const row = this.db.prepare(`
       SELECT
@@ -1325,6 +1432,7 @@ export class Store {
         t.content_preview,
         t.timestamp,
         t.source_kind,
+        t.session_file,
         t.source_session_id,
         t.source_logger_ts,
         r.run_id,
@@ -1344,6 +1452,7 @@ export class Store {
         role: row.role,
         textPreview: row.content_preview ?? "",
         timestamp: row.timestamp ?? null,
+        sessionFile: row.session_file ?? null,
       },
       run: row.run_id ? {
         runId: row.run_id,
@@ -1482,4 +1591,8 @@ export class Store {
   close(): void {
     this.db.close();
   }
+}
+
+function dedupeStrings(values: string[]): string[] {
+  return [...new Set(values)];
 }

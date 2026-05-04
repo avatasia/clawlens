@@ -4,6 +4,10 @@ import type { SSEManager } from "./sse-manager.js";
 import { calculateCost, loadCostConfig } from "./cost-calculator.js";
 import type { ClawLensConfig } from "./types.js";
 import { isClawLensDebugEnabled, logClawLensDebug } from "./debug.js";
+import {
+  resolveTranscriptSourceCandidates,
+  serializePreviewForTextColumn,
+} from "./structured-preview.js";
 
 type ActiveRun = {
   runId: string;
@@ -38,6 +42,7 @@ type PendingTranscriptTurn = {
   normalized: {
     role: string;
     preview: string;
+    searchableText: string;
     length: number;
     timestamp?: number;
     toolCallsCount: number;
@@ -67,11 +72,11 @@ function classifyPromptRunKind(prompt?: string): "heartbeat" | "chat" {
   return "chat";
 }
 
-function classifyTranscriptTurnKind(normalized: {
+export function classifyTranscriptTurnKind(normalized: {
   role: string;
-  preview: string;
+  searchableText: string;
 }): "heartbeat" | "chat" {
-  const text = normalized.preview ?? "";
+  const text = normalized.searchableText ?? "";
   if (
     text.includes("Read HEARTBEAT.md if it exists (workspace context).") ||
     text.includes("/home/openclaw/.openclaw/workspace/HEARTBEAT.md") ||
@@ -92,6 +97,7 @@ export class Collector {
   private flushInterval: ReturnType<typeof setInterval> | null = null;
   private costMap = new Map<string, { input: number; output: number; cacheRead: number; cacheWrite: number }>();
   private debugEnabled = false;
+  private structuredPreviewsEnabled = false;
   private liveLlmByRunId = new Map<string, LiveLlmStream>();
   private pendingModelCallStarts = new Map<string, number>();
   // ROLLBACK_INDEX: CLAWLENS_TRANSCRIPT_BINDING_STRATEGY -> docs/CLAWLENS_TRANSCRIPT_BINDING_ROLLBACK_PLAYBOOK.md
@@ -107,6 +113,7 @@ export class Collector {
   start(runtime: unknown, globalConfig: unknown, pluginConfig: ClawLensConfig): void {
     this.costMap = loadCostConfig(globalConfig);
     this.debugEnabled = isClawLensDebugEnabled(pluginConfig.collector?.debugLogs);
+    this.structuredPreviewsEnabled = pluginConfig.collector?.structuredPreviews === true;
     this.transcriptBindingStrategy = resolveTranscriptBindingStrategy(
       pluginConfig.collector?.transcriptBindingStrategy,
     );
@@ -450,7 +457,11 @@ export class Collector {
     const active = this.activeRuns.get(runId);
     this.enqueueLlmStart(runId, Date.now());
     if (active) {
-      if (event.prompt) active.lastUserPrompt = event.prompt.slice(0, 200);
+      if (event.prompt) {
+        active.lastUserPrompt = this.structuredPreviewsEnabled
+          ? serializePreviewForTextColumn(event.prompt)
+          : event.prompt.slice(0, 200);
+      }
       if (event.systemPrompt) active.systemPromptHash = simpleHash(event.systemPrompt);
       const runKind = classifyPromptRunKind(event.prompt);
       if (active.runKind !== runKind) {
@@ -510,11 +521,19 @@ export class Collector {
     const isError = event.error !== undefined && event.error !== null;
 
     const argsSummary = event.params
-      ? JSON.stringify(event.params).slice(0, 200)
+      ? (this.structuredPreviewsEnabled
+          ? serializePreviewForTextColumn(event.params)
+          : JSON.stringify(event.params).slice(0, 200))
       : undefined;
-    const resultSummary = event.result
-      ? JSON.stringify(event.result).slice(0, 200)
-      : event.error?.slice(0, 200);
+    const resultSummary = event.result != null
+      ? (this.structuredPreviewsEnabled
+          ? serializePreviewForTextColumn(event.result)
+          : JSON.stringify(event.result).slice(0, 200))
+      : event.error
+        ? (this.structuredPreviewsEnabled
+            ? serializePreviewForTextColumn(event.error)
+            : event.error.slice(0, 200))
+        : undefined;
 
     try {
       this.store.insertToolExecution(runId, toolCallId, toolName, durationMs ? now - durationMs : now, {
@@ -565,9 +584,12 @@ export class Collector {
         const raw = typeof msg.content === "string"
           ? msg.content
           : JSON.stringify(msg.content ?? "");
+        const preview = this.structuredPreviewsEnabled
+          ? serializePreviewForTextColumn(msg.content ?? "")
+          : raw.slice(0, 500);
         this.store.insertConversationTurn(
           runId, sessionKey, turnIndex++, role,
-          raw.slice(0, 500), raw.length, now,
+          preview, raw.length, now,
           { sourceKind: "session_fallback" },
         );
       }
@@ -583,7 +605,9 @@ export class Collector {
     const sessionKey = update.sessionKey;
     if (!sessionKey || !update.messageId) return;
 
-    const normalized = normalizeTranscriptMessage(update.message);
+    const normalized = normalizeTranscriptMessage(update.message, {
+      structuredPreviews: this.structuredPreviewsEnabled,
+    });
     if (!normalized) return;
     const queuedTimestamp = extractQueuedConversationTimestampMs(update.message);
     const anchorTimestamp = normalized.timestamp ?? queuedTimestamp;
@@ -868,9 +892,54 @@ function extractAssistantDeltaText(data?: Record<string, unknown>): string {
   return "";
 }
 
-function normalizeTranscriptMessage(message: unknown): {
+export function normalizeTranscriptMessage(message: unknown): {
   role: string;
   preview: string;
+  searchableText: string;
+  length: number;
+  timestamp?: number;
+  toolCallsCount: number;
+  tokensUsed?: number;
+  explicitRunId?: string;
+} | null;
+export function normalizeTranscriptMessage(
+  message: unknown,
+  options: { structuredPreviews: boolean },
+): {
+  role: string;
+  preview: string;
+  searchableText: string;
+  length: number;
+  timestamp?: number;
+  toolCallsCount: number;
+  tokensUsed?: number;
+  explicitRunId?: string;
+} | null;
+export function normalizeTranscriptMessage(
+  message: unknown,
+  options?: { structuredPreviews: boolean },
+): {
+  role: string;
+  preview: string;
+  searchableText: string;
+  length: number;
+  timestamp?: number;
+  toolCallsCount: number;
+  tokensUsed?: number;
+  explicitRunId?: string;
+} | null {
+  return normalizeTranscriptMessageInternal(message, {
+    structuredPreviews: options?.structuredPreviews === true,
+  });
+}
+
+function normalizeTranscriptMessageInternal(
+  message: unknown,
+  options: { structuredPreviews: boolean },
+): {
+  role: string;
+  preview: string;
+  searchableText: string;
   length: number;
   timestamp?: number;
   toolCallsCount: number;
@@ -908,7 +977,10 @@ function normalizeTranscriptMessage(message: unknown): {
   const explicitRunId = extractExplicitRunId(msg);
   return {
     role,
-    preview: raw.slice(0, 500),
+    preview: options.structuredPreviews
+      ? serializePreviewForTextColumn(content ?? "")
+      : raw.slice(0, 500),
+    searchableText: raw,
     length: raw.length,
     timestamp: typeof msg.timestamp === "number" ? msg.timestamp : undefined,
     toolCallsCount: toolCalls,
@@ -916,6 +988,7 @@ function normalizeTranscriptMessage(message: unknown): {
     explicitRunId,
   };
 }
+
 
 function extractExplicitRunId(message: Record<string, unknown>): string | undefined {
   const abortMeta = (message.openclawAbort && typeof message.openclawAbort === "object")
@@ -943,9 +1016,7 @@ function extractExplicitRunId(message: Record<string, unknown>): string | undefi
 }
 
 function extractSessionIdFromSessionFile(sessionFile?: string): string | undefined {
-  if (!sessionFile) return undefined;
-  const m = sessionFile.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i);
-  return m?.[1];
+  return resolveTranscriptSourceCandidates({ sessionFile }).sessionId ?? undefined;
 }
 
 function resolveTranscriptBindingStrategy(

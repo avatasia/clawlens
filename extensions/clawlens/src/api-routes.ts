@@ -4,6 +4,7 @@ import type { Store } from "./store.js";
 import type { SSEManager } from "./sse-manager.js";
 import type { ClawLensConfig } from "./types.js";
 import { importLoggerMappings, inspectLoggerImportDir } from "./logger-import.js";
+import { hasTrustedSourceRoots, isSourceLookupEnabled, SourceResolver } from "./source-resolver.js";
 
 function parseIntParam(value: string | null, defaultValue: number): number {
   if (value === null) return defaultValue;
@@ -17,8 +18,16 @@ function sendJson(res: ServerResponse, status: number, data: unknown): void {
   res.end(body);
 }
 
-function getToken(api: OpenClawPluginApi): string | undefined {
+function getPluginRouteToken(api: OpenClawPluginApi): string | undefined {
   return (api.config as any)?.auth?.token as string | undefined;
+}
+
+function getSourceRouteToken(api: OpenClawPluginApi): string | undefined {
+  // Native plugin HTTP routes commonly have gateway auth configured, while a
+  // separate top-level plugin auth token may be absent in real deployments.
+  // Full source responses still require an authenticated boundary, so source
+  // routes accept either the plugin-scoped token or the gateway shared token.
+  return getPluginRouteToken(api) ?? ((api.config as any)?.gateway?.auth?.token as string | undefined);
 }
 
 function authOk(req: IncomingMessage, token: string | undefined): boolean {
@@ -37,7 +46,87 @@ function parseUrl(req: IncomingMessage): URL {
   return new URL(req.url ?? "/", "http://localhost");
 }
 
+function sourceLookupContext(pluginConfig?: ClawLensConfig, token?: string): {
+  enabled: boolean;
+  sourceLookupDirs: string[];
+  hasGlobalTrustedRoots: boolean;
+  allowSourceResponses: boolean;
+} {
+  const collectorConfig = pluginConfig?.collector;
+  const enabled = isSourceLookupEnabled(collectorConfig);
+  const sourceLookupDirs = collectorConfig?.sourceLookupDirs ?? [];
+  return {
+    enabled,
+    sourceLookupDirs,
+    hasGlobalTrustedRoots: hasTrustedSourceRoots(undefined, sourceLookupDirs),
+    allowSourceResponses: enabled && !!token,
+  };
+}
+
+function enrichAuditRunDetail(detail: any, context: ReturnType<typeof sourceLookupContext>): any {
+  if (!detail || typeof detail !== "object") return detail;
+  const runSessionFiles = Array.isArray(detail.sourceLookupHints?.sessionFiles)
+    ? detail.sourceLookupHints.sessionFiles.filter(Boolean)
+    : [];
+  const trustedRunSessionFiles = context.enabled
+    ? runSessionFiles.filter((sessionFile: string) => hasTrustedSourceRoots(sessionFile, context.sourceLookupDirs))
+    : [];
+  const runHasRoots = context.enabled && trustedRunSessionFiles.length > 0;
+
+  if (Array.isArray(detail.turns)) {
+    detail.turns = detail.turns.map((turn: any) => {
+      const hasTrustedRoot = context.enabled
+        && !!turn?.sessionFile
+        && hasTrustedSourceRoots(turn.sessionFile, context.sourceLookupDirs);
+      const hasSourceLookup = context.enabled
+        && !!turn?.messageId
+        && hasTrustedRoot;
+      return {
+        ...turn,
+        hasSourceLookup,
+      };
+    });
+  }
+
+  if (Array.isArray(detail.timeline)) {
+    detail.timeline = detail.timeline.map((entry: any) => {
+      if (entry?.type !== "tool_execution") return entry;
+      return {
+        ...entry,
+        hasSourceLookup: context.enabled && !!entry?.toolCallId && runHasRoots,
+      };
+    });
+  }
+
+  delete detail.sourceLookupHints;
+  return detail;
+}
+
+function requireSourceLookupAuth(
+  req: IncomingMessage,
+  res: ServerResponse,
+  token: string | undefined,
+  context: ReturnType<typeof sourceLookupContext>,
+): boolean {
+  if (!context.enabled) {
+    sendJson(res, 200, { ok: false, miss: "source_root_unavailable" });
+    return false;
+  }
+  if (!token) {
+    sendJson(res, 403, { ok: false, error: "source lookup requires configured auth token" });
+    return false;
+  }
+  if (!authOk(req, token)) {
+    sendJson(res, 401, { error: "unauthorized" });
+    return false;
+  }
+  return true;
+}
+
 export function registerApiRoutes(api: OpenClawPluginApi, store: Store, sseManager: SSEManager, pluginConfig?: ClawLensConfig): void {
+  const resolver = new SourceResolver({
+    sourceLookupDirs: pluginConfig?.collector?.sourceLookupDirs ?? [],
+  });
   api.registerHttpRoute({
     path: "/plugins/clawlens/api",
     match: "prefix",
@@ -46,11 +135,13 @@ export function registerApiRoutes(api: OpenClawPluginApi, store: Store, sseManag
       try {
       const url = parseUrl(req);
       const pathname = url.pathname;
-      const token = getToken(api);
+      const routeToken = getPluginRouteToken(api);
+      const sourceRouteToken = getSourceRouteToken(api);
+      const lookupContext = sourceLookupContext(pluginConfig, sourceRouteToken);
 
       // SSE uses query token
       if (pathname.endsWith("/events")) {
-        if (!authOkQuery(url, token)) {
+        if (!authOkQuery(url, routeToken)) {
           sendJson(res, 401, { error: "unauthorized" });
           return;
         }
@@ -64,7 +155,7 @@ export function registerApiRoutes(api: OpenClawPluginApi, store: Store, sseManag
       }
 
       // All other routes use Bearer token
-      if (!authOk(req, token)) {
+      if (!authOk(req, routeToken)) {
         sendJson(res, 401, { error: "unauthorized" });
         return;
       }
@@ -85,11 +176,42 @@ export function registerApiRoutes(api: OpenClawPluginApi, store: Store, sseManag
         return;
       }
 
+      const auditSourceMessageMatch = pathname.match(/\/audit\/source\/message\/([^/]+)$/);
+      if (auditSourceMessageMatch) {
+        if (!requireSourceLookupAuth(req, res, sourceRouteToken, lookupContext)) return;
+        const messageId = decodeURIComponent(auditSourceMessageMatch[1]);
+        const anchor = store.getConversationTurnSourceAnchor(messageId);
+        if (!anchor) { sendJson(res, 404, { error: "message not found" }); return; }
+        const result = await resolver.resolveMessageSource({
+          messageId,
+          sessionFile: anchor.sessionFile,
+          sourceKind: anchor.sourceKind,
+        });
+        sendJson(res, 200, result);
+        return;
+      }
+
+      const auditSourceToolMatch = pathname.match(/\/audit\/source\/tool\/([^/]+)\/([^/]+)$/);
+      if (auditSourceToolMatch) {
+        if (!requireSourceLookupAuth(req, res, sourceRouteToken, lookupContext)) return;
+        const runId = decodeURIComponent(auditSourceToolMatch[1]);
+        const toolCallId = decodeURIComponent(auditSourceToolMatch[2]);
+        const anchor = store.getToolExecutionSourceAnchor(runId, toolCallId);
+        if (!anchor) { sendJson(res, 404, { error: "tool call not found" }); return; }
+        const result = await resolver.resolveToolSource({
+          runId,
+          toolCallId,
+          sessionFiles: anchor.sessionFiles,
+        });
+        sendJson(res, 200, result);
+        return;
+      }
+
       // /audit/run/<runId>  — must be checked before generic /run/<runId>
       const auditRunMatch = pathname.match(/\/audit\/run\/([^/]+)$/);
       if (auditRunMatch) {
         const runId = decodeURIComponent(auditRunMatch[1]);
-        const detail = store.getAuditRun(runId);
+        const detail = enrichAuditRunDetail(store.getAuditRun(runId), lookupContext);
         if (!detail) { sendJson(res, 404, { error: "run not found" }); return; }
         sendJson(res, 200, detail);
         return;
@@ -99,8 +221,16 @@ export function registerApiRoutes(api: OpenClawPluginApi, store: Store, sseManag
       const auditMessageMatch = pathname.match(/\/audit\/message\/([^/]+)$/);
       if (auditMessageMatch) {
         const messageId = decodeURIComponent(auditMessageMatch[1]);
-        const detail = store.getAuditMessage(messageId);
+        const detail = store.getAuditMessage(messageId) as any;
         if (!detail) { sendJson(res, 404, { error: "message not found" }); return; }
+        if (detail?.matchedTurn) {
+          const hasTrustedRoot = lookupContext.enabled
+            && !!detail.matchedTurn.sessionFile
+            && hasTrustedSourceRoots(detail.matchedTurn.sessionFile, lookupContext.sourceLookupDirs);
+          detail.matchedTurn.hasSourceLookup = lookupContext.enabled
+            && !!detail.messageId
+            && hasTrustedRoot;
+        }
         sendJson(res, 200, detail);
         return;
       }
@@ -206,14 +336,18 @@ export function registerApiRoutes(api: OpenClawPluginApi, store: Store, sseManag
           value.split(",").map((item) => item.trim()).filter(Boolean),
         );
         const requireConversation = url.searchParams.get("requireConversation") === "1";
-        sendJson(res, 200, store.getAuditSession(sessionKey, {
+        const detail = store.getAuditSession(sessionKey, {
           limit,
           before,
           since,
           includeDetails,
           excludeKinds,
           requireConversation,
-        }));
+        }) as any;
+        if (Array.isArray(detail?.runs)) {
+          detail.runs = detail.runs.map((run: any) => enrichAuditRunDetail(run, lookupContext));
+        }
+        sendJson(res, 200, detail);
         return;
       }
 

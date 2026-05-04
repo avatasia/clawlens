@@ -10,6 +10,13 @@ const LIVE_LLM_STREAM_BY_RUN = new Map();
 const TIMELINE_SCALE_BY_RUN = new Map();
 const USER_MARKER_WIDTH_PCT = 3.2;
 const LIVE_LLM_STALE_MS = 600_000;
+const SOURCE_CACHE_MAX_ENTRIES = 50;
+const SOURCE_CACHE_MAX_BYTES = 16 * 1024 * 1024;
+const SOURCE_CACHE_TTL_MS = 15 * 60_000;
+const PREVIEW_HOVER_OPEN_MS = 120;
+const SOURCE_CACHE = new Map();
+const PREVIEW_EXPANDED_KEYS = new Set();
+const RENDERED_RUN_BY_ID = new Map();
 
 // ── State ─────────────────────────────────────────────────────────────────
 
@@ -24,6 +31,10 @@ const S = {
   runs: [],           // RunAuditDetail[] — new format from getAuditSession
   loadingSessions: false,
   loadingRuns: false,
+  previewHoverTimer: null,
+  previewSurfaceKey: null,
+  previewPinnedKey: null,
+  previewSourceStateByKey: new Map(),
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -38,6 +49,12 @@ function getToken() {
 }
 
 function authHeaders() {
+  const liveToken = getToken();
+  if (typeof liveToken === "string" && liveToken) {
+    S.token = liveToken;
+  } else if (!S.token) {
+    S.token = null;
+  }
   return S.token ? { Authorization: `Bearer ${S.token}` } : {};
 }
 
@@ -124,6 +141,241 @@ function fmtRelTime(ts) {
 }
 function esc(s) {
   return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function parseStructuredPreviewEnvelope(text) {
+  if (typeof text !== "string" || !text.trim()) return null;
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && parsed.__clawlensPreview?.version === 1 && parsed.__clawlensPreview?.node) {
+      return parsed.__clawlensPreview.node;
+    }
+  } catch {}
+  return null;
+}
+
+function previewInlineText(turn) {
+  const preview = turn?.preview ?? "";
+  const node = turn?.previewFormat === "structured-json-v1" ? parseStructuredPreviewEnvelope(preview) : null;
+  if (!node) return preview;
+  const text = structuredNodeToInlineText(node).trim();
+  return text || "[structured preview]";
+}
+
+function structuredNodeToInlineText(node) {
+  if (!node || typeof node !== "object") return "";
+  switch (node.kind) {
+    case "string":
+      return node.value ?? node.preview ?? "";
+    case "number":
+    case "boolean":
+      return String(node.value ?? "");
+    case "redacted":
+      return "[redacted]";
+    case "array":
+      return (node.items ?? []).map((item) => structuredNodeToInlineText(item)).join(" ");
+    case "object":
+      return (node.entries ?? [])
+        .flatMap((entry) => [entry.key, structuredNodeToInlineText(entry.value)])
+        .join(" ");
+    default:
+      return "";
+  }
+}
+
+function getPreviewKey(turn, runId, index) {
+  return turn?.messageId || `${runId || "run"}:${index}:${turn?.role || "unknown"}`;
+}
+
+function getSourceCacheKey(kind, id) {
+  return `${kind}:${id}`;
+}
+
+function getCachedSource(kind, id) {
+  const key = getSourceCacheKey(kind, id);
+  const entry = SOURCE_CACHE.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.at > SOURCE_CACHE_TTL_MS) {
+    SOURCE_CACHE.delete(key);
+    return null;
+  }
+  entry.at = Date.now();
+  SOURCE_CACHE.delete(key);
+  SOURCE_CACHE.set(key, entry);
+  return entry.data;
+}
+
+function setCachedSource(kind, id, data) {
+  const key = getSourceCacheKey(kind, id);
+  const bytes = Number(data?.bytes ?? 0) || JSON.stringify(data ?? null).length;
+  SOURCE_CACHE.delete(key);
+  SOURCE_CACHE.set(key, { data, bytes, at: Date.now() });
+  trimSourceCache();
+}
+
+function trimSourceCache() {
+  let totalBytes = 0;
+  const now = Date.now();
+  for (const [key, entry] of [...SOURCE_CACHE.entries()]) {
+    if (now - entry.at > SOURCE_CACHE_TTL_MS) {
+      SOURCE_CACHE.delete(key);
+      continue;
+    }
+    totalBytes += entry.bytes;
+  }
+  while (SOURCE_CACHE.size > SOURCE_CACHE_MAX_ENTRIES || totalBytes > SOURCE_CACHE_MAX_BYTES) {
+    const firstKey = SOURCE_CACHE.keys().next().value;
+    if (!firstKey) break;
+    totalBytes -= SOURCE_CACHE.get(firstKey)?.bytes ?? 0;
+    SOURCE_CACHE.delete(firstKey);
+  }
+}
+
+function clearPreviewTimers() {
+  if (S.previewHoverTimer) {
+    clearTimeout(S.previewHoverTimer);
+    S.previewHoverTimer = null;
+  }
+}
+
+function getSourceCacheIdFromTurn(turn) {
+  const sourceKind = turn.dataset.sourceKind || "message";
+  if (sourceKind === "tool") {
+    const runId = turn.dataset.runId || "";
+    const toolCallId = turn.dataset.toolCallId || "";
+    return toolCallId ? `${runId}:${toolCallId}` : "";
+  }
+  return turn.dataset.messageId || "";
+}
+
+function getPreviewSourceState(turn) {
+  const previewKey = turn.dataset.previewKey || "";
+  if (!previewKey) return "idle";
+  const sourceKind = turn.dataset.sourceKind || "message";
+  const sourceId = getSourceCacheIdFromTurn(turn);
+  if (getCachedSource(sourceKind, sourceId)) return "loaded";
+  return S.previewSourceStateByKey.get(previewKey) ?? "idle";
+}
+
+function setPreviewSourceState(turn, state) {
+  const previewKey = turn.dataset.previewKey || "";
+  if (!previewKey) return;
+  if (state === "idle" || state === "loaded") {
+    S.previewSourceStateByKey.delete(previewKey);
+    return;
+  }
+  S.previewSourceStateByKey.set(previewKey, state);
+}
+
+async function copyTextToClipboard(text) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return true;
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  ta.style.pointerEvents = "none";
+  document.body.appendChild(ta);
+  ta.select();
+  try {
+    return document.execCommand("copy");
+  } finally {
+    ta.remove();
+  }
+}
+
+function triggerCopyWithFeedback(button, text) {
+  const defaultLabel = button.dataset.copyDefaultLabel || button.textContent || "Copy";
+  button.dataset.copyDefaultLabel = defaultLabel;
+  return copyTextToClipboard(text)
+    .then(() => {
+      button.textContent = "Copied";
+    })
+    .catch(() => {
+      button.textContent = "Copy failed";
+    })
+    .finally(() => {
+      button.disabled = true;
+      if (button._clawlensCopyTimer) clearTimeout(button._clawlensCopyTimer);
+      button._clawlensCopyTimer = setTimeout(() => {
+        button.textContent = defaultLabel;
+        button.disabled = false;
+        button._clawlensCopyTimer = null;
+      }, 1200);
+    });
+}
+
+function buildTurnCopyPayload(turn) {
+  const sourceKind = turn.dataset.sourceKind || "message";
+  const sourceId = getSourceCacheIdFromTurn(turn);
+  const cached = sourceId ? getCachedSource(sourceKind, sourceId) : null;
+  return buildTurnCopyPayloadFromData({
+    runId: turn.dataset.runId || "",
+    toolCallId: turn.dataset.toolCallId || "",
+    messageId: turn.dataset.messageId || "",
+    role: turn.dataset.role || turn.querySelector(".clawlens-turn-role")?.textContent?.trim() || "",
+    previewFormat: turn.dataset.previewFormat || "text-legacy",
+    preview: turn.dataset.preview || "",
+    sourceKind,
+  }, cached ? (cached.payload ?? cached) : null);
+}
+
+function buildRunCopyPayload(runId) {
+  const run = RENDERED_RUN_BY_ID.get(runId);
+  if (!run) return null;
+  return {
+    kind: "run",
+    runId: run.runId ?? "",
+    status: run.status ?? "",
+    runKind: run.runKind ?? "",
+    userPrompt: run.userPrompt ?? "",
+    summary: run.summary ?? {},
+    timeline: Array.isArray(run.timeline) ? run.timeline : [],
+    turns: Array.isArray(run.turns)
+      ? run.turns.map((turn, index) => {
+          const sourceKind = turn?.sourceKind || "message";
+          const sourceId = sourceKind === "tool"
+            ? `${run.runId || ""}:${turn?.toolCallId || ""}`
+            : (turn?.messageId || "");
+          const cached = sourceId ? getCachedSource(sourceKind, sourceId) : null;
+          return buildTurnCopyPayloadFromData({
+            runId: run.runId ?? "",
+            toolCallId: turn?.toolCallId ?? "",
+            messageId: turn?.messageId || `${run.runId || "run"}:${index}`,
+            role: turn?.role ?? "",
+            previewFormat: turn?.previewFormat || "text-legacy",
+            preview: turn?.preview ?? "",
+            sourceKind,
+          }, cached ? (cached.payload ?? cached) : null);
+        })
+      : [],
+  };
+}
+
+function buildTurnCopyPayloadFromData(turnData, cachedSource) {
+  if (turnData.sourceKind === "tool") {
+    return {
+      kind: "tool_turn",
+      runId: turnData.runId || "",
+      toolCallId: turnData.toolCallId || "",
+      previewFormat: turnData.previewFormat || "text-legacy",
+      preview: turnData.preview || "",
+      ...(cachedSource != null ? { source: cachedSource } : {}),
+    };
+  }
+  return {
+    kind: "turn",
+    runId: turnData.runId || "",
+    messageId: turnData.messageId || "",
+    role: turnData.role || "",
+    previewFormat: turnData.previewFormat || "text-legacy",
+    preview: turnData.preview || "",
+    sourceKind: turnData.sourceKind || "message",
+    ...(cachedSource != null ? { source: cachedSource } : {}),
+  };
 }
 function shortKey(key) {
   if (!key || key === "unknown") return "—";
@@ -573,6 +825,7 @@ function renderAuditPanel(data) {
     if (!visibleRunIds.has(runId)) LIVE_LLM_STREAM_BY_RUN.delete(runId);
   }
   return data.runs.map((run, i) => {
+    if (run?.runId) RENDERED_RUN_BY_ID.set(run.runId, run);
     const runDuration = getRunRenderDuration(run, now);
     const liveLlmSegment = getLiveLlmSegment(run, now)
       ?? (run?.status === "running" ? null : getPersistedLlmStreamSegment(run));
@@ -603,8 +856,12 @@ function renderAuditPanel(data) {
           <span><span class="clawlens-tl-legend-dot" style="background:var(--ok,#22c55e)"></span>Tool</span>
         </div>
         ${needsRunDetailFetch(run) ? renderDeferredTimelineHint() : renderTimeline(run.timeline, runDuration, run.status, liveLlmSegment, run.runId, hasUserMarker)}
-        <div class="clawlens-section-label" style="margin-top:8px">Turns</div>
-        <div class="clawlens-turns">${needsRunDetailFetch(run) ? renderDeferredTurnsHint(loadingRunIds?.has(run.runId)) : renderTurns(run.turns)}</div>
+        ${needsRunDetailFetch(run) ? "" : renderToolRows(run.timeline, run.runId)}
+        <div class="clawlens-turns-header" style="margin-top:8px">
+          <span class="clawlens-section-label">Turns</span>
+          ${needsRunDetailFetch(run) ? "" : `<button type="button" class="clawlens-turns-copy-btn" data-copy-run-id="${esc(run.runId)}" title="Copy run data">Copy</button>`}
+        </div>
+        <div class="clawlens-turns">${needsRunDetailFetch(run) ? renderDeferredTurnsHint(loadingRunIds?.has(run.runId)) : renderTurns(run.turns, run.runId)}</div>
       </div>
     </div>
   `;
@@ -795,7 +1052,7 @@ function renderTimeline(timeline, totalDuration, runStatus, liveLlmSegment, runI
     }).join("") + emptyHint + "</div></div>";
 }
 
-function renderTurns(turns) {
+function renderTurns(turns, runId) {
   debugLog("renderTurns", {
     hasTurns: Array.isArray(turns),
     turnCount: turns?.length ?? null,
@@ -804,23 +1061,101 @@ function renderTurns(turns) {
   if (!turns?.length) {
     return '<div style="color:var(--muted,#838387);font-size:11px;padding:4px 0">No turns captured for this run.</div>';
   }
-  return turns.map(t => {
+  return turns.map((t, index) => {
     const preview = t.preview ?? "";
+    const previewText = previewInlineText(t);
+    const previewKey = getPreviewKey(t, runId, index);
+    const title = t.previewFormat === "structured-json-v1" || previewText.length > 160 ? "" : ` title="${esc(previewText)}"`;
+    const sourceBtn = t.hasSourceLookup
+      ? `<button class="clawlens-turn-source-btn" type="button" title="Load full source">Source</button>`
+      : "";
+    const actionGroup = `<span class="clawlens-turn-actions">${sourceBtn}<button class="clawlens-turn-copy-btn" type="button" title="Copy turn data">Copy</button></span>`;
     return `
-    <div class="clawlens-turn" title="${esc(preview)}">
+    <div class="clawlens-turn" tabindex="0" data-preview-key="${esc(previewKey)}" data-preview-format="${esc(t.previewFormat || "text-legacy")}" data-preview="${esc(preview)}" data-run-id="${esc(runId || "")}" data-message-id="${esc(t.messageId || "")}" data-role="${esc(t.role || "")}" data-source-kind="message" data-has-source-lookup="${t.hasSourceLookup ? "1" : "0"}"${title}>
       <span class="clawlens-turn-role ${esc(t.role)}">${esc(t.role)}</span>
-      <span class="clawlens-turn-preview">${esc(preview)}</span>
+      <span class="clawlens-turn-preview">${esc(previewText)}</span>
+      ${actionGroup}
     </div>
   `}).join("");
+}
+
+function renderToolRows(timeline, runId) {
+  const tools = Array.isArray(timeline) ? timeline.filter((entry) => entry?.type === "tool_execution") : [];
+  if (!tools.length) return "";
+  return `
+    <div class="clawlens-section-label" style="margin-top:8px">Tools</div>
+    <div class="clawlens-tool-rows">
+      ${tools.map((tool, index) => {
+        const previewKey = `tool:${runId}:${tool.toolCallId || index}`;
+        const sourceBtn = tool.hasSourceLookup
+          ? `<button class="clawlens-turn-source-btn" type="button" title="Load tool source">Source</button>`
+          : "";
+        const actionGroup = `<span class="clawlens-turn-actions">${sourceBtn}<button class="clawlens-turn-copy-btn" type="button" title="Copy tool data">Copy</button></span>`;
+        return `
+          <div class="clawlens-tool-row clawlens-turn" tabindex="0" data-preview-key="${esc(previewKey)}" data-preview-format="${esc(tool.argsPreviewFormat || "text-legacy")}" data-preview="${esc(tool.argsPreview || "")}" data-run-id="${esc(runId || "")}" data-role="tool" data-tool-call-id="${esc(tool.toolCallId || "")}" data-source-kind="tool" data-has-source-lookup="${tool.hasSourceLookup ? "1" : "0"}">
+            <span class="clawlens-turn-role tool">${esc(tool.toolName || "tool")}</span>
+            <span class="clawlens-turn-preview">${esc(tool.toolName || "tool")} · ${esc(tool.toolCallId || "unknown")}</span>
+            ${actionGroup}
+          </div>
+        `;
+      }).join("")}
+    </div>
+  `;
 }
 
 function bindAuditPanelInteractions(root) {
   if (!root || root.dataset.clawlensAuditBound === "1") return;
   root.dataset.clawlensAuditBound = "1";
+  root.addEventListener("mouseover", (e) => {
+    const turn = e.target.closest(".clawlens-turn");
+    if (!turn || !root.contains(turn)) return;
+    if (S.previewPinnedKey != null) return;
+    schedulePreviewSurface(turn, false);
+  });
+  root.addEventListener("keydown", (e) => {
+    const turn = e.target.closest(".clawlens-turn");
+    if (!turn || !root.contains(turn)) return;
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      openPreviewSurface(turn, true);
+    }
+  });
   root.addEventListener("click", async (e) => {
+    const copyBtn = e.target.closest(".clawlens-turn-copy-btn");
+    if (copyBtn && root.contains(copyBtn)) {
+      e.preventDefault();
+      e.stopPropagation();
+      const turn = copyBtn.closest(".clawlens-turn");
+      if (!turn) return;
+      const payload = buildTurnCopyPayload(turn);
+      triggerCopyWithFeedback(copyBtn, JSON.stringify(payload, null, 2));
+      return;
+    }
+
+    const runsCopyBtn = e.target.closest(".clawlens-turns-copy-btn");
+    if (runsCopyBtn && root.contains(runsCopyBtn)) {
+      e.preventDefault();
+      e.stopPropagation();
+      const runId = runsCopyBtn.dataset.copyRunId;
+      const payload = buildRunCopyPayload(runId);
+      if (payload) triggerCopyWithFeedback(runsCopyBtn, JSON.stringify(payload, null, 2));
+      return;
+    }
+
+    const sourceBtn = e.target.closest(".clawlens-turn-source-btn");
+    if (sourceBtn && root.contains(sourceBtn)) {
+      e.preventDefault();
+      e.stopPropagation();
+      const turn = sourceBtn.closest(".clawlens-turn");
+      if (!turn) return;
+      openPreviewSurface(turn, true);
+      await loadSourceForTurn(turn);
+      return;
+    }
+
     const turn = e.target.closest(".clawlens-turn");
     if (turn && root.contains(turn)) {
-      turn.classList.toggle("expanded");
+      openPreviewSurface(turn, true);
       return;
     }
 
@@ -834,6 +1169,271 @@ function bindAuditPanelInteractions(root) {
       runEl?.classList.toggle("expanded");
     }
   });
+}
+
+function ensurePreviewSurface() {
+  let surface = document.getElementById("clawlens-preview-surface");
+  if (surface) return surface;
+  surface = document.createElement("div");
+  surface.id = "clawlens-preview-surface";
+  surface.className = "clawlens-preview-surface hidden";
+  surface.addEventListener("click", async (e) => {
+    const openBtn = e.target.closest("[data-preview-action='pin']");
+    if (openBtn) {
+      const turn = document.querySelector(`.clawlens-turn[data-preview-key="${CSS.escape(openBtn.dataset.previewKey || "")}"]`);
+      if (turn) openPreviewSurface(turn, true);
+      return;
+    }
+    const closeBtn = e.target.closest("[data-preview-action='close']");
+    if (closeBtn) {
+      S.previewPinnedKey = null;
+      hidePreviewSurface();
+      return;
+    }
+    const toggleBtn = e.target.closest("[data-preview-toggle]");
+    if (toggleBtn) {
+      const expandKey = toggleBtn.dataset.previewToggle;
+      if (PREVIEW_EXPANDED_KEYS.has(expandKey)) PREVIEW_EXPANDED_KEYS.delete(expandKey);
+      else PREVIEW_EXPANDED_KEYS.add(expandKey);
+      rerenderPreviewSurface();
+      return;
+    }
+    const sourceBtn = e.target.closest("[data-preview-action='load-source']");
+    if (sourceBtn) {
+      const previewKey = sourceBtn.dataset.previewKey;
+      const turn = document.querySelector(`.clawlens-turn[data-preview-key="${CSS.escape(previewKey || "")}"]`);
+      if (turn) await loadSourceForTurn(turn);
+    }
+  });
+  document.body.appendChild(surface);
+  document.addEventListener("click", (e) => {
+    if (!S.previewSurfaceKey) return;
+    const target = e.target;
+    if (!(target instanceof Element)) return;
+    if (target.closest(".clawlens-preview-surface") || target.closest(".clawlens-turn")) return;
+    S.previewPinnedKey = null;
+    hidePreviewSurface();
+  });
+  return surface;
+}
+
+function schedulePreviewSurface(turn, pinned) {
+  clearPreviewTimers();
+  S.previewHoverTimer = setTimeout(() => openPreviewSurface(turn, pinned), PREVIEW_HOVER_OPEN_MS);
+}
+
+function openPreviewSurface(turn, pinned) {
+  clearPreviewTimers();
+  const surface = ensurePreviewSurface();
+  const previewKey = turn.dataset.previewKey;
+  if (!previewKey) return;
+  if (pinned) {
+    const isNewTurn = S.previewPinnedKey !== previewKey;
+    S.previewPinnedKey = previewKey;
+    S.previewSurfaceKey = previewKey;
+    if (isNewTurn) {
+      setPreviewSourceState(turn, getPreviewSourceState(turn));
+    }
+  } else {
+    S.previewSurfaceKey = previewKey;
+  }
+  renderPreviewSurfaceContent(surface, turn);
+  positionPreviewSurface(surface, turn, !!pinned);
+  surface.classList.remove("hidden");
+}
+
+function hidePreviewSurface() {
+  clearPreviewTimers();
+  const surface = ensurePreviewSurface();
+  surface.classList.add("hidden");
+  surface.innerHTML = "";
+  S.previewSurfaceKey = null;
+}
+
+function rerenderPreviewSurface() {
+  if (!S.previewSurfaceKey) return;
+  const turn = document.querySelector(`.clawlens-turn[data-preview-key="${CSS.escape(S.previewSurfaceKey)}"]`);
+  if (!turn) return;
+  const surface = ensurePreviewSurface();
+  renderPreviewSurfaceContent(surface, turn);
+  positionPreviewSurface(surface, turn, S.previewPinnedKey === S.previewSurfaceKey);
+}
+
+function positionPreviewSurface(surface, turn, pinned) {
+  const rect = turn.getBoundingClientRect();
+  const width = pinned ? Math.min(560, window.innerWidth - 24) : Math.min(420, window.innerWidth - 24);
+  const left = Math.max(12, Math.min(rect.left, window.innerWidth - width - 12));
+  const topDesired = rect.bottom + 8;
+  const maxAllowedTop = window.innerHeight - (pinned ? 200 : 160) - 20;
+  const top = Math.max(12, Math.min(topDesired, maxAllowedTop));
+  const availableHeight = window.innerHeight - top - 20;
+  const maxHeight = Math.min(availableHeight, pinned ? 640 : 420);
+  surface.style.left = `${left}px`;
+  surface.style.top = `${top}px`;
+  surface.style.width = `${width}px`;
+  surface.style.minWidth = `${width}px`;
+  surface.style.maxWidth = `${width}px`;
+  surface.style.maxHeight = `${Math.max(120, maxHeight)}px`;
+}
+
+function renderPreviewSurfaceContent(surface, turn) {
+  const pinned = S.previewPinnedKey === turn.dataset.previewKey;
+  const preview = turn.dataset.preview || "";
+  const previewFormat = turn.dataset.previewFormat || "text-legacy";
+  const messageId = turn.dataset.messageId || "";
+  const sourceKind = turn.dataset.sourceKind || "message";
+  const toolCallId = turn.dataset.toolCallId || "";
+  const runId = turn.dataset.runId || "";
+  const previewKey = turn.dataset.previewKey || "";
+  const node = previewFormat === "structured-json-v1" ? parseStructuredPreviewEnvelope(preview) : null;
+  const content = node
+    ? renderStructuredPreviewNode(node, previewKey, pinned, "root")
+    : `<div class="clawlens-preview-plain">${esc(preview)}</div>`;
+  const sourceHtml = renderSourceSection({
+    previewKey,
+    messageId,
+    sourceKind,
+    toolCallId,
+    runId,
+    pinned,
+    hasSourceLookup: turn.dataset.hasSourceLookup === "1",
+  });
+  surface.className = `clawlens-preview-surface${pinned ? " pinned" : ""}`;
+  surface.innerHTML = `
+    <div class="clawlens-preview-header">
+      <div class="clawlens-preview-title">${esc(turn.querySelector(".clawlens-turn-role")?.textContent || "preview")}</div>
+      <div class="clawlens-preview-actions">
+        ${pinned ? `<button type="button" class="clawlens-preview-action" data-preview-action="close">Close</button>` : `<button type="button" class="clawlens-preview-action" data-preview-action="pin" data-preview-key="${esc(previewKey)}">Open details</button>`}
+      </div>
+    </div>
+    <div class="clawlens-preview-body">${content}</div>
+    ${sourceHtml}
+  `;
+}
+
+function renderStructuredPreviewNode(node, previewKey, interactive, pathKey) {
+  if (!node || typeof node !== "object") return '<div class="clawlens-preview-leaf">invalid preview</div>';
+  if (node.kind === "object") {
+    const entries = node.entries || [];
+    return `<div class="clawlens-preview-tree">${entries.map((entry, index) => renderStructuredPreviewEntry(entry, previewKey, interactive, `${pathKey}.entry${index}`)).join("")}${renderNodeMeta(node)}</div>`;
+  }
+  if (node.kind === "array") {
+    const items = node.items || [];
+    return `<div class="clawlens-preview-tree">${items.map((item, index) => renderStructuredPreviewItem(index, item, previewKey, interactive, `${pathKey}.item${index}`)).join("")}${renderNodeMeta(node)}</div>`;
+  }
+  return `<div class="clawlens-preview-leaf">${esc(renderLeafValue(node))}${renderLeafMeta(node)}</div>`;
+}
+
+function renderStructuredPreviewEntry(entry, previewKey, interactive, pathKey) {
+  return `<div class="clawlens-preview-row"><div class="clawlens-preview-label">${esc(entry.key)}</div><div class="clawlens-preview-value">${renderStructuredPreviewValue(entry.value, previewKey, interactive, pathKey)}</div></div>`;
+}
+
+function renderStructuredPreviewItem(index, item, previewKey, interactive, pathKey) {
+  return `<div class="clawlens-preview-row"><div class="clawlens-preview-label">[${index}]</div><div class="clawlens-preview-value">${renderStructuredPreviewValue(item, previewKey, interactive, pathKey)}</div></div>`;
+}
+
+function renderStructuredPreviewValue(node, previewKey, interactive, pathKey) {
+  const expandable = node && typeof node === "object" && (node.kind === "object" || node.kind === "array");
+  const defaultCollapsed = expandable && pathKey !== "root";
+  const expandedKey = `${previewKey}:${pathKey}`;
+  const isExpanded = PREVIEW_EXPANDED_KEYS.has(expandedKey) || (!defaultCollapsed && interactive);
+  if (expandable) {
+    if (!interactive && defaultCollapsed) {
+      return `<div class="clawlens-preview-summary">${esc(structuredNodeToInlineText(node).slice(0, 160) || `[${node.kind}]`)}</div>`;
+    }
+    const toggle = interactive
+      ? `<button type="button" class="clawlens-preview-toggle" data-preview-toggle="${esc(expandedKey)}">${isExpanded ? "−" : "+"}</button>`
+      : "";
+    const body = isExpanded ? renderStructuredPreviewNode(node, previewKey, interactive, pathKey) : `<div class="clawlens-preview-summary">${esc(structuredNodeToInlineText(node).slice(0, 160) || `[${node.kind}]`)}</div>`;
+    return `<div class="clawlens-preview-nested">${toggle}${body}</div>`;
+  }
+  return `<div class="clawlens-preview-leaf">${esc(renderLeafValue(node))}${renderLeafMeta(node)}</div>`;
+}
+
+function renderLeafValue(node) {
+  if (!node || typeof node !== "object") return String(node ?? "");
+  if (node.kind === "string") return node.value ?? node.preview ?? "";
+  if (node.kind === "number" || node.kind === "boolean") return String(node.value ?? "");
+  if (node.kind === "null") return "null";
+  if (node.kind === "undefined") return "undefined";
+  if (node.kind === "redacted") return "[redacted]";
+  if (node.kind === "circular_reference") return "[circular reference]";
+  if (node.kind === "depth_truncated") return `[depth truncated at ${node.maxDepth}]`;
+  if (node.kind === "max_bytes_truncated") return `[max bytes truncated]`;
+  return node.kind || "value";
+}
+
+function renderLeafMeta(node) {
+  if (!node || typeof node !== "object") return "";
+  const bits = [];
+  if (node.truncated) bits.push("truncated");
+  if (typeof node.length === "number") bits.push(`length ${node.length}`);
+  return bits.length ? `<span class="clawlens-preview-meta">${esc(bits.join(" · "))}</span>` : "";
+}
+
+function renderNodeMeta(node) {
+  if (!node || typeof node !== "object") return "";
+  const bits = [];
+  if (typeof node.omittedItems === "number" && node.omittedItems > 0) bits.push(`omitted items ${node.omittedItems}`);
+  if (typeof node.omittedEntries === "number" && node.omittedEntries > 0) bits.push(`omitted entries ${node.omittedEntries}`);
+  return bits.length ? `<div class="clawlens-preview-meta block">${esc(bits.join(" · "))}</div>` : "";
+}
+
+function renderSourceSection({ previewKey, messageId, sourceKind, toolCallId, runId, pinned, hasSourceLookup }) {
+  if (!pinned) return "";
+  if (!hasSourceLookup) {
+    return `<div class="clawlens-preview-source"><div class="clawlens-preview-source-title">Source</div><div class="clawlens-preview-source-note">Full source unavailable.</div></div>`;
+  }
+  const sourceId = sourceKind === "tool" ? `${runId}:${toolCallId}` : messageId;
+  const cached = sourceId ? getCachedSource(sourceKind, sourceId) : null;
+  const state = cached ? "loaded" : (S.previewSourceStateByKey.get(previewKey) ?? "idle");
+  let sourceBody;
+  if (state === "loading") {
+    sourceBody = `<div class="clawlens-preview-source-note">Loading source…</div>`;
+  } else if (state === "loaded" || state === "error") {
+    sourceBody = cached
+      ? renderSourcePayload(cached)
+      : `<div class="clawlens-preview-source-note">Source unavailable.</div>`;
+  } else {
+    sourceBody = `<button type="button" class="clawlens-preview-source-action" data-preview-action="load-source" data-preview-key="${esc(previewKey)}">Load full source</button>`;
+  }
+  return `<div class="clawlens-preview-source"><div class="clawlens-preview-source-title">Source</div>${sourceBody}</div>`;
+}
+
+function renderSourcePayload(payload) {
+  if (!payload) return "";
+  if (payload.ok === false) {
+    return `<div class="clawlens-preview-source-note">${esc(payload.miss || payload.error || "source unavailable")}</div>`;
+  }
+  return `<pre class="clawlens-preview-source-payload">${esc(JSON.stringify(payload.payload ?? payload, null, 2))}</pre>`;
+}
+
+async function loadSourceForTurn(turn) {
+  const messageId = turn.dataset.messageId || "";
+  const sourceKind = turn.dataset.sourceKind || "message";
+  const toolCallId = turn.dataset.toolCallId || "";
+  const runId = turn.dataset.runId || "";
+  const cacheId = sourceKind === "tool" ? `${runId}:${toolCallId}` : messageId;
+  if (!cacheId) return;
+  const cached = getCachedSource(sourceKind, cacheId);
+  if (cached) {
+    setPreviewSourceState(turn, "loaded");
+    if (S.previewSurfaceKey === turn.dataset.previewKey) rerenderPreviewSurface();
+    return;
+  }
+  setPreviewSourceState(turn, "loading");
+  if (S.previewSurfaceKey === turn.dataset.previewKey) rerenderPreviewSurface();
+  const data = sourceKind === "tool"
+    ? await apiFetch(`/audit/source/tool/${encodeURIComponent(runId)}/${encodeURIComponent(toolCallId)}`)
+    : await apiFetch("/audit/source/message/" + encodeURIComponent(messageId));
+  if (data) {
+    setCachedSource(sourceKind, cacheId, data);
+    setPreviewSourceState(turn, "loaded");
+  } else {
+    setCachedSource(sourceKind, cacheId, { ok: false, error: "request_failed" });
+    setPreviewSourceState(turn, "error");
+  }
+  if (S.previewSurfaceKey === turn.dataset.previewKey) rerenderPreviewSurface();
 }
 
 function renderAuditEmptyState(sessionKey, resolvedFrom) {

@@ -6,6 +6,9 @@ export type ClawLensConfig = {
     debugLogs?: boolean;
     loggerImportDir?: string;
     loggerImportMaxFileSizeMb?: number;
+    structuredPreviews?: boolean;
+    sourceLookupDirs?: string[];
+    sourceLookupEnabled?: boolean;
     backfillRunKindsOnStart?: boolean;
     backfillRunKindsLimit?: number;
     // ROLLBACK_INDEX: CLAWLENS_TRANSCRIPT_BINDING_STRATEGY -> docs/CLAWLENS_TRANSCRIPT_BINDING_ROLLBACK_PLAYBOOK.md

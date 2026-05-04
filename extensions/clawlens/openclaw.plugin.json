@@ -13,10 +13,20 @@
           "snapshotIntervalMs":      { "type": "number" },
           "retentionDays":           { "type": "number" },
           "debugLogs":               { "type": "boolean" },
+          "structuredPreviews":      { "type": "boolean" },
+          "sourceLookupEnabled":     { "type": "boolean" },
+          "sourceLookupDirs":        {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          },
           "loggerImportDir":         { "type": "string", "minLength": 1 },
           "loggerImportMaxFileSizeMb": { "type": "number", "exclusiveMinimum": 0 },
           "backfillRunKindsOnStart": { "type": "boolean" },
-          "backfillRunKindsLimit":   { "type": "number", "exclusiveMinimum": 0 }
+          "backfillRunKindsLimit":   { "type": "number", "exclusiveMinimum": 0 },
+          "transcriptBindingStrategy": {
+            "type": "string",
+            "enum": ["legacy_recent_window", "safe_message_anchor"]
+          }
         }
       },
       "compare": {
