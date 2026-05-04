@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
+import fs from "node:fs";
 import process from "node:process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { withSessionLock } from "./tmux-session-lock.mjs";
 
@@ -32,7 +33,9 @@ Commands:
   status                       print the current Gemini pane state
   clear                        send /clear and wait for a fresh prompt
   send                         send a message and wait for response
+  send-file                    paste a file and wait for response
   type                         type a message without submitting it
+  type-file                    paste a file without submitting it
   submit                       press Enter and wait for response
 
 Options:
@@ -43,6 +46,8 @@ Options:
   --settle-ms <n>              extra wait after submit before polling (default: 500)
   --stable-polls <n>           consecutive identical idle polls required (default: 3)
   --message <text>             message text for send/type commands
+  --file <path>                UTF-8 text file for send-file/type-file commands
+  --clear-first                run /clear before sending input
   --no-wait                    send without waiting for a response
   --json                       emit machine-readable JSON
   --include-pane-text          include raw pane snapshots in JSON output
@@ -51,7 +56,9 @@ Options:
 Examples:
   node scripts/gemini-tmux-control.mjs status --session gemini1
   node scripts/gemini-tmux-control.mjs send --session gemini1 --message "Hello Gemini"
+  node scripts/gemini-tmux-control.mjs send-file --session gemini1 --file /tmp/review.txt
   node scripts/gemini-tmux-control.mjs type --session gemini1 --message "Hello Gemini"
+  node scripts/gemini-tmux-control.mjs type-file --session gemini1 --file /tmp/review.txt
   node scripts/gemini-tmux-control.mjs submit --session gemini1
 `);
 }
@@ -74,6 +81,8 @@ function parseArgs(argv) {
     if (arg === "--settle-ms") { options.settleMs = Number(argv[++i]); continue; }
     if (arg === "--stable-polls") { options.stablePolls = Number(argv[++i]); continue; }
     if (arg === "--message") { options.message = argv[++i] ?? ""; continue; }
+    if (arg === "--file") { options.file = argv[++i] ?? ""; continue; }
+    if (arg === "--clear-first") { options.clearFirst = true; continue; }
     if (arg === "--no-wait") { options.waitForResponse = false; continue; }
     if (arg === "--json") { options.json = true; continue; }
     if (arg === "--include-pane-text") { options.includePaneText = true; continue; }
@@ -81,7 +90,7 @@ function parseArgs(argv) {
     throw new Error(`Unknown argument: ${arg}`);
   }
 
-  const validCommands = ["status", "clear", "send", "type", "submit"];
+  const validCommands = ["status", "clear", "send", "send-file", "type", "type-file", "submit"];
   if (!validCommands.includes(command)) {
     throw new Error(`Unknown command: ${command}`);
   }
@@ -98,6 +107,9 @@ function parseArgs(argv) {
   }
   if ((command === "send" || command === "type") && !options.message) {
     throw new Error("--message is required for send/type command");
+  }
+  if ((command === "send-file" || command === "type-file") && !options.file) {
+    throw new Error("--file is required for send-file/type-file command");
   }
 
   return { command, options };
@@ -131,6 +143,28 @@ function capturePane(target, bufferLines) {
   return run("tmux", ["capture-pane", "-pt", target, "-S", `-${bufferLines}`]);
 }
 
+function readUtf8File(filePath) {
+  if (!filePath) {
+    throw new Error("File path must be non-empty");
+  }
+
+  const resolved = fs.realpathSync(filePath);
+  const text = fs.readFileSync(resolved, "utf8");
+  return { path: resolved, text };
+}
+
+function pasteFileToPane(target, filePath) {
+  const bufferName = `gemini-tmux-control-${process.pid}-${randomUUID()}`;
+  try {
+    run("tmux", ["load-buffer", "-b", bufferName, filePath]);
+    run("tmux", ["paste-buffer", "-p", "-b", bufferName, "-t", target]);
+  } finally {
+    try {
+      run("tmux", ["delete-buffer", "-b", bufferName]);
+    } catch {}
+  }
+}
+
 export function stripAnsi(text) {
   return text
     .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "")
@@ -157,12 +191,16 @@ function isGeminiStopTailNoiseLine(line) {
   const trimmed = line.trim();
   if (trimmed === "") return true;
   if (trimmed === "? for shortcuts") return true;
+  if (trimmed.startsWith("Executing Hook:")) return true;
+  if (trimmed.startsWith("plan ")) return true;
   if (trimmed.startsWith("Shift+Tab to accept edits")) return true;
   if (trimmed.startsWith("workspace (/directory)")) return true;
   if (trimmed.includes("Auto (Gemini 3)") || trimmed.includes("Gemini Code")) return true;
-  if (trimmed.startsWith(">")) return true;
+  if (trimmed.startsWith(">") || trimmed.startsWith("›")) return true;
+  if (trimmed.startsWith("/") || trimmed.startsWith("~") || trimmed.startsWith("./") || trimmed.startsWith("../")) return true;
   if (/^[▀▄]+$/.test(trimmed)) return true;
   if (/^[─]+$/.test(trimmed)) return true;
+  if (trimmed.includes("branch") && trimmed.includes("sandbox")) return true;
   return false;
 }
 
@@ -179,35 +217,26 @@ function isGeminiRestartLine(line) {
 export function parseStopState(text) {
   const clean = stripAnsi(text);
   const lines = clean.split(/\r?\n/);
-  let stopLineIndex = -1;
-  let stopAt = null;
-  let raw = null;
 
-  for (let i = lines.length - 1; i >= 0; i -= 1) {
+  for (let i = lines.length - 1; i >= Math.max(0, lines.length - 20); i -= 1) {
     const line = lines[i];
-    const trimmed = line.trim();
-    if (trimmed === "") continue;
     if (isGeminiStopTailNoiseLine(line)) continue;
 
-    const match = line.match(/^\s*Stop says:\s*\[done\s+([^\]]+)\]\s*$/i);
+    const trimmed = line.trim();
+    const match = trimmed.match(/^(?:ℹ\s+)?Stop says:\s*\[done\s+([^\]]+)\](?:\s+\[[^\]]+\])?\s*$/i);
     if (match) {
-      stopLineIndex = i;
-      stopAt = match[1].trim();
-      raw = trimmed;
+      return {
+        stopSeen: true,
+        stopAt: match[1].trim(),
+        stopLineIndex: i,
+        raw: trimmed,
+      };
     }
+
     break;
   }
 
-  if (stopLineIndex < 0) {
-    return { stopSeen: false, stopAt: null, stopLineIndex: -1, raw: null };
-  }
-
-  return {
-    stopSeen: true,
-    stopAt,
-    stopLineIndex,
-    raw,
-  };
+  return { stopSeen: false, stopAt: null, stopLineIndex: -1, raw: null };
 }
 
 export function parseRestartState(text) {
@@ -300,8 +329,11 @@ export function parseFooterState(text) {
 function isGeminiNoiseLine(line) {
   const trimmed = line.trim();
   if (trimmed === "") return false;
+  if (trimmed.startsWith("ℹ Stop says:")) return true;
   if (trimmed.includes("Type your message or @path/to/file")) return true;
   if (trimmed === "? for shortcuts") return true;
+  if (trimmed.startsWith("Executing Hook:")) return true;
+  if (trimmed.startsWith("plan ")) return true;
   if (trimmed.startsWith("Shift+Tab to accept edits")) return true;
   if (trimmed.startsWith("workspace (/directory)")) return true;
   if (trimmed.includes("Auto (Gemini 3)") || trimmed.includes("Gemini Code")) return true;
@@ -371,6 +403,26 @@ function findGeminiInputBlock(lines, sentMessage) {
   }
 
   return null;
+}
+
+async function clearTarget(target, options) {
+  const baseline = await waitForReady(target, options);
+
+  run("tmux", ["send-keys", "-l", "-t", target, "/clear"]);
+  await sleep(200);
+  run("tmux", ["send-keys", "-t", target, "Enter"]);
+  await sleep(options.settleMs);
+
+  const deadline = Date.now() + options.timeoutMs;
+  while (Date.now() <= deadline) {
+    const text = capturePane(target, options.bufferLines);
+    if (!isBusy(text) && isPromptReady(text)) {
+      return { target, baseline, output: text, becameBusy: true };
+    }
+    await sleep(options.pollMs);
+  }
+
+  throw new Error("Timed out waiting for Gemini to finish /clear");
 }
 
 export function extractResponseMeta(baselineRaw, finalRaw, sentMessage) {
@@ -495,9 +547,66 @@ async function sendMessage(session, options, message) {
   const readyOptions = options.waitForResponse === false
     ? { ...options, timeoutMs: Math.min(options.timeoutMs, 2_000) }
     : options;
-  const baseline = await waitForReady(target, readyOptions);
+  const baseline = options.clearFirst
+    ? (await clearTarget(target, options)).output
+    : await waitForReady(target, readyOptions);
 
   run("tmux", ["send-keys", "-l", "-t", target, message]);
+  await sleep(250);
+  run("tmux", ["send-keys", "-t", target, "Enter"]);
+  await sleep(options.waitForResponse === false ? Math.min(options.settleMs, 200) : options.settleMs);
+
+  if (options.waitForResponse === false) {
+    const finalText = capturePane(target, options.bufferLines);
+    return { target, baseline, output: finalText, becameBusy: false, waitForResponse: false };
+  }
+
+  const busyDeadline = Date.now() + 10_000;
+  let becameBusy = false;
+  while (Date.now() <= busyDeadline) {
+    const text = capturePane(target, options.bufferLines);
+    if (isBusy(text)) {
+      becameBusy = true;
+      break;
+    }
+    await sleep(options.pollMs);
+  }
+
+  if (becameBusy) {
+    const deadline = Date.now() + options.timeoutMs;
+    let lastIdleText = null;
+    let stableCount = 0;
+    while (Date.now() <= deadline) {
+      const text = capturePane(target, options.bufferLines);
+      if (!isBusy(text)) {
+        stableCount = nextStableCount(lastIdleText, text, stableCount);
+        lastIdleText = text;
+        if (isPromptReady(text) || stableCount >= options.stablePolls) {
+          return { target, baseline, output: text, becameBusy: true };
+        }
+      } else {
+        lastIdleText = null;
+        stableCount = 0;
+      }
+      await sleep(options.pollMs);
+    }
+    throw new Error("Timed out waiting for Gemini to finish responding");
+  }
+
+  const finalText = capturePane(target, options.bufferLines);
+  return { target, baseline, output: finalText, becameBusy: false };
+}
+
+async function sendFile(session, options, filePath) {
+  const target = currentPaneTarget(session);
+  const readyOptions = options.waitForResponse === false
+    ? { ...options, timeoutMs: Math.min(options.timeoutMs, 2_000) }
+    : options;
+  const baseline = options.clearFirst
+    ? (await clearTarget(target, options)).output
+    : await waitForReady(target, readyOptions);
+
+  pasteFileToPane(target, filePath);
   await sleep(250);
   run("tmux", ["send-keys", "-t", target, "Enter"]);
   await sleep(options.waitForResponse === false ? Math.min(options.settleMs, 200) : options.settleMs);
@@ -554,6 +663,17 @@ async function typeMessage(session, options, message) {
   return { target, baseline, output: finalText, becameBusy: false };
 }
 
+async function typeFile(session, options, filePath) {
+  const target = currentPaneTarget(session);
+  const baseline = await waitForReady(target, options);
+
+  pasteFileToPane(target, filePath);
+  await sleep(250);
+
+  const finalText = capturePane(target, options.bufferLines);
+  return { target, baseline, output: finalText, becameBusy: false };
+}
+
 async function submitMessage(session, options) {
   const target = currentPaneTarget(session);
   const baseline = await waitForReady(target, options);
@@ -599,23 +719,7 @@ async function submitMessage(session, options) {
 
 async function clearConversation(session, options) {
   const target = currentPaneTarget(session);
-  const baseline = await waitForReady(target, options);
-
-  run("tmux", ["send-keys", "-l", "-t", target, "/clear"]);
-  await sleep(200);
-  run("tmux", ["send-keys", "-t", target, "Enter"]);
-  await sleep(options.settleMs);
-
-  const deadline = Date.now() + options.timeoutMs;
-  while (Date.now() <= deadline) {
-    const text = capturePane(target, options.bufferLines);
-    if (!isBusy(text) && isPromptReady(text)) {
-      return { target, baseline, output: text, becameBusy: true };
-    }
-    await sleep(options.pollMs);
-  }
-
-  throw new Error("Timed out waiting for Gemini to finish /clear");
+  return clearTarget(target, options);
 }
 
 function outputResult(result, asJson) {
@@ -660,6 +764,17 @@ function outputResult(result, asJson) {
     return;
   }
 
+  if (result.action === "type-file") {
+    console.log(`Action:        ${result.action}`);
+    console.log(`Session:       ${result.session}`);
+    console.log(`Target pane:   ${result.target}`);
+    console.log(`File:          ${result.file}`);
+    console.log(`Captured:      ${result.capturedChars}`);
+    console.log(`--- input ---`);
+    console.log(result.output);
+    return;
+  }
+
   if (result.action === "submit") {
     console.log(`Action:        ${result.action}`);
     console.log(`Session:       ${result.session}`);
@@ -674,12 +789,17 @@ function outputResult(result, asJson) {
   console.log(`Action:        ${result.action}`);
   console.log(`Session:       ${result.session}`);
   console.log(`Target pane:   ${result.target}`);
-  console.log(`Message:       ${result.message}`);
+  if (result.message) {
+    console.log(`Message:       ${result.message}`);
+  }
+  if (result.file) {
+    console.log(`File:          ${result.file}`);
+  }
   console.log(`Became busy:   ${result.becameBusy}`);
   console.log(`Method:        ${formatHumanMethodLabel(result.responseMeta?.method)}`);
   console.log(`Captured:      ${result.capturedChars}`);
   console.log(`--- response ---`);
-  console.log(result.output);
+  console.log(result.response ?? result.output);
 }
 
 async function main() {
@@ -751,6 +871,41 @@ async function main() {
     return;
   }
 
+  if (command === "send-file") {
+    const input = readUtf8File(options.file);
+    const result = await withSessionLock(
+      options.session,
+      async () => sendFile(options.session, options, input.path),
+      options.timeoutMs + 10_000,
+    );
+    const widenedOutput = capturePane(result.target, Math.max(options.bufferLines * 4, 600));
+    const responseMeta = refineResponseMetaWithWiderCapture(
+      result.baseline ?? "",
+      result.output,
+      widenedOutput,
+      input.text,
+    );
+    if (responseMeta.method !== "tail_fallback") {
+      result.output = widenedOutput;
+    }
+    const payload = {
+      action: "send-file",
+      session: options.session,
+      file: input.path,
+      waitForResponse: options.waitForResponse !== false,
+      response: responseMeta.text,
+      responseMeta,
+      ...paneDiagnostics(result.output ?? ""),
+      ...result,
+    };
+    if (options.json && !options.includePaneText) {
+      delete payload.baseline;
+      delete payload.output;
+    }
+    outputResult(payload, options.json);
+    return;
+  }
+
   if (command === "type") {
     const result = await withSessionLock(
       options.session,
@@ -761,6 +916,28 @@ async function main() {
       action: "type",
       session: options.session,
       message: options.message,
+      ...paneDiagnostics(result.output ?? ""),
+      ...result,
+    };
+    if (options.json && !options.includePaneText) {
+      delete payload.baseline;
+      delete payload.output;
+    }
+    outputResult(payload, options.json);
+    return;
+  }
+
+  if (command === "type-file") {
+    const input = readUtf8File(options.file);
+    const result = await withSessionLock(
+      options.session,
+      async () => typeFile(options.session, options, input.path),
+      options.timeoutMs + 10_000,
+    );
+    const payload = {
+      action: "type-file",
+      session: options.session,
+      file: input.path,
       ...paneDiagnostics(result.output ?? ""),
       ...result,
     };

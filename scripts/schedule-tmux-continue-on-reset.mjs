@@ -13,6 +13,7 @@ function usage() {
 
 Options:
   --session <name>          tmux session name (default: cc1)
+  --cli-type <claude|codex> CLI type for quota probe (default: auto-detect from session name)
   --buffer-lines <n>        capture last N pane lines (default: 120)
   --offset-minutes <n>      send continue N minutes after reset (default: 1)
   --dry-run                 parse and print target time without scheduling
@@ -24,6 +25,7 @@ Options:
 function parseArgs(argv) {
   const options = {
     session: "cc1",
+    cliType: null,
     bufferLines: 120,
     offsetMinutes: 1,
     dryRun: false,
@@ -34,6 +36,10 @@ function parseArgs(argv) {
     const arg = argv[i];
     if (arg === "--session") {
       options.session = argv[++i] ?? "";
+      continue;
+    }
+    if (arg === "--cli-type") {
+      options.cliType = argv[++i] ?? "";
       continue;
     }
     if (arg === "--buffer-lines") {
@@ -69,6 +75,18 @@ function parseArgs(argv) {
     throw new Error("--offset-minutes must be >= 0");
   }
 
+  // Auto-detect cli type from session name
+  if (!options.cliType) {
+    if (/codex/i.test(options.session)) {
+      options.cliType = "codex";
+    } else {
+      options.cliType = "claude";
+    }
+  }
+  if (options.cliType !== "claude" && options.cliType !== "codex") {
+    throw new Error("--cli-type must be 'claude' or 'codex'");
+  }
+
   return options;
 }
 
@@ -101,12 +119,21 @@ function parseRelativeDuration(text) {
 }
 
 export function extractResetSpec(text) {
+  // Codex wraps "...try again\nat H:MM PM." across terminal lines — join first
+  const joined = text.replace(/\r?\n/g, " ");
+  if (/hit your usage limit/i.test(joined)) {
+    const m = joined.match(/try again at\s+(\d{1,2}:\d{2}\s*[AP]M)/i);
+    if (m) {
+      return [{ kind: "absolute", resetText: m[1].trim(), timezone: null, sourceLine: "You've hit your usage limit" }];
+    }
+  }
+
   const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   const candidates = [];
 
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
-    if (!/limit reached|hit your limit|0% left/i.test(line) && !/resets/i.test(line)) {
+    if (!/limit reached|hit your limit/i.test(line) && !/resets/i.test(line)) {
       continue;
     }
 
@@ -135,6 +162,48 @@ export function extractResetSpec(text) {
   }
 
   return candidates.length > 0 ? candidates : null;
+}
+
+// Parse /usage TUI overlay output from Claude Code.
+// Returns { percentLeft, spec } or null.
+export function parseClaudeUsage(text) {
+  const idx = text.lastIndexOf("Current session");
+  if (idx === -1) return null;
+  const block = text.slice(idx);
+
+  let percentLeft;
+  const percentMatch = block.match(/(\d+)%\s+used/);
+  if (percentMatch) {
+    percentLeft = 100 - Number(percentMatch[1]);
+  } else if (/limit reached/i.test(block)) {
+    percentLeft = 0;
+  } else {
+    return null;
+  }
+
+  const resetsMatch = block.match(/Resets\s+(.+)/);
+  if (!resetsMatch) return null;
+  const resetText = resetsMatch[1].trim();
+
+  const tzMatch = resetText.match(/^(.+?)\s*\(([^)]+)\)\s*$/);
+  const resetTimeText = tzMatch ? tzMatch[1].trim() : resetText;
+  const timezone = tzMatch ? tzMatch[2].trim() : null;
+
+  return {
+    percentLeft,
+    spec: { kind: "absolute", resetText: resetTimeText, timezone, sourceLine: `Claude /usage: ${resetText}` },
+  };
+}
+
+// Parse /status output from Codex.
+// Returns { percentLeft, spec } or null.
+export function parseCodexStatus(text) {
+  const m = text.match(/5h\s+limit:.*?(\d+)%\s+left\s+\(resets\s+([^)]+)\)/i);
+  if (!m) return null;
+  return {
+    percentLeft: Number(m[1]),
+    spec: { kind: "absolute", resetText: m[2].trim(), timezone: null, sourceLine: `Codex /status: resets ${m[2]}` },
+  };
 }
 
 function dateInTimezone(format, timezone, dateExpr = "now") {
@@ -180,6 +249,37 @@ function sanitizeName(value) {
   return value.replace(/[^A-Za-z0-9_.-]+/g, "_");
 }
 
+// Send /usage or /status to the pane and return parsed quota result.
+// Returns { percentLeft, spec } on success, or { skipped: reason } if not attempted.
+// Only called when an interruption signal is already detected in the pane.
+export function probeQuota(paneId, cliType, captureLines = 120) {
+  const command = cliType === "codex" ? "/status" : "/usage";
+
+  // Send command and Enter as separate send-keys calls
+  run("tmux", ["send-keys", "-t", paneId, command, ""]);
+  spawnSync("sleep", ["0.1"]);
+  run("tmux", ["send-keys", "-t", paneId, "Enter", ""]);
+
+  // Poll for parseable output (up to 10s)
+  const deadline = Date.now() + 10_000;
+  let result = null;
+  while (Date.now() < deadline) {
+    spawnSync("sleep", ["0.5"]);
+    const text = run("tmux", ["capture-pane", "-pt", paneId, "-S", `-${captureLines}`]);
+    result = cliType === "codex" ? parseCodexStatus(text) : parseClaudeUsage(text);
+    if (result) break;
+  }
+
+  // Dismiss Claude Code /usage TUI overlay
+  if (cliType === "claude") {
+    spawnSync("sleep", ["0.3"]);
+    run("tmux", ["send-keys", "-t", paneId, "Escape", ""]);
+    spawnSync("sleep", ["0.2"]);
+  }
+
+  return result ?? { skipped: "parse-failed" };
+}
+
 function makeRunnerScript({ session, delaySeconds, logPath, metadataPath, runnerPath, lockHelperPath }) {
   return `#!/usr/bin/env bash
 set -euo pipefail
@@ -219,7 +319,11 @@ function isBusy(text) {
 }
 
 function isPromptReady(text) {
-  return /Type your message or @path\\/to\\/file|^\\s*>\\s*$/m.test(text);
+  return /Type your message or @path\\/to\\/file|^\\s*[>›]\\s*$/m.test(text);
+}
+
+function hasStackedInput(text) {
+  return /^\\s*[>›]\\s+\\S/m.test(text);
 }
 
 try {
@@ -238,11 +342,27 @@ try {
       return;
     }
     if (!isPromptReady(paneText)) {
-      log("prompt not ready, skipped continue");
-      return;
+      if (hasStackedInput(paneText)) {
+        log("stacked input detected, sending C-c to clear");
+        run("tmux", ["send-keys", "-t", pane, "C-c", ""]);
+        spawnSync("sleep", ["0.8"]);
+        const freshPane = run("tmux", ["capture-pane", "-pt", pane, "-S", "-30"]);
+        if (!isPromptReady(freshPane)) {
+          log("prompt not clean after clearing stacked input, skipped");
+          return;
+        }
+      } else {
+        log("prompt not ready, skipped continue");
+        return;
+      }
     }
-    run("tmux", ["send-keys", "-t", pane, "continue", "Enter"]);
-    log("sent continue");
+    // Send "continue" text, then Enter twice (second Enter triggers task resume)
+    run("tmux", ["send-keys", "-t", pane, "continue", ""]);
+    spawnSync("sleep", ["0.1"]);
+    run("tmux", ["send-keys", "-t", pane, "Enter", ""]);
+    spawnSync("sleep", ["0.3"]);
+    run("tmux", ["send-keys", "-t", pane, "Enter", ""]);
+    log("sent continue (2x Enter)");
   }, 30_000);
 } catch (error) {
   log("runner failed: " + (error instanceof Error ? error.message : String(error)));
@@ -259,9 +379,11 @@ NODE
 `;
 }
 
+// Detect whether the pane shows a task-interruption signal from quota exhaustion.
+// Does NOT treat "0% left" as an interruption signal (that can appear from /status output).
 export function analyzePane(text) {
+  const waitingForReset = /limit reached|hit your limit|hit your usage limit|usage ⚠/i.test(text);
   const spec = extractResetSpec(text);
-  const waitingForReset = /limit reached|hit your limit|0% left/i.test(text);
   return { waitingForReset, spec };
 }
 
@@ -288,37 +410,28 @@ export function isBusyForContinue(text) {
 }
 
 export function isPromptReadyForContinue(text) {
-  return /Type your message or @path\/to\/file|^\s*>\s*$/m.test(String(text || ""));
+  return /Type your message or @path\/to\/file|^\s*[>›]\s*$/m.test(String(text || ""));
+}
+
+export function hasStackedInputForContinue(text) {
+  return /^\s*[>›]\s+\S/m.test(String(text || ""));
 }
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   const paneText = capturePane(options.session, options.bufferLines);
   const paneId = currentPaneId(options.session);
-  const analysis = analyzePane(paneText);
 
-  if (!analysis.waitingForReset || !analysis.spec) {
-    console.error(`Session ${options.session} is not in a parseable reset-waiting state.`);
-    console.error(`Current pane: ${paneId}`);
-    process.exit(1);
+  // Step 1: Skip if busy
+  if (isBusyForContinue(paneText)) {
+    console.log(`Session ${options.session}: busy, no action.`);
+    return;
   }
 
+  // Step 2: Skip if already scheduled
   const nowEpoch = Math.floor(Date.now() / 1000);
-  const specs = Array.isArray(analysis.spec) ? analysis.spec : [analysis.spec];
-  const selected = selectResetCandidate(specs, nowEpoch, options.offsetMinutes);
-  if (!selected) {
-    console.error(`Session ${options.session} has no usable reset candidate.`);
-    process.exit(1);
-  }
-  const { spec, targetEpoch } = selected;
-  const delaySeconds = Math.max(0, targetEpoch - nowEpoch);
   const metadataDir = path.join(os.tmpdir(), "clawlens-auto-continue");
   const metadataPath = path.join(metadataDir, `${sanitizeName(options.session)}.json`);
-  const jobId = `${sanitizeName(options.session)}-${targetEpoch}`;
-  const logPath = path.join(metadataDir, `${jobId}.log`);
-  const runnerPath = path.join(metadataDir, `${jobId}.sh`);
-
-  fs.mkdirSync(metadataDir, { recursive: true });
 
   if (fs.existsSync(metadataPath) && !options.force) {
     const existing = JSON.parse(fs.readFileSync(metadataPath, "utf8"));
@@ -331,8 +444,52 @@ async function main() {
     }
   }
 
+  // Step 3: Check for task-interruption signal in pane (gate for probe)
+  const analysis = analyzePane(paneText);
+  if (!analysis.waitingForReset) {
+    console.log(`Session ${options.session}: no interruption signal, no action.`);
+    return;
+  }
+
+  // Step 4: Probe quota via /status or /usage to get authoritative reset time
+  let spec = null;
+  if (isPromptReadyForContinue(paneText)) {
+    const probe = probeQuota(paneId, options.cliType, options.bufferLines);
+    if (!probe.skipped) {
+      if (probe.percentLeft > 0) {
+        console.log(`Session ${options.session}: quota not exhausted (${probe.percentLeft}% left), no action.`);
+        return;
+      }
+      spec = probe.spec;
+    }
+  }
+
+  // Fall back to pane-text reset time if probe failed or prompt not ready
+  if (!spec && analysis.spec) {
+    const specs = Array.isArray(analysis.spec) ? analysis.spec : [analysis.spec];
+    const selected = selectResetCandidate(specs, nowEpoch, options.offsetMinutes);
+    if (selected) {
+      spec = selected.spec;
+    }
+  }
+
+  if (!spec) {
+    console.error(`Session ${options.session}: interruption detected but could not determine reset time.`);
+    process.exit(1);
+  }
+
+  // Step 5: Compute target and schedule
+  const targetEpoch = computeTargetEpoch(spec, nowEpoch, options.offsetMinutes);
+  const delaySeconds = Math.max(0, targetEpoch - nowEpoch);
+  const jobId = `${sanitizeName(options.session)}-${targetEpoch}`;
+  const logPath = path.join(metadataDir, `${jobId}.log`);
+  const runnerPath = path.join(metadataDir, `${jobId}.sh`);
+
+  fs.mkdirSync(metadataDir, { recursive: true });
+
   const metadata = {
     session: options.session,
+    cliType: options.cliType,
     paneId,
     sourceLine: spec.sourceLine,
     targetEpoch,
@@ -353,8 +510,6 @@ async function main() {
       if (existing.targetEpoch > nowEpoch) {
         console.log(`Already scheduled for session ${options.session}.`);
         console.log(`Existing target: ${formatEpoch(existing.targetEpoch)}`);
-        console.log(`Metadata: ${metadataPath}`);
-        console.log(`Log: ${existing.logPath}`);
         return;
       }
     }
@@ -367,7 +522,7 @@ async function main() {
         logPath,
         metadataPath,
         runnerPath,
-        lockHelperPath: path.join(__dirname, "tmux-session-lock.mjs"),
+        lockHelperPath: path.join(path.dirname(fileURLToPath(import.meta.url)), "tmux-session-lock.mjs"),
       }),
       "utf8",
     );
@@ -378,7 +533,7 @@ async function main() {
 
     console.log(`Scheduled continue for session ${options.session}.`);
     console.log(`Current pane: ${paneId}`);
-    console.log(`Trigger line: ${spec.sourceLine}`);
+    console.log(`Trigger: ${spec.sourceLine}`);
     console.log(`Target: ${metadata.targetTime}`);
     console.log(`Metadata: ${metadataPath}`);
     console.log(`Log: ${logPath}`);

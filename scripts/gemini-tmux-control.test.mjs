@@ -111,6 +111,12 @@ test("parseStopState tolerates leading/trailing whitespace on the stop line", ()
   assert.equal(parseStopState(text).stopAt, "12:14:47");
 });
 
+test("parseStopState accepts Gemini hook prefix and trailing script path", () => {
+  const text = "ℹ Stop says: [done 12:14:47] [/home/chlli/.gemini/hooks/stop-says.sh]\n";
+  assert.equal(parseStopState(text).stopSeen, true);
+  assert.equal(parseStopState(text).stopAt, "12:14:47");
+});
+
 test("parseStopState ignores stop markers embedded in normal content", () => {
   const text = `
 Here is an example of the hook format:

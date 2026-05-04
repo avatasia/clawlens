@@ -4,10 +4,8 @@
 # an external reviewer CLI (codex, gemini, ...).
 #
 # Flow:
-#   1. send `/clear` + Enter to reset the reviewer conversation context
-#   2. paste the package body via bracketed paste (tmux paste-buffer -p)
-#      — newlines inside the buffer are delivered as newlines, not Enter/submit
-#   3. send Enter to submit
+#   - Gemini sessions: delegate clear + send-file to gemini-tmux-control.mjs
+#   - Other sessions: use the legacy tmux paste flow below
 #
 # Usage:
 #   bash scripts/send-review-to-tmux.sh <session> <package-file>
@@ -48,6 +46,15 @@ fi
 if [ ! -f "$PKG" ]; then
     echo "ERROR: package file '$PKG' not found" >&2
     exit 1
+fi
+
+if [[ "$SESSION" == gemini* ]]; then
+    node scripts/gemini-tmux-control.mjs \
+        send-file \
+        --session "$SESSION" \
+        --file "$PKG" \
+        --clear-first
+    exit 0
 fi
 
 LOCK_SESSION="$(printf '%s' "$SESSION" | tr -c 'A-Za-z0-9_.-' '_')"
