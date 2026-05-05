@@ -1,7 +1,7 @@
 ---
 status: active
 created: 2026-05-01
-updated: 2026-05-02
+updated: 2026-05-05
 ---
 
 # Quota Auto-Continue — 设计方案
@@ -138,6 +138,16 @@ metadata 文件路径：`/tmp/clawlens-auto-continue/<session>.json`
   --session cc1 >> /tmp/clawlens-auto-continue/cc1-watcher.log 2>&1 # cc1-quota-watcher") | crontab -
 ```
 （自动推断 `--cli-type claude`）
+
+### gemini1 会话
+```bash
+(crontab -l; echo "*/3 * * * * PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/node \
+  ./scripts/schedule-tmux-continue-on-reset.mjs \
+  --session gemini1 >> /tmp/clawlens-auto-continue/gemini1-watcher.log 2>&1 # gemini1-quota-watcher") | crontab -
+```
+（自动推断 `--cli-type gemini`，探测命令 `/stats`，Escape 关闭 TUI overlay）
+
+**注意**：Gemini `/stats` 不含重置时间，probe 仅用于检测 `percentLeft`。重置时间依赖 pane 文本中的中断消息（格式待补充——触发后记录实际错误文本）。
 
 注意：tmux 在 `/usr/local/bin`，cron 环境 PATH 必须包含此路径。
 

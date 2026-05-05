@@ -10,6 +10,7 @@ import {
   isPromptReadyForContinue,
   parseClaudeUsage,
   parseCodexStatus,
+  parseGeminiStats,
   selectResetCandidate,
 } from "./schedule-tmux-continue-on-reset.mjs";
 
@@ -307,4 +308,85 @@ test("parseCodexStatus parses /status output with remaining quota", () => {
 
 test("parseCodexStatus returns null when 5h limit line absent", () => {
   assert.equal(parseCodexStatus("Weekly limit: 50% left (resets 10:00)"), null);
+});
+
+test("parseCodexStatus handles 0% quota error message with short time format", () => {
+  const text = [
+    "■ You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), v",
+    "isit https://chatgpt.com/codex/settings/usage to purchase more credits or try again",
+    "at 5:20 PM.",
+  ].join("\n");
+
+  const result = parseCodexStatus(text);
+  assert.ok(result);
+  assert.equal(result.percentLeft, 0);
+  assert.equal(result.spec?.kind, "absolute");
+  assert.equal(result.spec?.resetText, "5:20 PM");
+});
+
+test("parseCodexStatus handles 0% quota error message with full date format", () => {
+  const text = [
+    "■ You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro),",
+    "visit .../usage to purchase more credits or try again at May 5th, 2026 1:40 PM.",
+  ].join("\n");
+
+  const result = parseCodexStatus(text);
+  assert.ok(result);
+  assert.equal(result.percentLeft, 0);
+  assert.equal(result.spec?.kind, "absolute");
+  assert.equal(result.spec?.resetText, "1:40 PM");
+});
+
+test("extractResetSpec handles Codex full-date format (May 5th, 2026 H:MM PM)", () => {
+  const text = [
+    "■ You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro),",
+    "visit .../usage to purchase more credits or try again at May 5th, 2026 1:40 PM.",
+  ].join("\n");
+
+  const result = extractResetSpec(text);
+  assert.ok(result);
+  assert.equal(result[0]?.kind, "absolute");
+  assert.equal(result[0]?.resetText, "1:40 PM");
+  assert.equal(result[0]?.timezone, null);
+});
+
+test("extractResetSpec handles Codex full-date format across newline", () => {
+  const text = [
+    "■ You've hit your usage limit. ... try again",
+    "at May 5th, 2026 1:40",
+    "PM.",
+  ].join("\n");
+
+  const result = extractResetSpec(text);
+  assert.ok(result);
+  assert.equal(result[0]?.resetText, "1:40 PM");
+});
+
+// --- parseGeminiStats ---
+
+test("parseGeminiStats parses quota from status bar (0% used)", () => {
+  const text = `
+ workspace (/directory)  branch  sandbox  /model  quota
+ ~/github/clawlens        main    no sandbox  Auto  0% used
+`;
+  const result = parseGeminiStats(text);
+  assert.ok(result);
+  assert.equal(result.percentLeft, 100);
+  assert.equal(result.spec, null);
+});
+
+test("parseGeminiStats parses quota from status bar (80% used)", () => {
+  const result = parseGeminiStats("quota  80% used");
+  assert.ok(result);
+  assert.equal(result.percentLeft, 20);
+});
+
+test("parseGeminiStats returns null when quota line absent", () => {
+  assert.equal(parseGeminiStats("Session Stats\nTool Calls: 6"), null);
+});
+
+test("isPromptReadyForContinue accepts Gemini * prompt", () => {
+  assert.equal(isPromptReadyForContinue("*"), true);
+  assert.equal(isPromptReadyForContinue("  *  "), true);
+  assert.equal(isPromptReadyForContinue("* Type your message or @path/to/file"), true);
 });

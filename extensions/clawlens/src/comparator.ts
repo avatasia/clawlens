@@ -37,7 +37,7 @@ export class Comparator {
     let primaryProvider: string | undefined;
     let primaryModel: string | undefined;
     try {
-      const storePath = this.runtime.agent.session.resolveStorePath(ctx.agentId);
+      const storePath = this.runtime.agent.session.resolveStorePath(undefined, { agentId: ctx.agentId });
       const sessionStore = this.runtime.agent.session.loadSessionStore(storePath);
       const entry = sessionStore[ctx.sessionKey!];
       primaryModel = entry?.model;
@@ -86,7 +86,7 @@ export class Comparator {
               model,
               onAgentEvent: (evt: any) => {
                 if (evt.stream === "lifecycle" && evt.data?.phase === "start") {
-                  this.store.insertRun(evt.runId ?? randomUUID(), compareSessionKey, evt.ts ?? Date.now(), {
+                  this.store.insertRun(compareRunId, compareSessionKey, Date.now(), {
                     channel: ctx.channelId,
                     agentId: ctx.agentId,
                     provider,
@@ -95,9 +95,9 @@ export class Comparator {
                     isPrimary: false,
                   });
                 } else if (evt.stream === "lifecycle" && evt.data?.phase === "end") {
-                  this.store.completeRun(evt.runId, evt.ts ?? Date.now(), "completed");
+                  this.store.completeRun(compareRunId, Date.now(), "completed");
                 } else if (evt.stream === "lifecycle" && evt.data?.phase === "error") {
-                  this.store.completeRun(evt.runId, evt.ts ?? Date.now(), "error", String(evt.data?.error ?? ""));
+                  this.store.completeRun(compareRunId, Date.now(), "error", String(evt.data?.error ?? ""));
                 }
               },
             });

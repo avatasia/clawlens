@@ -79,12 +79,14 @@ function parseArgs(argv) {
   if (!options.cliType) {
     if (/codex/i.test(options.session)) {
       options.cliType = "codex";
+    } else if (/gemini/i.test(options.session)) {
+      options.cliType = "gemini";
     } else {
       options.cliType = "claude";
     }
   }
-  if (options.cliType !== "claude" && options.cliType !== "codex") {
-    throw new Error("--cli-type must be 'claude' or 'codex'");
+  if (options.cliType !== "claude" && options.cliType !== "codex" && options.cliType !== "gemini") {
+    throw new Error("--cli-type must be 'claude', 'codex', or 'gemini'");
   }
 
   return options;
@@ -122,7 +124,8 @@ export function extractResetSpec(text) {
   // Codex wraps "...try again\nat H:MM PM." across terminal lines — join first
   const joined = text.replace(/\r?\n/g, " ");
   if (/hit your usage limit/i.test(joined)) {
-    const m = joined.match(/try again at\s+(\d{1,2}:\d{2}\s*[AP]M)/i);
+    // Match both "5:20 PM" and full-date "May 5th, 2026 1:40 PM" formats
+    const m = joined.match(/try again at\s+(?:[A-Za-z]+\s+\d+(?:st|nd|rd|th)?,?\s+\d{4}\s+)?(\d{1,2}:\d{2}\s*[AP]M)/i);
     if (m) {
       return [{ kind: "absolute", resetText: m[1].trim(), timezone: null, sourceLine: "You've hit your usage limit" }];
     }
@@ -199,11 +202,36 @@ export function parseClaudeUsage(text) {
 // Returns { percentLeft, spec } or null.
 export function parseCodexStatus(text) {
   const m = text.match(/5h\s+limit:.*?(\d+)%\s+left\s+\(resets\s+([^)]+)\)/i);
+  if (m) {
+    return {
+      percentLeft: Number(m[1]),
+      spec: { kind: "absolute", resetText: m[2].trim(), timezone: null, sourceLine: `Codex /status: resets ${m[2]}` },
+    };
+  }
+  // When quota is 0%, /status returns the same error message instead of the bar format
+  const joined = text.replace(/\r?\n/g, " ");
+  if (/hit your usage limit/i.test(joined)) {
+    const timeMatch = joined.match(/try again at\s+(?:[A-Za-z]+\s+\d+(?:st|nd|rd|th)?,?\s+\d{4}\s+)?(\d{1,2}:\d{2}\s*[AP]M)/i);
+    if (timeMatch) {
+      const resetText = timeMatch[1].trim();
+      return {
+        percentLeft: 0,
+        spec: { kind: "absolute", resetText, timezone: null, sourceLine: `Codex /status: hit usage limit, resets ${resetText}` },
+      };
+    }
+    return { percentLeft: 0, spec: null };
+  }
+  return null;
+}
+
+// Parse /stats output from Gemini CLI.
+// Returns { percentLeft, spec } or null.
+// Gemini /stats does not report reset time; caller falls back to pane-text spec.
+export function parseGeminiStats(text) {
+  const m = text.match(/\b(\d+)%\s+used\b/i);
   if (!m) return null;
-  return {
-    percentLeft: Number(m[1]),
-    spec: { kind: "absolute", resetText: m[2].trim(), timezone: null, sourceLine: `Codex /status: resets ${m[2]}` },
-  };
+  const percentUsed = Number(m[1]);
+  return { percentLeft: 100 - percentUsed, spec: null };
 }
 
 function dateInTimezone(format, timezone, dateExpr = "now") {
@@ -249,11 +277,11 @@ function sanitizeName(value) {
   return value.replace(/[^A-Za-z0-9_.-]+/g, "_");
 }
 
-// Send /usage or /status to the pane and return parsed quota result.
+// Send /usage, /status, or /stats to the pane and return parsed quota result.
 // Returns { percentLeft, spec } on success, or { skipped: reason } if not attempted.
 // Only called when an interruption signal is already detected in the pane.
 export function probeQuota(paneId, cliType, captureLines = 120) {
-  const command = cliType === "codex" ? "/status" : "/usage";
+  const command = cliType === "codex" ? "/status" : cliType === "gemini" ? "/stats" : "/usage";
 
   // Send command and Enter as separate send-keys calls
   run("tmux", ["send-keys", "-t", paneId, command, ""]);
@@ -266,12 +294,21 @@ export function probeQuota(paneId, cliType, captureLines = 120) {
   while (Date.now() < deadline) {
     spawnSync("sleep", ["0.5"]);
     const text = run("tmux", ["capture-pane", "-pt", paneId, "-S", `-${captureLines}`]);
-    result = cliType === "codex" ? parseCodexStatus(text) : parseClaudeUsage(text);
+    if (cliType === "codex") result = parseCodexStatus(text);
+    else if (cliType === "gemini") result = parseGeminiStats(text);
+    else result = parseClaudeUsage(text);
     if (result) break;
   }
 
   // Dismiss Claude Code /usage TUI overlay
   if (cliType === "claude") {
+    spawnSync("sleep", ["0.3"]);
+    run("tmux", ["send-keys", "-t", paneId, "Escape", ""]);
+    spawnSync("sleep", ["0.2"]);
+  }
+
+  // Dismiss Gemini /stats TUI overlay with Escape
+  if (cliType === "gemini") {
     spawnSync("sleep", ["0.3"]);
     run("tmux", ["send-keys", "-t", paneId, "Escape", ""]);
     spawnSync("sleep", ["0.2"]);
@@ -319,11 +356,11 @@ function isBusy(text) {
 }
 
 function isPromptReady(text) {
-  return /Type your message or @path\\/to\\/file|^\\s*[>›]\\s*$/m.test(text);
+  return /Type your message or @path\\/to\\/file|^\\s*[>›*]\\s*$/m.test(text);
 }
 
 function hasStackedInput(text) {
-  return /^\\s*[>›]\\s+\\S/m.test(text);
+  return /^\\s*[>›*]\\s+\\S/m.test(text);
 }
 
 try {
@@ -382,7 +419,7 @@ NODE
 // Detect whether the pane shows a task-interruption signal from quota exhaustion.
 // Does NOT treat "0% left" as an interruption signal (that can appear from /status output).
 export function analyzePane(text) {
-  const waitingForReset = /limit reached|hit your limit|hit your usage limit|usage ⚠/i.test(text);
+  const waitingForReset = /limit reached|hit your limit|hit your usage limit|usage ⚠|quota.*exceeded|you've reached your.*quota|rate limit exceeded/i.test(text);
   const spec = extractResetSpec(text);
   return { waitingForReset, spec };
 }
@@ -410,7 +447,9 @@ export function isBusyForContinue(text) {
 }
 
 export function isPromptReadyForContinue(text) {
-  return /Type your message or @path\/to\/file|^\s*[>›]\s*$/m.test(String(text || ""));
+  // Claude: "Type your message or @path/to/file" or "> " / "› "
+  // Gemini: "* Type your message or @path/to/file" or "* " (asterisk prompt)
+  return /Type your message or @path\/to\/file|^\s*[>›*]\s*$/m.test(String(text || ""));
 }
 
 export function hasStackedInputForContinue(text) {
