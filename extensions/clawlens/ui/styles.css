@@ -32,6 +32,14 @@
   color: var(--muted, #838387);
   flex: 1;
 }
+.cl-version {
+  font-size: 10px;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  opacity: 0.6;
+  margin-left: 3px;
+}
 .cl-sse-dot {
   font-size: 10px;
   color: var(--muted, #838387);

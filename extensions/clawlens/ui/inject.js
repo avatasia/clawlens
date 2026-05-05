@@ -22,6 +22,7 @@ const RENDERED_RUN_BY_ID = new Map();
 
 const S = {
   token: null,
+  version: null,
   overview: null,
   drawerOpen: false,
   auditDays: 7,
@@ -540,6 +541,15 @@ function getTimelineScaleDurationForRun(runId, elapsedMs, runStatus) {
 
 // ── Data fetch ────────────────────────────────────────────────────────────
 
+async function fetchVersion() {
+  const d = await apiFetch("/version");
+  if (d?.version) {
+    S.version = d.version;
+    const el = document.getElementById("cl-version");
+    if (el) el.textContent = ` v${d.version}`;
+  }
+}
+
 async function fetchOverview() {
   const d = await apiFetch("/overview");
   if (d) { S.overview = d; renderOverview(); }
@@ -644,7 +654,7 @@ function _createPanelEl() {
   panel.id = "clawlens-panel";
   panel.innerHTML = `
     <div class="cl-panel-header">
-      <span class="cl-panel-title">ClawLens</span>
+      <span class="cl-panel-title">ClawLens<span id="cl-version" class="cl-version"></span></span>
       <span id="cl-sse-dot" class="cl-sse-dot" title="SSE">●</span>
       <button id="cl-audit-btn" class="cl-audit-btn" title="打开 Audit 面板">Audit →</button>
     </div>
@@ -1464,7 +1474,7 @@ async function main() {
   S.token = getToken();
   mountOverviewPanel();
 
-  await fetchOverview();
+  await Promise.all([fetchOverview(), fetchVersion()]);
   setInterval(fetchOverview, OVERVIEW_INTERVAL);
 
   connectSSE();

@@ -461,6 +461,18 @@ export class Collector {
         active.lastUserPrompt = this.structuredPreviewsEnabled
           ? serializePreviewForTextColumn(event.prompt)
           : event.prompt.slice(0, 200);
+      } else {
+        // Channels like Discord pass full history as messages[] without a top-level prompt.
+        const msgs = (event as any).messages;
+        if (Array.isArray(msgs) && msgs.length > 0) {
+          const lastUser = [...msgs].reverse().find((m: any) => m?.role === "user");
+          if (lastUser) {
+            const content = (lastUser as any).content;
+            active.lastUserPrompt = this.structuredPreviewsEnabled
+              ? serializePreviewForTextColumn(content ?? "")
+              : (typeof content === "string" ? content : JSON.stringify(content ?? "")).slice(0, 200);
+          }
+        }
       }
       if (event.systemPrompt) active.systemPromptHash = simpleHash(event.systemPrompt);
       const runKind = classifyPromptRunKind(event.prompt);
@@ -559,7 +571,16 @@ export class Collector {
     event: { messages?: unknown[]; success?: boolean; durationMs?: number },
     ctx: { sessionKey?: string; sessionId?: string },
   ): void {
-    const runId = ctx.sessionId ? this.sessionIdToRunId.get(ctx.sessionId) : undefined;
+    let runId = ctx.sessionId ? this.sessionIdToRunId.get(ctx.sessionId) : undefined;
+
+    // Fallback for channels (e.g. Discord) that don't provide sessionId in agent_end:
+    // find the most recent active or just-completed run for this session key.
+    if (!runId && ctx.sessionKey && ctx.sessionKey !== "unknown") {
+      const byActive = this.findActiveRunIdForSessionKind(ctx.sessionKey, "chat");
+      const byRecent = byActive ?? this.store.findRecentRunIdForSession(ctx.sessionKey, { windowMs: 120_000 });
+      if (byRecent) runId = byRecent;
+    }
+
     this.debug("agent_end", {
       sessionId: ctx.sessionId,
       sessionKey: ctx.sessionKey,

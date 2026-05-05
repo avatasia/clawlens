@@ -1,3 +1,4 @@
+import { createRequire } from "node:module";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import type { Store } from "./store.js";
@@ -5,6 +6,11 @@ import type { SSEManager } from "./sse-manager.js";
 import type { ClawLensConfig } from "./types.js";
 import { importLoggerMappings, inspectLoggerImportDir } from "./logger-import.js";
 import { hasTrustedSourceRoots, isSourceLookupEnabled, SourceResolver } from "./source-resolver.js";
+
+const _require = createRequire(import.meta.url);
+const CLAWLENS_VERSION: string = (() => {
+  try { return (_require("../package.json") as { version: string }).version; } catch { return "unknown"; }
+})();
 
 function parseIntParam(value: string | null, defaultValue: number): number {
   if (value === null) return defaultValue;
@@ -157,6 +163,11 @@ export function registerApiRoutes(api: OpenClawPluginApi, store: Store, sseManag
       // All other routes use Bearer token
       if (!authOk(req, routeToken)) {
         sendJson(res, 401, { error: "unauthorized" });
+        return;
+      }
+
+      if (pathname.endsWith("/version")) {
+        sendJson(res, 200, { version: CLAWLENS_VERSION });
         return;
       }
 
