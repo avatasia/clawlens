@@ -74,7 +74,7 @@ type ConversationTurnOpts = {
   tokensUsed?: number;
   messageId?: string;
   sessionFile?: string;
-  sourceKind?: "transcript_explicit" | "llm_prompt_metadata" | "session_fallback";
+  sourceKind?: "transcript_explicit" | "transcript_recovered" | "llm_prompt_metadata" | "session_fallback";
   sourceSessionId?: string;
   sourceLoggerTs?: string;
 };
@@ -120,6 +120,7 @@ export class Store {
 
   private static readonly SOURCE_PRIORITY = {
     transcript_explicit: 3,
+    transcript_recovered: 2.5,
     llm_prompt_metadata: 2,
     session_fallback: 1,
   } as const;

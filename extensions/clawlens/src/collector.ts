@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { Store } from "./store.js";
 import type { SSEManager } from "./sse-manager.js";
 import { calculateCost, loadCostConfig } from "./cost-calculator.js";
@@ -60,6 +63,19 @@ type LiveLlmStream = {
   lastEmitAt: number;
 };
 
+type FinalizeRunContext = {
+  runId: string;
+  sessionKey: string;
+  startedAt: number;
+  endedAt: number;
+  runKind?: "heartbeat" | "chat";
+  status: string;
+  errorMessage?: string;
+};
+
+const RECOVERY_WINDOW_BEFORE_MS = 5_000;
+const RECOVERY_WINDOW_AFTER_MS = 5_000;
+
 function classifyPromptRunKind(prompt?: string): "heartbeat" | "chat" {
   const text = prompt ?? "";
   if (
@@ -100,6 +116,8 @@ export class Collector {
   private structuredPreviewsEnabled = false;
   private liveLlmByRunId = new Map<string, LiveLlmStream>();
   private pendingModelCallStarts = new Map<string, number>();
+  private transcriptTurnCountByRunId = new Map<string, number>();
+  private sessionFileBySessionKeyCache = new Map<string, string | null>();
   // ROLLBACK_INDEX: CLAWLENS_TRANSCRIPT_BINDING_STRATEGY -> docs/CLAWLENS_TRANSCRIPT_BINDING_ROLLBACK_PLAYBOOK.md
   // DOC_INDEX: CLAWLENS_TRANSCRIPT_BINDING_PLAYBOOK -> docs/CLAWLENS_TRANSCRIPT_BINDING_ROLLBACK_PLAYBOOK.md
   // Keep legacy as default. Switch explicitly via collector.transcriptBindingStrategy.
@@ -137,15 +155,22 @@ export class Collector {
     // Flush any pending completions immediately
     for (const [runId, pending] of this.pendingCompletes) {
       clearTimeout(pending.timer);
-      this.enqueue(() => {
-        this.store.completeRun(runId, pending.endedAt, pending.status, pending.errorMessage);
-        this.sseManager.broadcast({ type: "run_ended", runId, endedAt: pending.endedAt, status: pending.status });
-      });
+      const active = this.activeRuns.get(runId);
+        this.enqueue(() => this.finalizeRun({
+          runId,
+          sessionKey: active?.sessionKey ?? "unknown",
+          startedAt: active?.startedAt ?? pending.endedAt,
+          endedAt: pending.endedAt,
+          runKind: active?.runKind,
+          status: pending.status,
+          errorMessage: pending.errorMessage,
+        }));
     }
     this.pendingCompletes.clear();
     this.llmStartQueueByRunId.clear();
     this.liveLlmByRunId.clear();
     this.sessionIdToRunId.clear();
+    this.transcriptTurnCountByRunId.clear();
     this.flush();
   }
 
@@ -327,11 +352,17 @@ export class Collector {
     const timer = setTimeout(() => {
       this.pendingCompletes.delete(runId);
       this.llmStartQueueByRunId.delete(runId);
+      const active = this.activeRuns.get(runId);
       this.activeRuns.delete(runId);
-      this.enqueue(() => {
-        this.store.completeRun(runId, endedAt, status, errorMessage);
-        this.sseManager.broadcast({ type: "run_ended", runId, endedAt, status });
-      });
+      this.enqueue(() => this.finalizeRun({
+        runId,
+        sessionKey: active?.sessionKey ?? "unknown",
+        startedAt: active?.startedAt ?? endedAt,
+        endedAt,
+        runKind: active?.runKind,
+        status,
+        errorMessage,
+      }));
     }, 800);
 
     this.pendingCompletes.set(runId, { endedAt, status, errorMessage, timer });
@@ -874,10 +905,10 @@ export class Collector {
 
   private persistTranscriptTurn(runId: string, turn: PendingTranscriptTurn): void {
     const timestamp = turn.normalized.timestamp ?? Date.now();
-      this.store.upsertConversationTurnByMessageId(
-        runId,
-        turn.sessionKey,
-        turn.normalized.role,
+    this.store.upsertConversationTurnByMessageId(
+      runId,
+      turn.sessionKey,
+      turn.normalized.role,
       turn.normalized.preview,
       turn.normalized.length,
       timestamp,
@@ -889,6 +920,7 @@ export class Collector {
         tokensUsed: turn.normalized.tokensUsed,
       },
     );
+    this.transcriptTurnCountByRunId.set(runId, (this.transcriptTurnCountByRunId.get(runId) ?? 0) + 1);
     this.sseManager.broadcast({
       type: "transcript_turn",
       runId,
@@ -896,6 +928,219 @@ export class Collector {
       messageId: turn.messageId,
     });
   }
+
+  private finalizeRun(ctx: FinalizeRunContext): void {
+    this.recoverMissingTranscriptTurns(ctx);
+    this.store.completeRun(ctx.runId, ctx.endedAt, ctx.status, ctx.errorMessage);
+    this.sseManager.broadcast({
+      type: "run_ended",
+      runId: ctx.runId,
+      endedAt: ctx.endedAt,
+      status: ctx.status,
+    });
+  }
+
+  private recoverMissingTranscriptTurns(ctx: FinalizeRunContext): void {
+    try {
+      const knownTurns = this.transcriptTurnCountByRunId.get(ctx.runId) ?? 0;
+      if (knownTurns > 0) {
+        return;
+      }
+      if (this.store.getConversationTurnCount(ctx.runId) > 0) {
+        this.transcriptTurnCountByRunId.set(ctx.runId, 1);
+        return;
+      }
+      if (!ctx.sessionKey || ctx.sessionKey === "unknown") {
+        return;
+      }
+
+      const sessionFile = this.resolveSessionFileForSessionKey(ctx.sessionKey);
+      if (!sessionFile) {
+        return;
+      }
+
+      const recovered = recoverTranscriptMessagesFromSessionFile(sessionFile, {
+        startedAt: ctx.startedAt,
+        endedAt: ctx.endedAt,
+        expectedKind: ctx.runKind ?? "chat",
+        structuredPreviews: this.structuredPreviewsEnabled,
+      });
+      for (const turn of recovered) {
+        this.store.upsertConversationTurnByMessageId(
+          ctx.runId,
+          ctx.sessionKey,
+          turn.role,
+          turn.preview,
+          turn.length,
+          turn.timestamp,
+          {
+            messageId: turn.messageId,
+            sessionFile,
+            sourceKind: "transcript_recovered",
+            toolCallsCount: turn.toolCallsCount,
+            tokensUsed: turn.tokensUsed,
+          },
+        );
+        this.transcriptTurnCountByRunId.set(ctx.runId, (this.transcriptTurnCountByRunId.get(ctx.runId) ?? 0) + 1);
+        this.sseManager.broadcast({
+          type: "transcript_turn",
+          runId: ctx.runId,
+          sessionKey: ctx.sessionKey,
+          messageId: turn.messageId,
+        });
+      }
+      if (recovered.length > 0) {
+        this.debug("transcript_recovered", {
+          runId: ctx.runId,
+          sessionKey: ctx.sessionKey,
+          sessionFile,
+          recoveredCount: recovered.length,
+        });
+      }
+    } catch (err) {
+      console.error("[clawlens] recoverMissingTranscriptTurns: failed:", err);
+    }
+  }
+
+  private resolveSessionFileForSessionKey(sessionKey: string): string | null {
+    if (this.sessionFileBySessionKeyCache.has(sessionKey)) {
+      return this.sessionFileBySessionKeyCache.get(sessionKey) ?? null;
+    }
+    const resolved = resolveSessionFileForSessionKey(sessionKey);
+    this.sessionFileBySessionKeyCache.set(sessionKey, resolved);
+    return resolved;
+  }
+}
+
+function resolveSessionFileForSessionKey(sessionKey: string): string | null {
+  if (!sessionKey.startsWith("agent:")) {
+    return null;
+  }
+  const agentId = sessionKey.split(":")[1];
+  if (!agentId) {
+    return null;
+  }
+  const stateRoot = path.join(os.homedir(), ".openclaw");
+  const candidateStores = [
+    path.join(stateRoot, "agents", agentId, "sessions", "sessions.json"),
+  ];
+
+  const agentsDir = path.join(stateRoot, "agents");
+  if (fs.existsSync(agentsDir)) {
+    for (const entry of fs.readdirSync(agentsDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const storePath = path.join(agentsDir, entry.name, "sessions", "sessions.json");
+      if (!candidateStores.includes(storePath)) {
+        candidateStores.push(storePath);
+      }
+    }
+  }
+
+  for (const storePath of candidateStores) {
+    try {
+      if (!fs.existsSync(storePath)) continue;
+      const parsed = JSON.parse(fs.readFileSync(storePath, "utf8")) as Record<
+        string,
+        { sessionId?: unknown }
+      >;
+      const entry = parsed?.[sessionKey];
+      const sessionId = typeof entry?.sessionId === "string" ? entry.sessionId : "";
+      if (!sessionId) continue;
+      const sessionFile = path.join(path.dirname(storePath), `${sessionId}.jsonl`);
+      if (fs.existsSync(sessionFile)) {
+        return sessionFile;
+      }
+    } catch {
+      // Ignore bad session stores and continue scanning.
+    }
+  }
+
+  return null;
+}
+
+function recoverTranscriptMessagesFromSessionFile(
+  sessionFile: string,
+  options: {
+    startedAt: number;
+    endedAt: number;
+    expectedKind: "heartbeat" | "chat";
+    structuredPreviews: boolean;
+  },
+): Array<{
+  messageId: string;
+  role: string;
+  preview: string;
+  length: number;
+  timestamp: number;
+  toolCallsCount: number;
+  tokensUsed?: number;
+}> {
+  const startedAt = Math.max(0, options.startedAt - RECOVERY_WINDOW_BEFORE_MS);
+  const endedAt = options.endedAt + RECOVERY_WINDOW_AFTER_MS;
+  const raw = fs.readFileSync(sessionFile, "utf8");
+  const recovered: Array<{
+    messageId: string;
+    role: string;
+    preview: string;
+    length: number;
+    timestamp: number;
+    toolCallsCount: number;
+    tokensUsed?: number;
+  }> = [];
+
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const parsed = safeParseJsonRecord(line);
+    if (!parsed) continue;
+    const messageId = typeof parsed.id === "string" ? parsed.id : "";
+    const message = parsed.message;
+    if (!messageId || !message || typeof message !== "object") continue;
+
+    const normalized = normalizeTranscriptMessage(message, {
+      structuredPreviews: options.structuredPreviews,
+    });
+    if (!normalized) continue;
+    if (normalized.role !== "user" && normalized.role !== "assistant") continue;
+    if (classifyTranscriptTurnKind(normalized) !== options.expectedKind) continue;
+    const timestamp = normalized.timestamp ?? parseTimestampMs(parsed.timestamp);
+    if (timestamp == null) continue;
+    if (timestamp < startedAt || timestamp > endedAt) continue;
+
+    recovered.push({
+      messageId,
+      role: normalized.role,
+      preview: normalized.preview,
+      length: normalized.length,
+      timestamp,
+      toolCallsCount: normalized.toolCallsCount,
+      ...(typeof normalized.tokensUsed === "number" ? { tokensUsed: normalized.tokensUsed } : {}),
+    });
+  }
+
+  recovered.sort((a, b) => a.timestamp - b.timestamp);
+  return recovered;
+}
+
+function safeParseJsonRecord(input: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(input);
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseTimestampMs(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return undefined;
 }
 
 function extractAssistantDeltaText(data?: Record<string, unknown>): string {

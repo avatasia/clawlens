@@ -7,6 +7,9 @@
  */
 import { test, describe, beforeEach } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { Collector, classifyTranscriptTurnKind, normalizeTranscriptMessage } from "../src/collector.js";
 import { parsePreviewFormat } from "../src/structured-preview.js";
 
@@ -16,6 +19,7 @@ type Call = { method: string; args: unknown[] };
 
 function makeMockStore() {
   const calls: Call[] = [];
+  const conversationTurnCounts = new Map<string, number>();
   const record =
     (method: string) =>
     (...args: unknown[]) =>
@@ -33,7 +37,7 @@ function makeMockStore() {
     updateRunLlmStreamMetrics: record("updateRunLlmStreamMetrics"),
     updateRunSessionKeyIfUnknown: record("updateRunSessionKeyIfUnknown"),
     upsertConversationTurnByMessageId: record("upsertConversationTurnByMessageId"),
-    getConversationTurnCount: () => 0,
+    getConversationTurnCount: (runId: string) => conversationTurnCounts.get(runId) ?? 0,
     findRunIdByMessageId: () => undefined,
     findUnknownRunIdByPromptMessageId: () => undefined,
     findRecentRunIdForSession: () => undefined,
@@ -44,6 +48,7 @@ function makeMockStore() {
     close: record("close"),
     // introspection
     calls,
+    conversationTurnCounts,
     callsOf: (method: string) => calls.filter((c) => c.method === method),
   };
 }
@@ -253,6 +258,268 @@ describe("Collector — 正常值", () => {
 
     const turnCall = store.callsOf("insertConversationTurn")[0];
     assert.equal(parsePreviewFormat(turnCall.args[4] as string).previewFormat, "structured-json-v1");
+  });
+
+  test("run completes without transcript_update and recovers turns from session jsonl", () => {
+    const { collector, store } = makeCollector();
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "clawlens-home-"));
+    const originalHome = process.env.HOME;
+    const sessionKey = "agent:main:discord:direct:123";
+    const sessionId = "sess-recover-1";
+    const sessionsDir = path.join(tmpHome, ".openclaw", "agents", "main", "sessions");
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionsDir, "sessions.json"),
+      JSON.stringify({
+        [sessionKey]: { sessionId, updatedAt: Date.now() },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(sessionsDir, `${sessionId}.jsonl`),
+      [
+        JSON.stringify({
+          type: "message",
+          id: "user-msg-1",
+          timestamp: "2026-05-06T03:00:00.000Z",
+          message: { role: "user", content: [{ type: "text", text: "昨天天气" }], timestamp: 1778036400000 },
+        }),
+        JSON.stringify({
+          type: "message",
+          id: "assistant-msg-1",
+          timestamp: "2026-05-06T03:00:10.000Z",
+          message: { role: "assistant", content: [{ type: "text", text: "补回成功" }], timestamp: 1778036410000 },
+        }),
+      ].join("\n"),
+    );
+
+    process.env.HOME = tmpHome;
+    try {
+      collector.handleAgentEvent({
+        stream: "lifecycle",
+        runId: "run-recover-1",
+        sessionKey,
+        ts: 1778036400000,
+        data: { phase: "start", startedAt: 1778036400000 },
+      });
+      collector.handleAgentEvent({
+        stream: "lifecycle",
+        runId: "run-recover-1",
+        ts: 1778036420000,
+        data: { phase: "end", endedAt: 1778036420000 },
+      });
+      collector.stop();
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      fs.rmSync(tmpHome, { recursive: true, force: true });
+    }
+
+    const upserts = store.callsOf("upsertConversationTurnByMessageId");
+    assert.equal(upserts.length, 2);
+    assert.equal(upserts[0].args[6]?.sourceKind, "transcript_recovered");
+    assert.equal(upserts[0].args[6]?.messageId, "user-msg-1");
+    assert.equal(upserts[1].args[6]?.messageId, "assistant-msg-1");
+    assert.equal(store.callsOf("completeRun").length, 1);
+  });
+
+  test("adjacent runs recover only their own transcript window", () => {
+    const { collector, store } = makeCollector();
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "clawlens-home-"));
+    const originalHome = process.env.HOME;
+    const sessionKey = "agent:main:discord:direct:adjacent";
+    const sessionId = "sess-recover-adjacent";
+    const sessionsDir = path.join(tmpHome, ".openclaw", "agents", "main", "sessions");
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionsDir, "sessions.json"),
+      JSON.stringify({
+        [sessionKey]: { sessionId, updatedAt: Date.now() },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(sessionsDir, `${sessionId}.jsonl`),
+      [
+        JSON.stringify({
+          type: "message",
+          id: "run-1-user",
+          timestamp: "2026-05-06T03:00:00.000Z",
+          message: { role: "user", content: [{ type: "text", text: "first user" }], timestamp: 1778036400000 },
+        }),
+        JSON.stringify({
+          type: "message",
+          id: "run-1-assistant",
+          timestamp: "2026-05-06T03:00:01.000Z",
+          message: { role: "assistant", content: [{ type: "text", text: "first reply" }], timestamp: 1778036401000 },
+        }),
+        JSON.stringify({
+          type: "message",
+          id: "run-2-user",
+          timestamp: "2026-05-06T03:00:08.000Z",
+          message: { role: "user", content: [{ type: "text", text: "second user" }], timestamp: 1778036408000 },
+        }),
+        JSON.stringify({
+          type: "message",
+          id: "run-2-assistant",
+          timestamp: "2026-05-06T03:00:09.000Z",
+          message: { role: "assistant", content: [{ type: "text", text: "second reply" }], timestamp: 1778036409000 },
+        }),
+      ].join("\n"),
+    );
+
+    process.env.HOME = tmpHome;
+    try {
+      collector.handleAgentEvent({
+        stream: "lifecycle",
+        runId: "run-recover-a",
+        sessionKey,
+        ts: 1778036400000,
+        data: { phase: "start", startedAt: 1778036400000 },
+      });
+      collector.handleAgentEvent({
+        stream: "lifecycle",
+        runId: "run-recover-a",
+        ts: 1778036402000,
+        data: { phase: "end", endedAt: 1778036402000 },
+      });
+      collector.handleAgentEvent({
+        stream: "lifecycle",
+        runId: "run-recover-b",
+        sessionKey,
+        ts: 1778036408000,
+        data: { phase: "start", startedAt: 1778036408000 },
+      });
+      collector.handleAgentEvent({
+        stream: "lifecycle",
+        runId: "run-recover-b",
+        ts: 1778036410000,
+        data: { phase: "end", endedAt: 1778036410000 },
+      });
+      collector.stop();
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      fs.rmSync(tmpHome, { recursive: true, force: true });
+    }
+
+    const bindings = store.callsOf("upsertConversationTurnByMessageId").map((call) => ({
+      runId: call.args[0],
+      messageId: call.args[6]?.messageId,
+    }));
+    assert.deepEqual(bindings, [
+      { runId: "run-recover-a", messageId: "run-1-user" },
+      { runId: "run-recover-a", messageId: "run-1-assistant" },
+      { runId: "run-recover-b", messageId: "run-2-user" },
+      { runId: "run-recover-b", messageId: "run-2-assistant" },
+    ]);
+  });
+
+  test("chat recovery skips heartbeat transcript rows", () => {
+    const { collector, store } = makeCollector();
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "clawlens-home-"));
+    const originalHome = process.env.HOME;
+    const sessionKey = "agent:main:discord:direct:heartbeat-mix";
+    const sessionId = "sess-heartbeat-mix";
+    const sessionsDir = path.join(tmpHome, ".openclaw", "agents", "main", "sessions");
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionsDir, "sessions.json"),
+      JSON.stringify({
+        [sessionKey]: { sessionId, updatedAt: Date.now() },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(sessionsDir, `${sessionId}.jsonl`),
+      [
+        JSON.stringify({
+          type: "message",
+          id: "hb-msg-1",
+          timestamp: "2026-05-06T03:00:00.000Z",
+          message: { role: "assistant", content: [{ type: "text", text: "HEARTBEAT_OK" }], timestamp: 1778036400000 },
+        }),
+        JSON.stringify({
+          type: "message",
+          id: "chat-msg-1",
+          timestamp: "2026-05-06T03:00:01.000Z",
+          message: { role: "assistant", content: [{ type: "text", text: "normal chat reply" }], timestamp: 1778036401000 },
+        }),
+      ].join("\n"),
+    );
+
+    process.env.HOME = tmpHome;
+    try {
+      collector.handleAgentEvent({
+        stream: "lifecycle",
+        runId: "run-chat-recover-1",
+        sessionKey,
+        ts: 1778036400000,
+        data: { phase: "start", startedAt: 1778036400000 },
+      });
+      collector.handleAgentEvent({
+        stream: "lifecycle",
+        runId: "run-chat-recover-1",
+        ts: 1778036402000,
+        data: { phase: "end", endedAt: 1778036402000 },
+      });
+      collector.stop();
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      fs.rmSync(tmpHome, { recursive: true, force: true });
+    }
+
+    const upserts = store.callsOf("upsertConversationTurnByMessageId");
+    assert.equal(upserts.length, 1);
+    assert.equal(upserts[0].args[6]?.messageId, "chat-msg-1");
+  });
+
+  test("existing conversation turns suppress transcript recovery", () => {
+    const { collector, store } = makeCollector();
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "clawlens-home-"));
+    const originalHome = process.env.HOME;
+    const sessionKey = "agent:main:discord:direct:existing-turns";
+    const sessionId = "sess-existing-turns";
+    const sessionsDir = path.join(tmpHome, ".openclaw", "agents", "main", "sessions");
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionsDir, "sessions.json"),
+      JSON.stringify({
+        [sessionKey]: { sessionId, updatedAt: Date.now() },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(sessionsDir, `${sessionId}.jsonl`),
+      JSON.stringify({
+        type: "message",
+        id: "should-not-recover",
+        timestamp: "2026-05-06T03:00:00.000Z",
+        message: { role: "assistant", content: [{ type: "text", text: "already stored elsewhere" }], timestamp: 1778036400000 },
+      }),
+    );
+
+    store.conversationTurnCounts.set("run-existing-turns", 1);
+    process.env.HOME = tmpHome;
+    try {
+      collector.handleAgentEvent({
+        stream: "lifecycle",
+        runId: "run-existing-turns",
+        sessionKey,
+        ts: 1778036400000,
+        data: { phase: "start", startedAt: 1778036400000 },
+      });
+      collector.handleAgentEvent({
+        stream: "lifecycle",
+        runId: "run-existing-turns",
+        ts: 1778036402000,
+        data: { phase: "end", endedAt: 1778036402000 },
+      });
+      collector.stop();
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      fs.rmSync(tmpHome, { recursive: true, force: true });
+    }
+
+    assert.equal(store.callsOf("upsertConversationTurnByMessageId").length, 0);
   });
 });
 
