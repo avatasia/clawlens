@@ -227,12 +227,40 @@ test("isPromptReadyForContinue accepts Codex › prompt", () => {
 test("hasStackedInputForContinue detects stacked commands in input box", () => {
   const stackedPane = "› continue\n  /usage\n  /stats\n  q";
   assert.equal(hasStackedInputForContinue(stackedPane), true);
+  assert.equal(hasStackedInputForContinue(stackedPane, "any"), true);
 
   assert.equal(hasStackedInputForContinue("›"), false);
   assert.equal(hasStackedInputForContinue("  ›  "), false);
   assert.equal(hasStackedInputForContinue(">"), false);
 
   assert.equal(isPromptReadyForContinue(stackedPane), false);
+});
+
+test("hasStackedInputForContinue ignores historical transcript lines by default", () => {
+  const pane = `
+› 目前有个定时任务 额度恢复会自动发resume
+
+• Working (28s • esc to interrupt)
+
+  tab to queue message                                           96% context left
+`;
+
+  assert.equal(hasStackedInputForContinue(pane), false);
+  assert.equal(hasStackedInputForContinue(pane, "any"), true);
+  assert.equal(isPromptReadyForContinue(pane), false);
+});
+
+test("isPromptReadyForContinue only accepts trailing prompt state", () => {
+  const pane = `
+› historical transcript line
+
+other output
+
+›
+`;
+
+  assert.equal(isPromptReadyForContinue(pane), true);
+  assert.equal(hasStackedInputForContinue(pane), false);
 });
 
 // --- parseClaudeUsage ---

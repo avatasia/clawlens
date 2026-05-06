@@ -7,12 +7,16 @@
     "extensions": [
       "./index.ts"
     ],
+    "runtimeExtensions": [
+      "./dist/index.js"
+    ],
     "install": {
       "minHostVersion": ">=2026.4.24",
       "npmSpec": "clawlens@0.1.0"
     }
   },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "npx tsx --test tests/*.test.ts"
   },

@@ -1,7 +1,7 @@
 ---
 status: active
 created: 2026-04-20
-updated: 2026-04-20
+updated: 2026-05-06
 ---
 
 # Claude Tmux Control Playbook
@@ -19,6 +19,17 @@ updated: 2026-04-20
 
 当前把“切模型”视为基础操作；“切 effort”和“组合切换”是同一套监控逻辑上的增量命令。
 
+## Session Naming
+
+本文中的 `cc1` 不是固定保留名，只是“当前 Claude CLI 所在 tmux session”的示例值。
+
+使用规则：
+
+- 把目标统一理解为“Claude CLI tmux session”，不要把 `cc1` 当成硬编码约定。
+- 具体 session 名以操作者当前环境为准，例如 `cc1`、`claude-main`、`review-claude`。
+- 所有控制命令在执行前都应先确认目标 session 名，不要默认当前机器一定存在 `cc1`。
+- 文档中的 `--session cc1` 均表示示例写法，不表示仓库级固定命名要求。
+
 ## 脚本位置
 
 - CLI: `scripts/claude-tmux-control.mjs`
@@ -31,6 +42,12 @@ node scripts/claude-tmux-control.mjs status --session cc1
 node scripts/claude-tmux-control.mjs set-model --session cc1 --model opus
 node scripts/claude-tmux-control.mjs set-effort --session cc1 --effort medium
 node scripts/claude-tmux-control.mjs set-combo --session cc1 --model sonnet --effort high
+```
+
+若需要把示例值改成当前环境中的实际 session，可直接替换为：
+
+```bash
+node scripts/claude-tmux-control.mjs status --session <claude-session>
 ```
 
 通用参数：
@@ -97,6 +114,31 @@ node scripts/claude-tmux-control.mjs set-combo --session cc1 --model sonnet --ef
 - slash command 驱动的模型 / effort 切换
 
 它不是一个通用的 TUI 自动化框架；如果后续要扩展 `/clear`、`continue`、批量组合编排，可以继续复用同一套 pane 解析和轮询骨架。
+
+## Multi-round Review Control
+
+当 Claude CLI tmux session 正在执行多轮评审时，操作者消息要区分“正式评审任务”与“轮中纠偏”两类动作。
+
+推荐规则：
+
+- 正式评审任务本体：作为正常消息发送。
+- 轮中追加操作者指令：优先使用 `/btw`，用于纠偏、催收敛、补约束、要求输出最终 verdict。
+- 不要把 `/btw` 类操作者插话和正式评审任务本体混写在同一条消息里。
+- 如果 pane 中已经出现 queued message，要先判断是继续提交、撤回，还是先清理当前队列；不要继续叠加额外控制输入。
+
+禁止规则：
+
+- 不要为了“推动评审继续”而发送会终止前台 Claude CLI 的中断式控制。
+- 不要把 tmux session 当成后台 subagent；它是一个有前台交互状态的真实 Claude CLI，会受到 `/clear`、queued message、busy/idle 状态和控制字符的影响。
+- 不要在未确认 pane 当前状态时盲发 `submit`、额外回车或中断键。
+
+最小安全顺序：
+
+1. 先确认目标 session 名。
+2. 检查 pane 当前是否处于可安全交互状态。
+3. 正式任务用正常消息发送。
+4. 多轮追问或纠偏优先用 `/btw`。
+5. 若要继续 queued message，先显式确认当前 queued 内容就是要发送的那条。
 
 ## 自查方式
 

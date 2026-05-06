@@ -12,7 +12,7 @@ Codex / Claude Code 会话在 5 小时窗口额度耗尽后停止响应，需要
 
 ## 核心方案
 
-`scripts/schedule-tmux-continue-on-reset.mjs` 统一处理两种 CLI：
+`scripts/schedule-tmux-continue-on-reset.mjs` 统一处理三种 CLI：
 
 ```
 node scripts/schedule-tmux-continue-on-reset.mjs --session <tmux-session>
@@ -20,8 +20,9 @@ node scripts/schedule-tmux-continue-on-reset.mjs --session <tmux-session>
 
 参数：
 - `--session <name>`       tmux 会话名（默认 cc1）
-- `--cli-type <claude|codex>`  CLI 类型，用于决定发哪条探测命令（默认从 session 名自动推断：含 "codex" → codex，否则 → claude）
+- `--cli-type <claude|codex|gemini>`  CLI 类型，用于决定发哪条探测命令（默认从 session 名自动推断：含 "codex" → codex；含 "gemini" → gemini；否则 → claude）
 - `--offset-minutes <n>`   重置后延迟 N 分钟再发 continue（默认 1）
+- `--stacked-input-scope <trailing|any>` 输入残留检测范围（默认 `trailing`，只看 pane 底部当前 prompt 区域）
 - `--dry-run`              只解析打印目标时间，不实际调度
 - `--force`                忽略已有的 pending metadata，重新调度
 
@@ -108,6 +109,18 @@ tmux send-keys -t pane "Enter"     → 第二次回车（触发任务恢复）
 
 runner 触发前还会检查：会话是否存在？pane 是否仍在 busy？提示符是否就绪？
 
+### `C-c` 清场约束
+
+`C-c` 不是默认总会发送。只有在 runner 触发时同时满足以下条件才会发送：
+
+1. 当前 pane 不是 prompt-ready。
+2. pane **底部当前 prompt 区域**检测到输入残留，例如：
+   - `› continue`
+   - `> /usage`
+   - `* /stats`
+
+`trailing` 模式不会把历史 transcript 中较早位置的 `› ...` / `> ...` 行当成输入残留，因此不会因为旧对话记录误发 `C-c`。`any` 模式仅保留给兼容用途，不推荐用于 cron watcher。
+
 ## 调度机制
 
 1. 脚本生成 runner bash 脚本（`/tmp/clawlens-auto-continue/<session>-<epoch>.sh`）
@@ -127,7 +140,8 @@ metadata 文件路径：`/tmp/clawlens-auto-continue/<session>.json`
 ```
 */3 * * * * PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/node \
   ./scripts/schedule-tmux-continue-on-reset.mjs \
-  --session codex >> /tmp/clawlens-auto-continue/codex-watcher.log 2>&1
+  --session codex \
+  --stacked-input-scope trailing >> /tmp/clawlens-auto-continue/codex-watcher.log 2>&1
 ```
 （自动推断 `--cli-type codex`）
 
@@ -135,7 +149,8 @@ metadata 文件路径：`/tmp/clawlens-auto-continue/<session>.json`
 ```bash
 (crontab -l; echo "*/3 * * * * PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/node \
   ./scripts/schedule-tmux-continue-on-reset.mjs \
-  --session cc1 >> /tmp/clawlens-auto-continue/cc1-watcher.log 2>&1 # cc1-quota-watcher") | crontab -
+  --session cc1 \
+  --stacked-input-scope trailing >> /tmp/clawlens-auto-continue/cc1-watcher.log 2>&1 # cc1-quota-watcher") | crontab -
 ```
 （自动推断 `--cli-type claude`）
 
@@ -143,7 +158,8 @@ metadata 文件路径：`/tmp/clawlens-auto-continue/<session>.json`
 ```bash
 (crontab -l; echo "*/3 * * * * PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/node \
   ./scripts/schedule-tmux-continue-on-reset.mjs \
-  --session gemini1 >> /tmp/clawlens-auto-continue/gemini1-watcher.log 2>&1 # gemini1-quota-watcher") | crontab -
+  --session gemini1 \
+  --stacked-input-scope trailing >> /tmp/clawlens-auto-continue/gemini1-watcher.log 2>&1 # gemini1-quota-watcher") | crontab -
 ```
 （自动推断 `--cli-type gemini`，探测命令 `/stats`，Escape 关闭 TUI overlay）
 
@@ -156,7 +172,7 @@ metadata 文件路径：`/tmp/clawlens-auto-continue/<session>.json`
 | 文件 | 用途 |
 |------|------|
 | `scripts/schedule-tmux-continue-on-reset.mjs` | 主脚本（检测+探测+调度） |
-| `scripts/schedule-tmux-continue-on-reset.test.mjs` | 单元测试（22 个用例） |
+| `scripts/schedule-tmux-continue-on-reset.test.mjs` | 单元测试（32 个用例） |
 | `scripts/tmux-session-lock.mjs` | 并发锁，防止多个 runner 同时发送 |
 | `/tmp/clawlens-auto-continue/<session>.json` | 调度 metadata（运行时） |
 | `/tmp/clawlens-auto-continue/<session>-watcher.log` | watcher 日志 |

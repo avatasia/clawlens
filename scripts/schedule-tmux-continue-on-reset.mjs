@@ -16,6 +16,8 @@ Options:
   --cli-type <claude|codex> CLI type for quota probe (default: auto-detect from session name)
   --buffer-lines <n>        capture last N pane lines (default: 120)
   --offset-minutes <n>      send continue N minutes after reset (default: 1)
+  --stacked-input-scope <trailing|any>
+                            how to detect input residue before sending C-c (default: trailing)
   --dry-run                 parse and print target time without scheduling
   --force                   ignore an existing pending metadata file
   --help                    show this help
@@ -28,6 +30,7 @@ function parseArgs(argv) {
     cliType: null,
     bufferLines: 120,
     offsetMinutes: 1,
+    stackedInputScope: "trailing",
     dryRun: false,
     force: false,
   };
@@ -48,6 +51,10 @@ function parseArgs(argv) {
     }
     if (arg === "--offset-minutes") {
       options.offsetMinutes = Number(argv[++i]);
+      continue;
+    }
+    if (arg === "--stacked-input-scope") {
+      options.stackedInputScope = argv[++i] ?? "";
       continue;
     }
     if (arg === "--dry-run") {
@@ -73,6 +80,9 @@ function parseArgs(argv) {
   }
   if (!Number.isFinite(options.offsetMinutes) || options.offsetMinutes < 0) {
     throw new Error("--offset-minutes must be >= 0");
+  }
+  if (options.stackedInputScope !== "trailing" && options.stackedInputScope !== "any") {
+    throw new Error("--stacked-input-scope must be 'trailing' or 'any'");
   }
 
   // Auto-detect cli type from session name
@@ -108,6 +118,30 @@ function run(command, args, extra = {}) {
 
 function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function trailingPromptLines(text) {
+  const lines = String(text || "").split(/\r?\n/);
+  const trailing = [];
+
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i];
+    if (trailing.length === 0 && !line.trim()) {
+      continue;
+    }
+    if (/tab to queue message/i.test(line)) {
+      continue;
+    }
+    if (!line.trim()) {
+      break;
+    }
+    trailing.unshift(line);
+    if (/^\s*(?:Type your message or @path\/to\/file|[>›*])/.test(line)) {
+      break;
+    }
+  }
+
+  return trailing;
 }
 
 function parseRelativeDuration(text) {
@@ -317,7 +351,7 @@ export function probeQuota(paneId, cliType, captureLines = 120) {
   return result ?? { skipped: "parse-failed" };
 }
 
-function makeRunnerScript({ session, delaySeconds, logPath, metadataPath, runnerPath, lockHelperPath }) {
+function makeRunnerScript({ session, delaySeconds, logPath, metadataPath, runnerPath, lockHelperPath, stackedInputScope }) {
   return `#!/usr/bin/env bash
 set -euo pipefail
 
@@ -327,6 +361,7 @@ TMUX_CONTINUE_SESSION=${shellQuote(session)} \
 TMUX_CONTINUE_LOG_PATH=${shellQuote(logPath)} \
 TMUX_CONTINUE_METADATA_PATH=${shellQuote(metadataPath)} \
 TMUX_CONTINUE_RUNNER_PATH=${shellQuote(runnerPath)} \
+TMUX_CONTINUE_STACKED_INPUT_SCOPE=${shellQuote(stackedInputScope)} \
 TMUX_CONTINUE_LOCK_HELPER=${shellQuote(pathToFileURL(lockHelperPath).href)} \
 node --input-type=module <<'NODE'
 import fs from "node:fs";
@@ -337,6 +372,7 @@ const session = process.env.TMUX_CONTINUE_SESSION;
 const logPath = process.env.TMUX_CONTINUE_LOG_PATH;
 const metadataPath = process.env.TMUX_CONTINUE_METADATA_PATH;
 const runnerPath = process.env.TMUX_CONTINUE_RUNNER_PATH;
+const stackedInputScope = process.env.TMUX_CONTINUE_STACKED_INPUT_SCOPE || "trailing";
 
 function log(line) {
   fs.appendFileSync(logPath, "[" + new Date().toISOString() + "] " + line + "\\n", "utf8");
@@ -351,16 +387,42 @@ function run(command, args) {
   return (result.stdout || "").trimEnd();
 }
 
+function trailingPromptLines(text) {
+  const lines = String(text || "").split(/\\r?\\n/);
+  const trailing = [];
+
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i];
+    if (trailing.length === 0 && !line.trim()) {
+      continue;
+    }
+    if (/tab to queue message/i.test(line)) {
+      continue;
+    }
+    if (!line.trim()) {
+      break;
+    }
+    trailing.unshift(line);
+    if (/^\\s*(?:Type your message or @path\\/to\\/file|[>›*])/.test(line)) {
+      break;
+    }
+  }
+
+  return trailing;
+}
+
 function isBusy(text) {
   return /•\\s+Working\\b/.test(text) || /tab to queue message/i.test(text) || /Thinking\\.\\.\\./i.test(text) || /Considering Command Execution/i.test(text);
 }
 
 function isPromptReady(text) {
-  return /Type your message or @path\\/to\\/file|^\\s*[>›*]\\s*$/m.test(text);
+  const trailing = trailingPromptLines(text).join("\\n");
+  return /Type your message or @path\\/to\\/file|^\\s*[>›*]\\s*$/m.test(trailing);
 }
 
 function hasStackedInput(text) {
-  return /^\\s*[>›*]\\s+\\S/m.test(text);
+  const haystack = stackedInputScope === "any" ? String(text || "") : trailingPromptLines(text).join("\\n");
+  return /^\\s*[>›*]\\s+\\S/m.test(haystack);
 }
 
 try {
@@ -449,11 +511,13 @@ export function isBusyForContinue(text) {
 export function isPromptReadyForContinue(text) {
   // Claude: "Type your message or @path/to/file" or "> " / "› "
   // Gemini: "* Type your message or @path/to/file" or "* " (asterisk prompt)
-  return /Type your message or @path\/to\/file|^\s*[>›*]\s*$/m.test(String(text || ""));
+  const trailing = trailingPromptLines(text).join("\n");
+  return /Type your message or @path\/to\/file|^\s*[>›*]\s*$/m.test(trailing);
 }
 
-export function hasStackedInputForContinue(text) {
-  return /^\s*[>›]\s+\S/m.test(String(text || ""));
+export function hasStackedInputForContinue(text, scope = "trailing") {
+  const haystack = scope === "any" ? String(text || "") : trailingPromptLines(text).join("\n");
+  return /^\s*[>›*]\s+\S/m.test(haystack);
 }
 
 async function main() {
@@ -529,6 +593,7 @@ async function main() {
   const metadata = {
     session: options.session,
     cliType: options.cliType,
+    stackedInputScope: options.stackedInputScope,
     paneId,
     sourceLine: spec.sourceLine,
     targetEpoch,
@@ -561,6 +626,7 @@ async function main() {
         logPath,
         metadataPath,
         runnerPath,
+        stackedInputScope: options.stackedInputScope,
         lockHelperPath: path.join(path.dirname(fileURLToPath(import.meta.url)), "tmux-session-lock.mjs"),
       }),
       "utf8",
